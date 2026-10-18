@@ -1,0 +1,64 @@
+{
+  "version": 1,
+  "upstream": "Noelo-Lab/kuna",
+  "branch": "main",
+  "track": "branch",
+  "author": {
+    "name": "dweee",
+    "email": "5091497+dweee@users.noreply.github.com"
+  },
+  "required_paths": [
+    "nix/package.nix",
+    "decompiler/Cargo.lock"
+  ],
+  "protected_paths": [
+    "ci/**",
+    "nix/**"
+  ],
+  "matrix": [
+    {
+      "system": "aarch64-darwin",
+      "packages": [
+        "kuna"
+      ],
+      "checks": [
+        "kuna"
+      ],
+      "tests": []
+    },
+    {
+      "system": "x86_64-linux",
+      "packages": [
+        "kuna"
+      ],
+      "checks": [
+        "kuna"
+      ],
+      "tests": [
+        [
+          "nix",
+          "develop",
+          "--no-write-lock-file",
+          "--command",
+          "make",
+          "specs",
+          "test",
+          "test-stages",
+          "rust-test",
+          "check-spec",
+          "test-tools"
+        ]
+      ]
+    },
+    {
+      "system": "aarch64-linux",
+      "packages": [
+        "kuna"
+      ],
+      "checks": [
+        "kuna"
+      ],
+      "tests": []
+    }
+  ]
+}

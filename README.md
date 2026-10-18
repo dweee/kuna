@@ -19,6 +19,70 @@ Learn more about this approach in this [post](https://noelo.org/blog/kuna-releas
 Kuna is distributed as a single Rust binary and can be run on most systems.
 It can be used either on the [CLI](#cli-usage), the [web browser](#web-browser-usage), or in the [Ghidra GUI](#ghidra-gui-usage) (as the decompiler backend), most found in [releases](https://github.com/Noelo-Lab/kuna/releases).
 
+### Nix
+
+This fork builds Kuna from the Rust workspace and pinned Cargo dependencies, then
+compiles every vendored SLEIGH spec before embedding them into the CLI. It does not
+download upstream release binaries. The initial source is upstream commit
+`ae5e1c479f65dc68d2b55e1d2e926323a6f7b130` (version `1.910`); `LICENSE`, `NOTICE`,
+and the full upstream history are retained. `upstream` points to Noelo-Lab/kuna;
+the public packaging branch is `dweee/kuna:flakey`.
+
+```bash
+nix run 'github:dweee/kuna/flakey' -- --help
+nix build 'github:dweee/kuna/flakey#kuna' --max-jobs 2 --cores 2
+./result/bin/kuna decompile ./a.out main
+nix develop -c make check-spec
+```
+
+The flake exports `packages.<system>.{kuna,default}`, `apps.<system>.{kuna,default}`,
+`checks.<system>.kuna`, and `devShells.<system>.default` for x86_64/aarch64 Linux and
+aarch64 Darwin (the pinned nixpkgs has dropped Intel Darwin). Linux x86_64 and Apple Silicon macOS builds and smoke tests have passed.
+Native CI also builds aarch64 Linux. The package includes `kuna`, `kuna_ghidra`,
+`slacomp`, `decomp_dbg`, and `decomp_test_dbg`, compiled specs under
+`share/kuna/specs`, and the complete upstream agent skill at
+`share/kuna/skills/kuna-decompiler/SKILL.md`.
+
+Use your configuration's nixpkgs pin with `follows`:
+
+```nix
+inputs.kuna = {
+  url = "github:dweee/kuna/flakey";
+  inputs.nixpkgs.follows = "nixpkgs";
+};
+```
+
+On either NixOS or nix-darwin, install directly with
+`environment.systemPackages = [ inputs.kuna.packages.${pkgs.system}.kuna ];`.
+Alternatively import `inputs.kuna.nixosModules.default` on NixOS or
+`inputs.kuna.darwinModules.default` on Darwin and set `programs.kuna.enable = true;`.
+Home Manager users can put the same package in `home.packages` and link its skill
+directory into their agents' skill discovery paths. `kuna install-skill --dir DIR`
+also installs the embedded skill offline. Kuna uses a CLI and skill, and does not
+provide an MCP server or need a daemon. T3 Code's provider agents should receive
+the package on PATH and the skill through their ordinary skill configuration.
+
+`kuna_ghidra` implements Ghidra's native decompiler process protocol; it is not a
+standalone analysis command. A Ghidra integration can copy a Ghidra installation
+into a new Nix derivation and replace its platform `decompile` executable with
+`bin/kuna_ghidra`, leaving the original immutable installation untouched. This
+package does not build or install the Java GUI extension.
+
+The Nix build checks CLI startup, option catalog consistency, and exact embedded
+skill contents. The upstream gates remain available in the development shell:
+`make test test-stages rust-test check-spec test-tools`. They are deliberately
+separate from the package build because the workspace suite is much larger than
+the packaged command. Set `CARGO_BUILD_JOBS=2` on memory constrained builders.
+The development shell clears inherited `LD_LIBRARY_PATH` and `NIX_CFLAGS_LINK`:
+GUI launchers such as T3 can inject bundled libraries and host link paths that
+mix incompatible glibc versions when the tests compile their C fixtures. Nix
+package builds already run in a clean sandbox.
+The shell also disables compiler fortification because upstream fixtures
+deliberately compile at `-O0 -Werror`; fortification requires optimization. It
+disables `zerocallusedregs` for fixtures whose expected register lifetimes match
+the source program rather than injected register-clearing epilogues. Package
+build hardening remains enabled.
+
 ### CLI Usage
 If building from source, you can find the `kuna` binary in `decompiler/target/release/kuna`.
 Otherwise, you can find it in the latest [release](https://github.com/Noelo-Lab/kuna/releases) for your OS (Linux, Windows, MacOS supported). The release `kuna` is a single self-contained binary: the compiled SLEIGH specs are built in. 
@@ -169,3 +233,13 @@ We are especially grateful to the generous sponsorship from the [Air Force Resea
 ---
 
 Need to get in touch? Contact the lead maintainer [Zion Basque](https://zionbasque) through email: zionbasque@uga.edu.
+
+### Nix CI and cache
+
+Native GitHub Actions build the three supported platforms, retain closure archives,
+and publish successful default-branch builds through a separate Attic publisher.
+The x86_64 Linux job also runs the selected upstream regression gates.
+Build jobs receive no upload credential. Cache settings are repository variables;
+the dedicated scoped token is a GitHub Actions secret. See [ci/ATTIC.md](ci/ATTIC.md).
+Upstream synchronization uses the pinned shared fork controller and requires
+all configured builds and tests before optional promotion.
