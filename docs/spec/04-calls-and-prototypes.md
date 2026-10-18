@@ -407,7 +407,23 @@ stack, upstream rounds its slot up to the data type's alignment. The kuna
 takes the next free stack slot (`modelrules.rs (AssignAction::assign_address)`).
 `SparcV9_32.cspec` sets it: SPARC32 passes arguments as consecutive words, while
 its data organization aligns eight-byte objects to eight for structure layout.
-Every other cspec keeps the upstream rounding.
+
+The fallback walk rounds the same way: an aligned stack `<pentry>` wastes slots
+until the argument's offset from the entry's base is a multiple of its data type's
+alignment (`fspec.rs (ParamEntry::get_addr_by_slot_justify)`). The kuna
+`<pentry stackalign="false">` attribute skips that rounding too, so each slot
+keeps only the entry's own `align`
+(`p4_calls/kuna_stackparamalign.rs (effective_alignment)`). `x86win.cspec` sets
+it on the stack entry of `__stdcall`, `__cdecl`, `__fastcall` and `__thiscall`:
+Windows i386 passes every stack argument in four-byte slots, while its data
+organization aligns `double`, `long long` and a structure holding one to eight.
+A `double` or `struct { double re, im; }` after an `int` or the hidden return
+pointer therefore sits at entry ESP+8, where the callee reads it, not at ESP+12.
+The data type's own alignment, and so its field offsets, are unchanged. An
+absent attribute or `true` keeps the rounding; `false` on a register entry or a
+single-slot entry, or any other value, fails the `<pentry>` decode
+(`kuna_stackparamalign.rs (decode)`), which drops the model like any other
+malformed `<pentry>`. Every other cspec keeps the upstream rounding.
 
 The bundled AArch64 cspecs (`AARCH64.cspec`, `AARCH64_apple.cspec` and
 `AARCH64_win.cspec`) never split an argument wider than one general register
@@ -1115,7 +1131,18 @@ that machinery.
   param <func>::<i> <storage> <decl>` and `map return <func>::<storage>
   <decl>`, reached from the CLI as `--assert 'param <func>::<i> …'`. A slot no
   directive named is `undefined` of pointer width, so slots may be declared in
-  any order. A CALLIND through a literal global slot has one additional early
+  any order. (kuna) Explicit return storage also keeps the return out of that
+  model-driven input assignment (`kuna_customreturn.rs`): the inputs are laid
+  out against a temporary `void` result before the stated output is installed.
+  A return the model cannot place in a register (a ten-byte x87 `float10` under
+  the x86 models, which the model returns through a hidden pointer) therefore
+  no longer adds a hidden return-pointer input that survives the override,
+  takes the first stated slot, and shifts the stack-pop inference. Inputs no
+  directive overrides keep the slots the model assigns with every stated input
+  in the list, so a stack input that follows one overridden to a register keeps
+  the stack offset it would have had. Pieces without explicit return storage
+  allocate an indirect return as before.
+  A CALLIND through a literal global slot has one additional early
   source: when input 0 is either the unwritten memory Varnode at that exact
   address or the result of exactly `LOAD(constant-space, constant-address)`,
   the slot is queried before generic recovery. An exact data symbol contributes
@@ -7247,3 +7274,15 @@ return what they tail-call or call, and nine PLT stubs return the import's resul
 (`v1 = (*dat_17e58)(); return v1;` for `lseek`). Each prints the signature
 `decompile-all` prints. Only a function whose callers read it pays for a second
 drive.
+
+An explicitly freed x87 ST0 is not an inferred return value. Before SSA, a
+must-empty analysis records ordinary returns reached with ST0 empty on every
+path. FFREE must name the raw ST0 register; equal values in ST1 do not qualify.
+Any later ST0 write, tag-word write, call, or other opaque user-op withdraws
+the proof. Partial accesses to the x87 register bank also withdraw it: they
+include MMX instructions whose tag effects the SLEIGH lift may leave implicit.
+A function with no FFREE bypasses the graph analysis. Joins
+require every reachable predecessor, including loop entry paths, to agree.
+Return recovery withdraws an unlocked ST0 trial only when every remaining
+ordinary return has that proof. Explicit and caller-forced results take priority.
+Restarting analysis clears and rebuilds the evidence.
