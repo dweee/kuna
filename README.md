@@ -243,3 +243,8 @@ Build jobs receive no upload credential. Cache settings are repository variables
 the dedicated scoped token is a GitHub Actions secret. See [ci/ATTIC.md](ci/ATTIC.md).
 Upstream synchronization uses the pinned shared fork controller and requires
 all configured builds and tests before optional promotion.
+
+Upstream stores only its major in `VERSION`; the minor is derived from Git history.
+The Nix recipe therefore pins the full upstream version explicitly. Update it
+with the selected upstream revision during source promotion. Automatic promotion
+is disabled until that version review is complete.

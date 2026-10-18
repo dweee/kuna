@@ -1,7 +1,9 @@
 { lib, stdenv, rustPlatform, python3 }:
 
 let
-  version = lib.removeSuffix "\n" (builtins.readFile ../VERSION);
+  # Upstream VERSION is only the major; its minor counts Git commits.
+  # Keep the complete upstream version with each reviewed source promotion.
+  version = "1.910";
 in
 rustPlatform.buildRustPackage {
   pname = "kuna";
