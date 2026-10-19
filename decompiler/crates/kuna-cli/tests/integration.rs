@@ -113,6 +113,9 @@ mod crypto_cli;
 #[path = "ctypes_per_arch.rs"]
 mod ctypes_per_arch;
 
+#[path = "decompile_budget_cli.rs"]
+mod decompile_budget_cli;
+
 #[path = "decompile_cli.rs"]
 mod decompile_cli;
 
@@ -331,6 +334,9 @@ mod stack_object_lifetimes;
 #[path = "stack_parameter_lifetimes.rs"]
 mod stack_parameter_lifetimes;
 
+#[path = "stack_home_aliases.rs"]
+mod stack_home_aliases;
+
 #[path = "stack_struct.rs"]
 mod stack_struct;
 
@@ -462,6 +468,7 @@ mod float_field_slices;
 
 #[path = "float_storage_truncation.rs"]
 mod float_storage_truncation;
+
 #[path = "dwarf_reference_arguments.rs"]
 mod dwarf_reference_arguments;
 
@@ -470,3 +477,67 @@ mod fortran_fatal_diagnostics;
 
 #[path = "dwarf_array_bounds.rs"]
 mod dwarf_array_bounds;
+
+#[path = "wide_right_shift.rs"]
+mod wide_right_shift;
+
+#[path = "float_subword_bits.rs"]
+mod float_subword_bits;
+
+#[path = "x87_custom_storage.rs"]
+mod x87_custom_storage;
+
+#[path = "dwarf_complex_values.rs"]
+mod dwarf_complex_values;
+#[path = "project_direct_globals.rs"]
+mod project_direct_globals;
+
+#[path = "x87_empty_return.rs"]
+mod x87_empty_return;
+
+#[path = "windows_stack_argument_alignment.rs"]
+mod windows_stack_argument_alignment;
+#[path = "project_named_globals.rs"]
+mod project_named_globals;
+#[path = "x87_register_payload.rs"]
+mod x87_register_payload;
+
+#[path = "x87_free_operands.rs"]
+mod x87_free_operands;
+
+#[path = "prototype_call_mechanisms.rs"]
+mod prototype_call_mechanisms;
+#[path = "qualified_storage_addresses.rs"]
+mod qualified_storage_addresses;
+#[path = "qualified_import_storage.rs"]
+mod qualified_import_storage;
+
+#[path = "readonly_leaf_stack.rs"]
+mod readonly_leaf_stack;
+
+#[path = "global_array_bit_transfers.rs"]
+mod global_array_bit_transfers;
+
+#[path = "project_assertion_status.rs"]
+mod project_assertion_status;
+
+#[path = "x87_integer_conversions_native.rs"]
+mod x87_integer_conversions_native;
+
+#[path = "float_pointer_storage.rs"]
+mod float_pointer_storage;
+
+#[path = "dwarf_overlapping_locals.rs"]
+mod dwarf_overlapping_locals;
+
+#[path = "float_literal_width.rs"]
+mod float_literal_width;
+
+#[path = "project_call_declarations.rs"]
+mod project_call_declarations;
+
+#[path = "parameter_spill_reuse.rs"]
+mod parameter_spill_reuse;
+
+#[path = "declared_callee_pop.rs"]
+mod declared_callee_pop;

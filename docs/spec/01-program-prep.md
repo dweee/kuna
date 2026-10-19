@@ -1739,7 +1739,10 @@ moves.
   prototype. Independently, every provenance-confirmed import receives an
   address-keyed copy at each resolver address. Thus an IAT slot and veneer remain
   typed even when a same-spelled export suppresses the global key; the export
-  itself remains untouched.
+  itself remains untouched. Two complex-valued rows, `cexpf` and `cexp`, are
+  seeded with the DWARF pass's complex pair types (below), and only where that
+  layout applies to the value's width, so a call passes and returns the value
+  in the target's own registers or hidden buffer.
 - **(kuna) Library parameter and result names** (for `libcnames`,
   `decompiler/crates/kuna-analysis/src/analyzers/protos/kuna_libcnames.rs (library_names)`):
   every prototype the three libc tables above build carries the library's own
@@ -2243,8 +2246,18 @@ moves.
   three unrelated pointer locals. Plain frame slots, including Fortran `VALUE`
   arguments, keep their value types. Other source languages are not inferred
   from this pattern (a C++ class passed by invisible reference carries the same
-  location form), nor are composite expressions or the optimized forms
-  (`DW_OP_breg<n> 0`, location lists), which still import the value type. Both
+  location form), nor are composite expressions. Optimized arguments also receive pointer
+  types when their location is exactly `DW_OP_breg<n> 0` in an incoming integer
+  argument register for the image ABI. Location lists must contain one unambiguous
+  expression covering the subprogram entry. Register values, stack/frame-pointer
+  locations, nonzero offsets and stack-value expressions retain their value types.
+  The register rule skips only values the ABI itself may pass by value through a
+  hidden address in that register: none on x86-64 System V or 32-bit Arm, sizes
+  other than 1, 2, 4 and 8 bytes on Win64, and values wider than two argument
+  registers on AArch64 and RISC-V. Every other value type, including derived
+  types, arrays, complex and extended floating types, becomes a pointer; leaving
+  one of them a value would hand its register to the next reference argument
+  and misname every argument after it. Both
   the name-bound and the address-bound prototype import paths apply the rule;
   a `DW_TAG_enumeration_type` becomes a real enum type — name, declared width,
   signedness, and the `DW_TAG_enumerator` value→name map (05 §5.1), which is what
@@ -2273,7 +2286,22 @@ moves.
   stays a `char *`. Both used to read
   as `char`, so a clang `int fwd(char *b, const char *f, unsigned char c)
   { return sprintf(b, f, c); }` printed `sprintf(b,f,c)` with `char c`, which
-  compiles to a sign extension (202 prints as -54). An array's length is read
+  compiles to a sign extension (202 prints as -54). A `DW_ATE_complex_float`
+  base type
+  (`decompiler/crates/kuna-analysis/src/analyzers/dwarf/kuna_dwarfcomplex.rs`)
+  becomes a structure of two floating fields, `real` and `imag`, each half
+  the value's size, aligned to that half (`kuna_complex_float`,
+  `kuna_complex_double`), on the compiler specifications whose ABI passes and
+  returns the complex value exactly like that pair structure: ELF SysV AMD64
+  and PE x64 Windows for complex float and double, PE i386 for complex float
+  only (double-complex recovery there additionally requires correct stack
+  argument alignment). It used to fall through to the integer mapping, so
+  `float complex f(float complex z) { return cexpf(z); }` printed
+  `long f(long z)` with the call's argument and result lost. A complete
+  layout of that name is reused across units; a same-named type with any
+  other layout (a user's) is left untouched and the next free numbered name
+  is taken. Other targets, and `long double` complex everywhere, keep their
+  previous mapping. An array's length is read
   from its first `DW_TAG_subrange_type` child
   (`decompiler/crates/kuna-analysis/src/analyzers/dwarf/kuna_dwarfbounds.rs`): an
   explicit `DW_AT_count` wins, otherwise `upper - lower + 1` over signed bounds,
@@ -2285,8 +2313,12 @@ moves.
   zero origin used to be assumed everywhere, so gfortran's `real :: a(3)` read
   as `float a[4]` and `a(-8:-4)` as `float a[1]`;
   (3) stack locals — direct `DW_OP_fbreg` children become typelock|namelock stack
-  symbols at `call_frame_cfa + fbreg`, re-seeded per decompile (§1.1); nested
-  lexical-block locals and composite locations are a documented loss. (ida) The
+  symbols at `call_frame_cfa + fbreg`, re-seeded per decompile (§1.1). A frame
+  location may include `DW_OP_plus_uconst` displacements, as emitted for interior
+  equivalence views. Each unsigned LEB128 operand is decoded and added without
+  signed overflow; truncated operands and dereference, piece, register, or value
+  expressions remain outside this fixed-local path. Nested lexical-block locals
+  and composite locations are a documented loss. (ida) The
   data-global fix (DIV-24): a global used to be mapped with a size-1 type, so any
   multi-byte access queried `queryContainer(addr, 4)` past it and rendered
   `dat_<addr>`; the pass now resolves `DW_AT_type` to a byte size
