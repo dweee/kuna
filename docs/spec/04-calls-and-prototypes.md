@@ -407,7 +407,23 @@ stack, upstream rounds its slot up to the data type's alignment. The kuna
 takes the next free stack slot (`modelrules.rs (AssignAction::assign_address)`).
 `SparcV9_32.cspec` sets it: SPARC32 passes arguments as consecutive words, while
 its data organization aligns eight-byte objects to eight for structure layout.
-Every other cspec keeps the upstream rounding.
+
+The fallback walk rounds the same way: an aligned stack `<pentry>` wastes slots
+until the argument's offset from the entry's base is a multiple of its data type's
+alignment (`fspec.rs (ParamEntry::get_addr_by_slot_justify)`). The kuna
+`<pentry stackalign="false">` attribute skips that rounding too, so each slot
+keeps only the entry's own `align`
+(`p4_calls/kuna_stackparamalign.rs (effective_alignment)`). `x86win.cspec` sets
+it on the stack entry of `__stdcall`, `__cdecl`, `__fastcall` and `__thiscall`:
+Windows i386 passes every stack argument in four-byte slots, while its data
+organization aligns `double`, `long long` and a structure holding one to eight.
+A `double` or `struct { double re, im; }` after an `int` or the hidden return
+pointer therefore sits at entry ESP+8, where the callee reads it, not at ESP+12.
+The data type's own alignment, and so its field offsets, are unchanged. An
+absent attribute or `true` keeps the rounding; `false` on a register entry or a
+single-slot entry, or any other value, fails the `<pentry>` decode
+(`kuna_stackparamalign.rs (decode)`), which drops the model like any other
+malformed `<pentry>`. Every other cspec keeps the upstream rounding.
 
 The bundled AArch64 cspecs (`AARCH64.cspec`, `AARCH64_apple.cspec` and
 `AARCH64_win.cspec`) never split an argument wider than one general register
@@ -1115,7 +1131,18 @@ that machinery.
   param <func>::<i> <storage> <decl>` and `map return <func>::<storage>
   <decl>`, reached from the CLI as `--assert 'param <func>::<i> …'`. A slot no
   directive named is `undefined` of pointer width, so slots may be declared in
-  any order. A CALLIND through a literal global slot has one additional early
+  any order. (kuna) Explicit return storage also keeps the return out of that
+  model-driven input assignment (`kuna_customreturn.rs`): the inputs are laid
+  out against a temporary `void` result before the stated output is installed.
+  A return the model cannot place in a register (a ten-byte x87 `float10` under
+  the x86 models, which the model returns through a hidden pointer) therefore
+  no longer adds a hidden return-pointer input that survives the override,
+  takes the first stated slot, and shifts the stack-pop inference. Inputs no
+  directive overrides keep the slots the model assigns with every stated input
+  in the list, so a stack input that follows one overridden to a register keeps
+  the stack offset it would have had. Pieces without explicit return storage
+  allocate an indirect return as before.
+  A CALLIND through a literal global slot has one additional early
   source: when input 0 is either the unwritten memory Varnode at that exact
   address or the result of exactly `LOAD(constant-space, constant-address)`,
   the slot is queried before generic recovery. An exact data symbol contributes
@@ -2780,6 +2807,80 @@ and a `uint16_t` to `unsigned short`, and an x86-64 `int` parameter read as a
 `int` but whose body reads only its low byte (`(unsigned char)c` stored into a
 buffer) narrows as well; the C is still exact, but the declared type is not the
 source's.
+
+### (kuna) `narrowargs callers` — a 32-bit ARM parameter its callers extend
+
+The AAPCS has the caller extend a `uint8_t`, `int16_t` or `_Bool` argument to
+the whole register (`uxtb r1, r4; bl f`), and the callee relies on it: its body
+reads the register at full width, every bit is consumed, and the body rule
+above never fires. On ARM firmware these are the parameters decbench's
+type_match finds typed `unsigned int` or `int` most often. The evidence is at
+the call sites, so `narrowargs callers` (the option's default) gathers it in a
+whole-binary `decompile-all` of a 32-bit ARM image
+(`decompiler/crates/kuna-decomp/src/p4_calls/kuna_callerargs.rs`).
+
+After every decompile of the callee-first pass, `record` notes what each direct
+CALL passes in each argument register: whether the value fits a byte or a
+halfword unsigned (its nonzero-bit mask, or an argument the trimming cut from a
+zero-extended register), whether it is the sign extension of one (a sign
+extension, a zero extension of a byte, a constant that is one, or a copy or
+merge of such values), whether it is 0 or 1, and whether the caller extended it
+itself: a mask by exactly `0xff` or `0xffff` (the lifted `uxtb`/`uxth`) or an
+extension of a value it computed, not of a load, a call's result or its own
+input. A compiler emits that last kind for a narrow parameter and not for an
+`int`, so it is what a statement needs; a constant or a byte load alone is as
+often passed to an `int`.
+
+A function is a candidate only when its callers can all be listed, which is
+checked from two sides, each erring toward leaving the function open. The image
+is scanned once (`arm_closure.rs (scan)` in the CLI): no 32-bit value at any byte
+offset of a loaded section is the entry or the entry with the Thumb bit (a vector
+table, a literal pool, a pointer in a packed record) or the entry less the
+word's own address (a self-relative table), no dynamic relocation targets it,
+no `movw`/`movt` pair could
+build it (the halves are not matched), no PC-relative build lands on it (an
+`adr`, or a literal `ldr rX, [pc, #]` followed within 64 bytes by `add rX, pc`:
+the Thumb-2 and A32 PIC idiom of Linux and Android shared code), it is not
+exported or the entry point, and every instruction that decodes as a direct
+branch or call to it (decoded at every offset an instruction could start at) is
+a call or tail jump the cross-reference walk attributes to a known function,
+the function itself included (`CallGraph::arm_closed_sites`). And no decompiled
+body holds the entry as a value (`taken_entries`): any constant the analysis
+resolved, whatever idiom built it, equal to the entry or the entry with the Thumb
+bit anywhere but as a direct call's target, nor resolves an indirect call to it,
+nor flows into its code through an indirect branch. When the first pass is over,
+`decide` requires the recorded CALLs to be exactly the listed references,
+including a function's calls to itself; a tail jump decompiled as a branch, a
+caller that failed or a call through a register leaves the list incomplete and
+nothing is stated. An image whose dynamic relocations cannot be read (Android's
+packed `DT_ANDROID_REL`/`DT_ANDROID_RELA` tables, where an address may exist only
+as an encoded delta) closes no function at all.
+
+What remains unseen: a table of offsets relative to the table or to another
+function, read through an index the analysis cannot resolve, holds the address
+in no form a byte scan can recognize. C compilers do not emit such tables on
+32-bit ARM (hand-written assembly can); where kuna resolves the indirect call,
+the function is left open as above. For each of the function's own register-wide
+integer parameters, every call must pass a value of one narrow kind in that
+same register: all 0 or 1 with one of them computed (`bool`), or zero-fitting
+with one caller zero-extending (`unsigned char`/`unsigned short` at the widest
+width any call needs), or sign-fitting with one caller sign-extending (`char`/
+`short`). A caller that zero-extends and another that sign-extends, or one that
+passes a value wider than the width, states nothing.
+
+The function is then decompiled again (`caller_args_round`, plan order) with
+the statement seeded (`seed`), and `narrowargs`' rewrite replaces the stated
+input by its low part extended by `INT_ZEXT` or `INT_SEXT` at the entry
+(`narrow_stated`); type inference gives the narrow input the stated type
+(`input_vote`). Every call passes a value that fits, so every value the body
+computes is unchanged; every caller's C passes an argument the narrow parameter
+holds without loss. The redo pass may reprint 5% of the lines the first pass
+printed (a function of at most 32 lines is always redone), and a redo that
+fails or moves the arity keeps the first body and drops the statement. The
+callers are not decompiled again. Under `on` the body rule alone runs; any other
+architecture, a relocatable object, and the single-function `kuna decompile`
+are unaffected. Tests: `tests/cli/arm-parameter-every-caller-extends-is-narrow.json`
+and its `narrowargs on` twin, on the fixture `callerargs_thumb`.
 
 ### (kuna) `calleeprotostack` — the declared callee's stack contract
 
@@ -7247,3 +7348,15 @@ return what they tail-call or call, and nine PLT stubs return the import's resul
 (`v1 = (*dat_17e58)(); return v1;` for `lseek`). Each prints the signature
 `decompile-all` prints. Only a function whose callers read it pays for a second
 drive.
+
+An explicitly freed x87 ST0 is not an inferred return value. Before SSA, a
+must-empty analysis records ordinary returns reached with ST0 empty on every
+path. FFREE must name the raw ST0 register; equal values in ST1 do not qualify.
+Any later ST0 write, tag-word write, call, or other opaque user-op withdraws
+the proof. Partial accesses to the x87 register bank also withdraw it: they
+include MMX instructions whose tag effects the SLEIGH lift may leave implicit.
+A function with no FFREE bypasses the graph analysis. Joins
+require every reachable predecessor, including loop entry paths, to agree.
+Return recovery withdraws an unlocked ST0 trial only when every remaining
+ordinary return has that proof. Explicit and caller-forced results take priority.
+Restarting analysis clears and rebuilds the evidence.

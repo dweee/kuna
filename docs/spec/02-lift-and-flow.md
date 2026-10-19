@@ -1437,6 +1437,14 @@ shape is still reachable. Sharing is worth about 16% of the wall time of a
 two-table function, and on the interleaved shape `unrolledguard` was written for
 it recovers the same tables without any tolerance rule, because the shared
 partial's edge collection runs once while every sibling table is still empty.
+(kuna) Under a per-function budget (`00-overview.md`, *The watchdog*) the loop is bounded in
+time as well: `flow.rs (FlowInfo::recover_jump_tables)` asks the drive's
+deadline before each table and after its attempt, and `jumptable.rs
+(JumpTable::recover_model)` after the basic and the default-path model. A
+table reached once the deadline has passed is not attempted — its BRANCHIND is
+truncated like any unrecovered one, so the loop drains instead of staging more
+sub-decompilations — and the budget error names the step and the indirect
+jump's address. Without a budget each probe is one thread-local read.
 Two pre-checks bound the attempt:
 `funcdata_block.rs (Funcdata::early_jump_table_fail)` backtracks up to 8 ops
 through value-preserving arithmetic looking for a computation the recovery can
@@ -1502,6 +1510,16 @@ the case targets.
    switch). One special case: if the meld is a single read-only Varnode, the
    "switch" is a jump through a read-only pointer; its value is read from the
    load image and the table has one entry.
+   If that normalized variable is itself the output of a byte-sized LOAD, a
+   bounded common input farther down the meld may prove a smaller, exact output
+   domain. Kuna emulates every input value through the path, with one
+   `max_jumptable_size` total value budget across candidates, and accepts that
+   domain only when every direct or implicit load-image read is wholly covered,
+   byte by byte, by global read-only and non-volatile properties. It then
+   carries the resulting finite set through target recovery. An unbounded input,
+   failed emulation, or any writable or unclassified read leaves the original
+   selector range intact, so an image snapshot cannot stand in for mutable
+   program state.
    **Stranded rows.** The smallest range can belong to a variable in front of
    a map: in `switch (map[mode])` one guard bounds `mode` and a second bounds
    `map[mode] - 8` to the table, and `mode`'s range is the smaller. A value of

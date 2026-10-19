@@ -1197,7 +1197,8 @@ fn watchdog_stops_region_structuring_and_the_batch_continues() {
     let doc: serde_json::Value = serde_json::from_str(&stdout).expect(&stderr);
     let functions = doc["functions"].as_array().unwrap();
     let stress = functions.iter().find(|f| f["name"] == "stress").unwrap();
-    assert_eq!(stress["error"], "per-function decompile budget exceeded (1 s)", "{stdout}");
+    let error = stress["error"].as_str().unwrap_or_default();
+    assert!(error.starts_with("per-function decompile budget exceeded (1 s) in "), "{stdout}");
     assert!(stress["code"].is_null(), "{stdout}");
     let after = functions.iter().find(|f| f["name"] == "after").unwrap();
     assert!(after["error"].is_null(), "{stdout}");
@@ -8090,7 +8091,15 @@ fn check_elemptr_round_trip(run_native: bool) {
                 let listed = header.lines().find_map(|l| {
                     let why = l.split_once(&format!("/* {n} is "))?.1;
                     let decls = why.split_once("so it is not declared: ")?.1.trim_end_matches(" */");
-                    decls.split(", ").find(|d| d.contains('*') || d.ends_with("[]")).map(str::to_string)
+                    let views: Vec<_> = decls.split(", ").collect();
+                    let byte_address = !bodies.contains(&format!("{n}["))
+                        && views.iter().any(|d| *d == format!("long {n}") || *d == format!("unsigned long {n}"));
+                    if byte_address {
+                        assert!(!header.lines().any(|line| line.starts_with("extern ") && line.contains(n)));
+                        Some(format!("long {n}"))
+                    } else {
+                        views.into_iter().find(|d| d.contains('*') || d.ends_with("[]")).map(str::to_string)
+                    }
                 });
                 // A name the header leaves out is main's integer global; one the
                 // bodies subscript is a pointer.

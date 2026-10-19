@@ -157,6 +157,7 @@ pub struct DirectiveSymbol {
 }
 
 pub struct Funcdata {
+    pub(crate) kuna_x87_empty_returns: Vec<Address>,
     pub(crate) kuna_fpu_trunc_views: Vec<OpId>,
     /// Boolean properties associated with \b this function (C++ `flags`)
     flags: uint4,
@@ -591,6 +592,8 @@ pub struct Funcdata {
     /// (kuna `calleevote`) The types every caller of this function passes for its
     /// inputs, copied off the `Architecture` after the flow build.
     kuna_calleevote_inputs: Option<std::rc::Rc<crate::kuna_calleevote::CallerTypes>>,
+    /// (kuna `narrowargs callers`) The parameters every caller passes narrow.
+    kuna_callerargs: Option<std::rc::Rc<Vec<crate::kuna_callerargs::NarrowParam>>>,
     /// (kuna `elfmain`) The C runtime's `main` declaration this function's inputs
     /// take, when it is an executable's own `main`. See [`crate::kuna_elfmaindecl`].
     kuna_elfmain: Option<std::rc::Rc<crate::kuna_elfmaindecl::Runtime>>,
@@ -706,6 +709,7 @@ impl Funcdata {
 
         Ok(Funcdata {
             kuna_fpu_trunc_views: Vec::new(),
+            kuna_x87_empty_returns: Vec::new(),
             flags: 0,
             clean_up_index: 0,
             high_level_index: 0,
@@ -814,6 +818,7 @@ impl Funcdata {
             kuna_moved_back_returns: Vec::new(),
             kuna_pairs_first_low: false,
             kuna_calleevote_inputs: None,
+            kuna_callerargs: None,
             kuna_elfmain: None,
             kuna_calleevote_closed: false,
             kuna_elemptr_blocked: None,
@@ -1475,6 +1480,16 @@ impl Funcdata {
     /// (kuna `calleevote`) What this function's callers pass for its inputs.
     pub fn kuna_calleevote_inputs(&self) -> Option<&crate::kuna_calleevote::CallerTypes> {
         self.kuna_calleevote_inputs.as_deref()
+    }
+
+    /// (kuna `narrowargs callers`) Record the parameters every caller passes narrow.
+    pub fn kuna_set_callerargs(&mut self, stated: Option<std::rc::Rc<Vec<crate::kuna_callerargs::NarrowParam>>>) {
+        self.kuna_callerargs = stated;
+    }
+
+    /// (kuna `narrowargs callers`) The parameters every caller passes narrow.
+    pub fn kuna_callerargs(&self) -> Option<&std::rc::Rc<Vec<crate::kuna_callerargs::NarrowParam>>> {
+        self.kuna_callerargs.as_ref()
     }
 
     /// (kuna `elfmain`) Give this function's inputs the C runtime's `main`
@@ -4016,6 +4031,7 @@ impl Funcdata {
         self.kuna_regnarrow_values.clear();
         self.kuna_regnarrow_failed.clear();
         self.kuna_fpu_trunc_views.clear();
+        self.kuna_x87_empty_returns.clear();
         // Clear the analysis-derived flags (the exact mask from funcdata.cc:88).
         self.flags &= !(funcdata_flags::highlevel_on
             | funcdata_flags::blocks_generated
