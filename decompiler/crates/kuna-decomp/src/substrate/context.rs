@@ -619,6 +619,11 @@ mod tests;
 /// queries can use the remote scope. [`ArchHandle`] shares this context between
 /// the function and its analysis passes.
 pub struct ArchContext {
+    pub x87_empty_storage: Option<crate::p4_calls::kuna_x87emptyreturn::Storage>,
+
+    pub call_mechanisms: Rc<crate::kuna_callmechanisms::Mechanisms>,
+    /// (kuna) `callmechanisms` — apply compiler-spec prototype entry/return p-code.
+    pub call_mechanism_effects: bool,
     /// Shared spaces retain the pointer identities and indices used by lifted
     /// Varnodes. [`Self::new_shared`] accepts the engine's manager; [`Self::new`]
     /// wraps an owned manager for fixtures.
@@ -804,6 +809,9 @@ pub struct ArchContext {
     /// [`RuleSimdShuffleLane`](crate::kuna_simdlane::RuleSimdShuffleLane) can
     /// name a CALLOTHER without reaching the full `Architecture`.
     pub simd_shuffle_userops: Vec<kuna_base::types::uint4>,
+    /// (kuna) CALLOTHER ids of the x87 integer conversions read by
+    /// [`RuleX87Truncate`](crate::kuna_x87truncate::RuleX87Truncate).
+    pub x87_float_to_int_userops: Vec<kuna_base::types::uint4>,
     /// (kuna) GH-1276/8777: fold flag-modelled comparison idioms (C++
     /// `fold_flag_compare`, DIV-3 default-on).  Read by
     /// [`RuleBoolSignLess`](crate::kuna_flagcompare::RuleBoolSignLess) /
@@ -1069,6 +1077,7 @@ pub struct ArchContext {
     /// Read by `Heritage::guard_calls` through
     /// [`crate::p4_calls::kuna_calleepreserves::callee_preserves_range`].
     pub callee_preserves: bool,
+    pub global_call_ranges: bool,
     /// (kuna) let the callee's decoded body answer for the call's RETURN
     /// register too (`calleeretpreserves`).  Read by `Heritage::guard_calls`
     /// through
@@ -1719,8 +1728,11 @@ impl ArchContext {
         // C++ default: getMinimumLanedRegisterSize() returns the configured
         // minimum; the upstream default when unset is 4.
         ArchContext {
+            call_mechanisms: Rc::default(),
+            call_mechanism_effects: false,
             manage,
             min_laned_register_size: 4,
+            x87_empty_storage: None,
             lanerecords: Vec::new(),
             opbehaviors: Vec::new(),
             floatformats: Vec::new(),
@@ -1795,6 +1807,7 @@ impl ArchContext {
             const_space_load_fold: false, // constspaceload (the ArchSeam carries the real default)
             drop_call_push: false,        // callpush (the ArchSeam carries the real default)
             simd_shuffle_userops: Vec::new(),
+            x87_float_to_int_userops: Vec::new(),
             fold_flag_compare: false,    // GH-1276/8777 flagcompare
             add_carry_chain: false,      // GH-8913 addcarrychain
             ov_less_simplify: false,     // GH-7190 ovlesssimplify
@@ -1885,6 +1898,7 @@ impl ArchContext {
             zero_fill_return: true,
             zero_call_regs: true,
             callee_preserves: true,
+            global_call_ranges: true,
             callee_ret_preserves: true,
             callee_scratch_body: true,  // calleescratchbody (DIV-149 default-on)
             indirect_anchor: true,      // indirectanchor (default-on)
@@ -2538,6 +2552,15 @@ impl ArchContext {
                 continue;
             }
             let entry_addr = Address::new(std::rc::Rc::clone(space), e.first);
+            if let Some(mut proto) = crate::kuna_qualifiedcall::prototype(self, &entry_addr) {
+                if e.func_inject_id >= 0 {
+                    proto.set_inject_id(e.func_inject_id);
+                }
+                if e.func_no_return && self.peimportcall {
+                    proto.set_no_return(true);
+                }
+                return Some((e.symbol_name.clone(), entry_addr, std::rc::Rc::new(proto)));
+            }
             // Prefer a recovered code prototype when the type carries one (a
             // declared callee, e.g. `parse line extern void f(...)`); otherwise
             // hand back the default void proto the C++ funcsym's `getFuncProto`
