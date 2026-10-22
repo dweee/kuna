@@ -2936,7 +2936,10 @@ truncating the fall-through here"
             // datatest renders the cloned body, not a modeled call).  So we
             // restrict the pre-seat to NON-inline calls, exactly mirroring which
             // calls the C++ ActionDefaultParams copy arm actually reaches.
-            if !is_inline_call && !fc.proto().has_model() {
+            // (kuna `armfloatreturn`) A declared AEABI helper is laid out under
+            // the core-register model by ActionDefaultParams instead.
+            let helper = crate::kuna_armfloatreturn::declared_helper_model(self.data.get_arch(), fc.get_name()).is_some();
+            if !is_inline_call && !fc.proto().has_model() && !helper {
                 let callee_proto = if entry.is_invalid() {
                     None
                 } else {
@@ -3567,13 +3570,21 @@ truncating the fall-through here"
         // `None` and rebuilt per table when `option jtsharepartial` is off.
         let mut shared_partial: Option<Funcdata> = None;
         for op in table_ops {
-            let mode = self.data.recover_jump_table_flow(
-                op,
-                record,
-                &visited_snapshot,
-                run_pipeline,
-                &mut shared_partial,
-            );
+            let at = self.data.obank().get(op).map_or(0, |o| o.get_addr().get_offset());
+            let _scope = crate::decompile_drive::JumpTableScope::enter(at);
+            let mode = if crate::decompile_drive::deadline_passed_in("jump-table recovery") {
+                Ok(None)
+            } else {
+                let mode = self.data.recover_jump_table_flow(
+                    op,
+                    record,
+                    &visited_snapshot,
+                    run_pipeline,
+                    &mut shared_partial,
+                );
+                crate::decompile_drive::deadline_passed_in("jump-table recovery");
+                mode
+            };
             match mode {
                 Ok(Some(jt_idx)) => {
                     let tail = (!for_inline).then(|| self.tail_call_table_dest(op, jt_idx));
@@ -3857,6 +3868,7 @@ impl<E: FlowEnvironment> PcodeEmit for FlowEmit<'_, '_, E> {
             }
             i += 1;
         }
+        crate::kuna_localstackviews::record_native(self.fd, op);
         self.emitted.push(op);
     }
 }
