@@ -1652,6 +1652,20 @@ and COPY propagation see the declared two-byte character type. Neighboring
 data mappings and function symbols are never replaced, and no global string
 length or encoding heuristic is changed.
 
+The declaration also owns every other byte of its span. An inferred string --
+a character array whose type is locked but whose synthetic `s_<addr>` name is
+not, mapped at one address -- that shares any byte with the declared range is
+removed, whether it starts inside the range or straddles either end. Otherwise
+the narrower string wins the container lookup for an interior read (a `float
+values[3]` table whose middle bytes happen to spell text read back as
+`s_2002[2]`), and the header refuses both overlapping objects, leaving each
+name undeclared. Name-locked data, earlier explicit declarations, and symbols
+mapped at more than one address are kept. A constant pointing into the middle
+of a declared aggregate then follows the ordinary exact-hit rule above: it is
+recovered as a pointer into the declaration when its sink is typed as a
+pointer, and otherwise prints as the bare address, the same as for an
+aggregate the DWARF tier declared.
+
 Two (kuna) escapes hook exactly here, both shipped default-on (DIV-2,
 `decompiler/crates/kuna-decomp/phases.toml`):
 
@@ -3056,14 +3070,15 @@ is walked on in turn. The cast pass reinterprets the float for an ordered
 comparison, and for an `==` or `!=` too except against such a constant
 (chapter 09, *Integer equality on float bits*), where the float comparison
 holds for exactly the bits the binary tests (`ABS(a0) == INFINITY`, `a0 ==
-1.0`, `a0 == 16777218.0`), while `-0.0` equals `0.0`, a NaN equals nothing,
+1.0f`, `a0 == 16777218.0f`), while `-0.0` equals `0.0`, a NaN equals nothing,
 and a flushed denormal equals zero. The refusals below predate that cast and
 are kept: an accepted input against any other constant would now print as
-the union reinterpretation of its bits rather than a wrong float comparison. The printer writes a float
-constant by its shortest digits with no `f` suffix, which C reads as a
-`double`, so `0.1f` prints `0.1`, another value, and `a0 == 0.1` is false for
-`a0 = 0.1f`; the literal is printed (`FloatFormat::print_decimal`, in both
-notations) and read back as a `double`, which must be the constant's value. So
+the union reinterpretation of its bits rather than a wrong float comparison. The
+test predates the `f` suffix the C printer now puts on a 4-byte constant
+(chapter 09) and still reads the constant's shortest digits
+(`FloatFormat::print_decimal`, in both notations) back as a `double`, which must
+be the constant's value: `0.1f` prints `0.1`, another double, so it is refused
+even though `a0 == 0.1f` would now compare exactly. So
 an `==` or `!=` with zero, a NaN pattern, a denormal, `0.1f`, `FLT_MAX` or
 another value refuses the input (`v.u == 0`, `(v.u & 0x7fffffff) ==
 0x7fc00000`, `x.u == y.u`, `v.u == 0x3dcccccd`). Anything else refuses the input as well:
@@ -3102,7 +3117,11 @@ or is a constant a float literal spells (`returned_beside_ok`). A slot that
 fails refuses every input that reaches it, and the plan is taken again without
 them, so the helper prints float on both sides or on neither: `fb_mix(float x,
 u32 k)` ors its integer parameter into the bits it returns in `s0`, and keeps
-`unsigned int fb_mix(unsigned int,unsigned int)`. A returned value in an
+`unsigned int fb_mix(unsigned int,unsigned int)`. Under `armfloatreturn`
+(chapter 04) a value returned in `s0` or `d0` is already locked to the float
+of its width; the walk passes that lock as it would an unlocked value, so
+`copysignf` still takes two floats, while `fb_mix` returns the convention's
+float and keeps its integer parameters. A returned value in an
 integer register is the classifier's answer and keeps its own type, so
 `isnanf`, `signbit` and newlib's `isfinitef` take a float parameter only. The
 bit ops in the body then read a float, the cast pass inserts the cast each

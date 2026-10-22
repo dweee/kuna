@@ -225,8 +225,15 @@ kuna_options! { self, p1;
     "stackaddrargtrial" => on_off!(stack_addr_arg_trial, "Stack-address input trials"),
     "callretpair" => on_off!(call_ret_pair, "Two-register CALL output completion"),
     "multiregargs" => on_off!(multi_reg_args, "Complete ABI register argument partitions"),
+    "callwide" => {
+        let enabled = on_or_off(p1)?;
+        self.kuna_callwide.clear();
+        self.call_wide = enabled;
+        Ok(format!("Caller-proved register-pair returns turned {}", if enabled { "on" } else { "off" }))
+    },
     "bejoin" => {
         let (mode, msg) = crate::kuna_bejoin::BeJoinMode::parse(p1)?;
+        self.kuna_callwide.clear();
         self.be_join = mode;
         Ok(msg)
     },
@@ -239,6 +246,8 @@ kuna_options! { self, p1;
     "sparcstructret" => on_off!(sparc_struct_return, "SPARC struct-return tail recovery"),
     "arraystride" => on_off!(recover_array_stride, "Strided-induction array recovery"),
     "stackalias" => on_off!(stack_alias_deadstore, "Stack-pointer-alias dead-store hold"),
+    "globalcallranges" => on_off!(global_call_ranges, "Global call access ranges"),
+    "localstackviews" => on_off!(local_stack_views, "Bounded local stack views"),
     "stackviews" => {
         let (value, message) = crate::kuna_stackviews::OptionStackViews.apply(p1)?;
         self.stack_views = value;
@@ -382,8 +391,13 @@ kuna_options! { self, p1;
         Ok(format!("ARM floating argument recovery turned {p1}"))
     },
     "narrowargs" => {
-        self.narrow_args = on_or_off(p1)?;
-        Ok(format!("Narrow register parameter recovery turned {p1}"))
+        let (body, callers) = match p1 {
+            "callers" => (true, true),
+            _ => (on_or_off(p1)?, false),
+        };
+        self.narrow_args = body;
+        self.narrow_args_callers = callers;
+        Ok(format!("Narrow register parameter recovery set to {p1}"))
     },
     "regnarrow" => {
         self.narrow_locals = on_or_off(p1)?;
@@ -393,8 +407,15 @@ kuna_options! { self, p1;
         self.narrow_ret = on_or_off(p1)?;
         Ok(format!("Narrow call result recovery turned {p1}"))
     },
+    "regsigned" => {
+        self.narrow_signed = on_or_off(p1)?;
+        Ok(format!("Signed narrow register local recovery turned {p1}"))
+    },
     "narrowext" => {
         let (mode, msg) = crate::kuna_narrowext::OptionNarrowExt.apply(p1)?;
+        if self.narrow_ext != mode {
+            self.kuna_callwide.clear();
+        }
         self.narrow_ext = mode;
         Ok(msg)
     },
@@ -757,6 +778,9 @@ kuna_options! { self, p1;
     "bytehonest" => on_off!(byte_honest, "uncommitted-byte width reporting"),
     "slotptr" => on_off!(slot_ptr, "frame-slot pointer typing"),
     "reglocals" => on_off!(reg_locals, "register-local reporting"),
+    "slotreport" => on_off!(slot_report, "frame-slot local reporting"),
+    "callmechanisms" => on_off!(call_mechanism_effects, "compiler prototype call mechanisms"),
+    "slotsplit" => on_off!(slot_split, "frame-row splitting at declarations"),
     "voidtailreturn" => on_off!(voidtailreturn, "void tail-return elision"),
     "castimplied" => on_off!(cast_implied, "C-implied cast elision"),
     "castsign" => on_off!(cast_sign, "signed declarations for signed-only locals"),
@@ -865,6 +889,9 @@ kuna_options! { self, p1;
     },
     "thumbswitch" => {
         on_off!(analysis_thumbswitch, "Thumb tbb/tbh switch-table read in the Listing walk (GH-299)")
+    },
+    "x86listingswitch" => {
+        on_off!(analysis_x86listingswitch, "Bounded i386 switch successors in the discovery Listing")
     },
     "switchreach" => {
         on_off!(analysis_switchreach, "Register-chain jump-table reach in the reference walk")
@@ -1117,6 +1144,10 @@ kuna_options! { self, p1;
     "fast_funcdisc" => {
         on_off!(analysis_fast_funcdisc, "Fast whole-project function discovery")
     },
+    "lazyfuncs" => on_off!(
+        analysis_lazyfuncs,
+        "Materialize Function objects on demand instead of one per entry"
+    ),
     "rawdiscover" => {
         on_off!(analysis_rawdiscover, "Raw-image recursive function discovery")
     },

@@ -180,7 +180,7 @@ impl Action for ActionPrototypeTypes {
         // init).  The locked-input/output and truncated-space branches stay stubbed
         // (no locked proto / no truncated stack space on the recovery path).
 
-        let evalfp = data.get_arch().eval_fp_current().cloned();
+        let evalfp = crate::kuna_callmechanisms::evaluation_model(data);
         if let Some(evalfp) = evalfp {
             if !data.get_func_proto().is_model_locked()
                 && !data.get_func_proto().has_matching_model(&evalfp)
@@ -524,7 +524,13 @@ impl Action for ActionDefaultParams {
                             // present (Phase 3); a declaration that names none
                             // follows the image's float convention.
                             let seed_model = callee_model
+                                .or_else(|| {
+                                    crate::kuna_armfloatreturn::declared_helper_model(&arch, &pieces.name).or_else(|| {
+                                        crate::kuna_armfloatreturn::declared_helper_model(&arch, data.get_call_specs(i).get_name())
+                                    })
+                                })
                                 .or_else(|| crate::kuna_typedcallabi::undeclared_model(&arch, &pieces))
+                                .or_else(|| crate::kuna_armfloatreturn::helper_model(&arch, &pieces.name))
                                 .unwrap_or(dfp);
                             match fp.seed_locked_from_pieces(
                                 &pieces,
@@ -554,17 +560,21 @@ impl Action for ActionDefaultParams {
                 };
                 match callee_proto {
                     Some(calleeproto) => {
+                        let model = crate::kuna_armfloatreturn::helper_model(&arch, data.get_call_specs(i).get_name())
+                            .unwrap_or_else(|| evalfp.clone());
                         data.get_call_specs_mut(i).proto_mut().copy(&calleeproto);
                         let fc = data.get_call_specs(i);
-                        if !fc.proto().is_model_locked() && !fc.proto().has_matching_model(&evalfp) {
-                            data.get_call_specs_mut(i).proto_mut().set_model(Some(evalfp.clone()));
+                        if !fc.proto().is_model_locked() && !fc.proto().has_matching_model(&model) {
+                            data.get_call_specs_mut(i).proto_mut().set_model(Some(model));
                         }
                     }
                     None => {
                         // No source-declared callee prototype (a symbol with no
                         // Funcdata): set the default-model internal proto.  The
                         // register-parameter datatests resolve here.
-                        data.get_call_specs_mut(i).proto_mut().set_internal(evalfp.clone(), void_ty.clone());
+                        let model = crate::kuna_armfloatreturn::helper_model(&arch, data.get_call_specs(i).get_name())
+                            .unwrap_or_else(|| evalfp.clone());
+                        data.get_call_specs_mut(i).proto_mut().set_internal(model, void_ty.clone());
                         // (kuna) A console `map return <addr>`-only callee: keep the
                         // model-driven input recovery just established, but lock the
                         // custom return storage on top (the C++ `map return` locks
@@ -580,10 +590,16 @@ impl Action for ActionDefaultParams {
                         }
                     }
                 }
+            } else if arch.callee_proto_model(data.get_call_specs(i).get_entry_address()).is_some() {
+                crate::p4_calls::kuna_calleeprotostack::resolve_declared_extra_pop(
+                    arch.callee_proto_stack,
+                    data.get_call_specs_mut(i).proto_mut(),
+                );
             }
-            // fc->insertPcode(data): inject any uponreturn p-code.  STUB(W4
-            // pcodeinjectlib): the default models on the datatest path declare no
-            // uponreturn injection, so this is a no-op here.
+            if let Err(error) = crate::kuna_callmechanisms::apply_return(data, i) {
+                data.kuna_call_mechanisms.failure = Some(error.to_string());
+                return 0;
+            }
         }
         // (kuna) `msvcbyval`: size an MSVC `__cdecl` import's by-value class at
         // each call, now that every call's pop is known.  See
@@ -1733,7 +1749,9 @@ impl Action for ActionReturnRecovery {
             crate::p4_calls::kuna_zerofillreturn::drop_zero_fill(data, &mut active, &return_ops);
             crate::kuna_armfloatreturn::narrow_returns(data, &mut active);
             crate::kuna_retsysreg::drop_set_aside(data, &mut active, &return_ops);
+            crate::p4_calls::kuna_x87emptyreturn::drop_empty(data, &mut active, &return_ops);
             let own_input = crate::kuna_retcallhalf::accept(data, &mut active, &return_ops);
+            crate::p4_calls::kuna_callwide::retain_pair(data, &mut active, &return_ops);
             let manager_rc = data.get_arch().manage.clone();
             let _ = data.get_func_proto().derive_output_map(&mut active, &manager_rc);
             crate::p4_calls::kuna_voidret::whole_or_none(data, &mut active);
@@ -1753,6 +1771,7 @@ impl Action for ActionReturnRecovery {
             }
             crate::p4_calls::kuna_voidret::void_unless_returned(data);
             crate::kuna_armfloatreturn::type_returns(data, &active);
+            crate::kuna_x87return::type_returns(data, &active);
             data.clear_active_output();
             self.base.count += 1;
         } else {
@@ -1885,6 +1904,8 @@ impl Action for ActionInputPrototype {
                 };
                 if data.get_func_proto().possible_input_param(&addr, size)
                     && !crate::kuna_armfloatreturn::split_double_input(data, vn)
+                    && !crate::kuna_armfloatreturn::bank_saved_input(data, vn)
+                    && !crate::kuna_armfloatargs::stray_vector_input(data, vn)
                 {
                     let slot = active.get_num_trials();
                     active.register_trial(&addr, size);
