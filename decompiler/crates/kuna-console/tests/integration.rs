@@ -52,6 +52,9 @@ mod verify_buildstamp;
 #[path = "verify_bytehonest.rs"]
 mod verify_bytehonest;
 
+#[path = "verify_lazyfuncs.rs"]
+mod verify_lazyfuncs;
+
 #[path = "verify_byteoverlay.rs"]
 mod verify_byteoverlay;
 
@@ -189,6 +192,9 @@ mod verify_indirect_callers;
 
 #[path = "verify_itaniumrtti.rs"]
 mod verify_itaniumrtti;
+
+#[path = "verify_jumptable_budget.rs"]
+mod verify_jumptable_budget;
 
 #[path = "verify_libc_proto_addresses.rs"]
 mod verify_libc_proto_addresses;
@@ -376,6 +382,9 @@ mod verify_srcmap;
 #[path = "verify_switchtable.rs"]
 mod verify_switchtable;
 
+#[path = "verify_x86listingswitch.rs"]
+mod verify_x86listingswitch;
+
 #[path = "verify_symbolstream.rs"]
 mod verify_symbolstream;
 
@@ -420,3 +429,6 @@ mod wrapped_stack_encode;
 
 #[path = "verify_notype_import_prototypes.rs"]
 mod verify_notype_import_prototypes;
+
+#[path = "verify_clear_architecture.rs"]
+mod verify_clear_architecture;
