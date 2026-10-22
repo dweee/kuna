@@ -1,8 +1,10 @@
-{ clang, lld, mingw32Binutils, mingw64Binutils, stdenv, symlinkJoin, writeShellScriptBin }:
+{ clang, lld, mingw32Binutils, mingw64Binutils, lib, stdenv, symlinkJoin, writeShellScriptBin }:
 
 # Native fixtures need Nix's libc/loader. Freestanding foreign fixtures need
 # raw Clang and target linkers, without cc-wrapper's host-only flags.
-symlinkJoin {
+let
+  resourceDir = "${clang.cc.lib}/lib/clang/${lib.versions.major clang.version}";
+in symlinkJoin {
   name = "kuna-fixture-clang";
   paths = map (name: writeShellScriptBin name ''
     target=
@@ -36,8 +38,8 @@ symlinkJoin {
         wasm*) linker=${lld}/bin/wasm-ld ;;
         *) linker=${lld}/bin/ld.lld ;;
       esac
-      exec ${clang.cc}/bin/${name} "-fuse-ld=$linker" "$@"
+      exec ${clang.cc}/bin/${name} -resource-dir ${resourceDir} "-fuse-ld=$linker" "$@"
     fi
-    exec ${clang.cc}/bin/${name} "$@"
+    exec ${clang.cc}/bin/${name} -resource-dir ${resourceDir} "$@"
   '') [ "clang" "clang++" ];
 }
