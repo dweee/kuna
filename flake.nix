@@ -57,6 +57,10 @@
             # Host fixture compilers must not link Nix libraries with the host loader.
             # GUI launchers can also inject their own runtime library path.
             unset LD_LIBRARY_PATH LIBRARY_PATH NIX_CFLAGS_LINK
+          '' + pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
+            # DWARF fixture relocations are interpreted before decompression by
+            # the current loader. Keep full -g information in its plain format.
+            export NIX_CFLAGS_COMPILE="''${NIX_CFLAGS_COMPILE-} -gz=none"
           '';
         };
       });
