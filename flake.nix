@@ -40,14 +40,11 @@
           mingw64Binutils = pkgs.pkgsCross.mingwW64.buildPackages.binutils;
         };
       in {
-        default = (pkgs.mkShell.override {
-          stdenv = if pkgs.stdenv.hostPlatform.isLinux then pkgs.gcc13Stdenv else pkgs.stdenv;
-        }) {
+        default = pkgs.mkShell {
           # CLI tests build and execute C/Fortran fixtures inside Cargo's
           # Nix runtime environment; native drivers must use the matching loader.
-          # Keep fixture compiler majors stable across upstream code changes.
           packages = [ pkgs.cargo pkgs.rustc pkgs.clippy pkgs.rustfmt pkgs.python3 pkgs.gnumake pkgs.git ]
-            ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [ fixtureClang pkgs.gfortran13 ];
+            ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [ fixtureClang pkgs.gfortran ];
           hardeningDisable = [ "fortify" "fortify3" "zerocallusedregs" ];
           CARGO_BUILD_JOBS = "2";
           CARGO_INCREMENTAL = "0";
