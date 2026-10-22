@@ -40,8 +40,9 @@
           CARGO_PROFILE_DEV_DEBUG = "0";
           CARGO_PROFILE_TEST_DEBUG = "0";
           shellHook = ''
-            # GUI launchers can inject bundled libraries and host link paths.
-            unset LD_LIBRARY_PATH NIX_CFLAGS_LINK
+            # Host fixture compilers must not link Nix libraries with the host loader.
+            # GUI launchers can also inject their own runtime library path.
+            unset LD_LIBRARY_PATH LIBRARY_PATH NIX_CFLAGS_LINK
           '';
         };
       });
