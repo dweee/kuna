@@ -33,7 +33,10 @@
       checks = forAllSystems (system: { inherit (self.packages.${system}) kuna; });
       devShells = forAllSystems (system: let pkgs = nixpkgs.legacyPackages.${system}; in {
         default = pkgs.mkShell {
-          packages = [ pkgs.cargo pkgs.rustc pkgs.clippy pkgs.rustfmt pkgs.python3 pkgs.gnumake pkgs.git ];
+          # CLI tests build and execute C/Fortran fixtures inside Cargo's
+          # Nix runtime environment; all drivers must use the matching loader.
+          packages = [ pkgs.cargo pkgs.rustc pkgs.clippy pkgs.rustfmt pkgs.python3 pkgs.gnumake pkgs.git ]
+            ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.clang pkgs.gfortran ];
           hardeningDisable = [ "fortify" "fortify3" "zerocallusedregs" ];
           CARGO_BUILD_JOBS = "2";
           CARGO_INCREMENTAL = "0";
