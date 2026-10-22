@@ -1603,6 +1603,9 @@ fn lost_result(t: &TargetSpec, reason: &str) -> FuncResult {
         code: None,
         error: Some(reason.to_string()),
         proto: None,
+        emitted_c_name: None,
+        call_declarations: Vec::new(),
+        callwide_prototypes: Vec::new(),
         variables: Vec::new(),
         types: Vec::new(),
         stack_objects: Vec::new(),
@@ -2031,6 +2034,12 @@ mod tests {
             code: Some("void main(void)\n{\n  \"q\\\\\" /* \u{1}é */\n}".into()),
             error: None,
             proto: Some("void main(void);".into()),
+            emitted_c_name: Some("main_linkage".into()),
+            call_declarations: vec!["int external_value(int value);".into()],
+            callwide_prototypes: vec![kuna_decomp::kuna_callwide::ExportPrototype {
+                name: "proved".into(), entry: 0x401020, signed: true,
+                inputs: vec![true, false], definition: false,
+            }],
             variables: vec![
                 VarInfo {
                     name: "param_1".into(),
@@ -2041,6 +2050,7 @@ mod tests {
                     arg_index: Some(0),
                     line_numbers: vec![3, 4],
                     addresses: vec![0x401004, 0x401008],
+                    split_piece: false,
                 },
                 VarInfo {
                     name: "local_18".into(),
@@ -2051,6 +2061,7 @@ mod tests {
                     arg_index: None,
                     line_numbers: Vec::new(),
                     addresses: Vec::new(),
+                    split_piece: false,
                 },
                 // (kuna `reglocals`) A local outside the frame: its `kind` is
                 // carried by `is_param` and `stack_offset` alone.
@@ -2063,6 +2074,7 @@ mod tests {
                     arg_index: None,
                     line_numbers: vec![5],
                     addresses: vec![0x40100c],
+                    split_piece: false,
                 },
             ],
             // (kuna `structdefs`) One recovered type definition, so the frame
@@ -2094,6 +2106,7 @@ mod tests {
                 direct: true,
                 aggregate: true,
                 elem: true,
+                integer: true,
             }],
             field_calls: vec![
                 kuna_decomp::kuna_calltargettype::FieldDecl {
@@ -2129,6 +2142,9 @@ mod tests {
             && a.code == b.code
             && a.error == b.error
             && a.proto == b.proto
+            && a.emitted_c_name == b.emitted_c_name
+            && a.call_declarations == b.call_declarations
+            && a.callwide_prototypes == b.callwide_prototypes
             && a.aliases == b.aliases
             && a.object_location == b.object_location
             && a.callee_hints == b.callee_hints
@@ -2153,6 +2169,7 @@ mod tests {
                     && x.arg_index == y.arg_index
                     && x.line_numbers == y.line_numbers
                     && x.addresses == y.addresses
+                    && x.split_piece == y.split_piece
             })
     }
 
@@ -2199,6 +2216,9 @@ mod tests {
             code: None,
             error: Some("budget exceeded".into()),
             proto: None,
+            emitted_c_name: None,
+            call_declarations: Vec::new(),
+            callwide_prototypes: Vec::new(),
             variables: Vec::new(),
             types: Vec::new(),
             stack_objects: Vec::new(),
@@ -2240,7 +2260,7 @@ mod tests {
     }
 
     #[test]
-    fn result_encoding_matches_the_version_seven_wire_layout() {
+    fn result_encoding_matches_the_version_eleven_wire_layout() {
         let dir = ScratchDir::create().unwrap();
         let path = dir.path().join("wire.bin").to_string_lossy().into_owned();
         let result = FuncResult {
@@ -2251,6 +2271,9 @@ mod tests {
             code: None,
             error: Some("e".into()),
             proto: None,
+            emitted_c_name: None,
+            call_declarations: Vec::new(),
+            callwide_prototypes: Vec::new(),
             variables: Vec::new(),
             types: Vec::new(),
             stack_objects: Vec::new(),
@@ -2265,10 +2288,11 @@ mod tests {
             detail: None,
         };
         let expected = [
-            b"KUNAJOBRES07\x01\x48\0\0\0".as_slice(),
+            b"KUNAJOBRES11\x01\x51\0\0\0".as_slice(),
             b"\x10\0\0\0\0\0\0\0\x20\0\0\0\0\0\0\0",
             b"\xff\xff\xff\xff\xff\xff\xff\xff",
             b"\x01\0\0\0f\0\x01\x01\0\0\0e\0\0",
+            b"\0", // emitted C name
             b"\0\0\0\0", // aliases
             b"\0\0\0\0", // line mappings
             b"\0\0\0\0", // variables
@@ -2278,6 +2302,8 @@ mod tests {
             b"\0\0\0\0", // field calls
             b"\0\0\0\0", // callee hints
             b"\0\0", // synth and pointer arguments
+            b"\0\0\0\0", // call declarations
+            b"\0\0\0\0", // callwide prototypes
         ]
         .concat();
         ResultWriter::create(&path).unwrap().push(&result).unwrap();
@@ -2285,6 +2311,26 @@ mod tests {
         let decoded = decode_results(&expected).unwrap();
         assert_eq!(decoded.len(), 1);
         assert!(same(&decoded[0], &result));
+    }
+
+    #[test]
+    fn malformed_or_oversized_wide_contracts_do_not_cross_the_worker_boundary() {
+        let dir = ScratchDir::create().unwrap();
+        let path = dir.path().join("wide.bin").to_string_lossy().into_owned();
+        let mut record = sample_result();
+        record.callwide_prototypes[0].definition = true;
+        ResultWriter::create(&path).unwrap().push(&record).unwrap();
+        let full = std::fs::read(&path).unwrap();
+        let decoded = decode_results(&full).unwrap();
+        assert_eq!(decoded.len(), 1);
+        assert!(same(&decoded[0], &record));
+        let mut malformed = full;
+        let at = malformed.windows(6).position(|bytes| bytes == b"proved").unwrap();
+        malformed[at + 6 + 8] = 2;
+        assert!(decode_results(&malformed).unwrap().is_empty());
+        record.callwide_prototypes[0].inputs = vec![false; 33];
+        ResultWriter::create(&path).unwrap().push(&record).unwrap();
+        assert!(decode_results(&std::fs::read(&path).unwrap()).unwrap().is_empty());
     }
 
     /// The dynamic source is the only thing `--stream` changes about the pool:
@@ -2655,6 +2701,9 @@ mod tests {
             code: None,
             error: Some(e.to_string()),
             proto: None,
+            emitted_c_name: None,
+            call_declarations: Vec::new(),
+            callwide_prototypes: Vec::new(),
             variables: Vec::new(),
             types: Vec::new(),
             stack_objects: Vec::new(),
