@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "checks": [],
+  "upstreams": [
+    {
+      "name": "Noelo-Lab/kuna",
+      "api": "https://api.github.com/repos/Noelo-Lab/kuna/releases/latest"
+    }
+  ]
+}
