@@ -4,6 +4,8 @@
 //! `lib.rs` so public paths (`kuna_decomp::<module>`) are unchanged.
 
 pub mod heritage;
+mod kuna_leafmemory;
+pub(crate) mod kuna_globalcallranges;
 pub mod subflow;
 mod kuna_constantbytes;
 pub mod condexe;
@@ -23,6 +25,7 @@ pub mod kuna_globalstorekeep;
 pub mod kuna_globalorderkeep;
 pub mod kuna_globalcallstore;
 pub mod kuna_intfloatround;
+pub mod kuna_floatquiet;
 pub mod kuna_mulblob; // (kuna) keep a widened multiply operand a value, not an aggregate
 pub mod kuna_booleanmask;
 pub mod kuna_ovlesssimplify;
@@ -45,10 +48,12 @@ pub(crate) mod kuna_stackbytecopy;
 pub(crate) mod kuna_spillstoreguard;
 pub mod kuna_tiedstorekeep;
 pub mod kuna_loopcounterstore;
+pub mod kuna_pairrefine;
 pub mod kuna_splitstorekeep;
 pub mod kuna_pointeestorekeep;
 pub mod kuna_constspaceload;
 pub mod kuna_simdlane;
+pub mod kuna_x87truncate;
 pub mod kuna_cancelbytearithmetic;
 pub mod kuna_wideslice;
 pub mod kuna_devectorize;
