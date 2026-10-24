@@ -867,6 +867,9 @@ pub struct Heritage {
     /// "can a pointer reach this stack slot?" with, gathered at most once per
     /// pass.  See [`crate::p4_calls::kuna_calleeprotostack`].
     protostack_alias: Option<Option<crate::varmap::AliasChecker>>,
+    /// Positive evidence of nested frame setup, retained across passes.
+    protostack_frame_reload: Option<bool>,
+    global_call_ranges: super::kuna_globalcallranges::Calls,
     /// (kuna `stackstoreguard`) Whether this pass's frame has a stack access
     /// whose pointer does not resolve, decided at most once per pass.
     store_frame_unresolved: Option<bool>,
@@ -920,6 +923,8 @@ impl Heritage {
             deadline: None,
             load_copy_ops: Vec::new(),
             protostack_alias: None,
+            protostack_frame_reload: None,
+            global_call_ranges: Default::default(),
             store_frame_unresolved: None,
             store_frame_guarded: false,
             global_store_guards: 0,
@@ -1084,6 +1089,7 @@ impl Heritage {
     pub fn clear(&mut self) {
         self.disjoint.clear();
         self.globaldisjoint.clear();
+        self.global_call_ranges.clear();
         self.domchild.clear();
         self.augment.clear();
         self.flags.clear();
@@ -1097,6 +1103,7 @@ impl Heritage {
         self.store_guard.clear();
         self.store_frame_unresolved = None;
         self.store_frame_guarded = false;
+        self.protostack_frame_reload = None;
         self.maxdepth = -1;
         self.pass = 0;
     }
@@ -1570,7 +1577,7 @@ impl Heritage {
                     .get_space()
                     .map(|s| s.get_type() != spacetype::IPTR_INTERNAL)
                     .unwrap_or(false);
-            let stack_effects = crate::kuna_stackeffects::enabled_for(fd, addr);
+            let stack_effects = crate::kuna_stackeffects::enabled_for(fd, addr, size);
             let mut guarded_stores = if (high_ptr_possible && level >= LEVEL_FULL) || stack_effects {
                 self.guard_stores(fd, addr, size, write, false)
             } else if high_ptr_possible && guard_stack_bytes {
@@ -1602,6 +1609,16 @@ impl Heritage {
         }
     }
 
+    pub(crate) fn rebound_frame_base_seen(&self) -> bool {
+        self.protostack_frame_reload == Some(true)
+    }
+
+    fn protostack_restored_frame_alias(&mut self, fd: &crate::funcdata::Funcdata) -> bool {
+        *self.protostack_frame_reload.get_or_insert_with(|| {
+            crate::kuna_calleeprotostack::rebound_frame_base(fd)
+        })
+    }
+
     /// (kuna `calleeprotostack`) Can a pointer in this function reach the stack
     /// slot at `offset`?
     ///
@@ -1630,7 +1647,11 @@ impl Heritage {
         {
             return true;
         }
-        if fd.get_arch().stack_views || fd.get_arch().stack_alias_deadstore {
+        if fd.get_arch().stack_views || fd.get_arch().stack_alias_deadstore
+            || crate::kuna_localstackviews::preserves_range(
+                fd, &Address::new(Rc::clone(spc), offset), size,
+            )
+        {
             if !spc.stack_grows_negative() {
                 return true;
             }
@@ -1717,7 +1738,13 @@ impl Heritage {
             // `killedbycall`.
             let mut effecttype = fc.proto().has_effect(&trans_addr, size);
             if effecttype == effect_type::UNKNOWN_EFFECT
-                && crate::kuna_calleememory::preserves(fd, fc, addr, size)
+                && ((super::kuna_leafmemory::preserves(fd, fc, addr, size)
+                        && !self.protostack_is_aliased(fd, &spc, addr.get_offset(), 1)
+                        && !self.protostack_is_aliased(fd, &spc,
+                            spc.wrap_offset(addr.get_offset().wrapping_add(size.saturating_sub(1) as uintb)), 1))
+                    || crate::kuna_calleememory::preserves(fd, fc, addr, size)
+                    || ((fl & varnode_flags::persist) != 0
+                        && self.global_call_ranges.preserves(fd, fc, addr, size)))
             {
                 effecttype = effect_type::UNAFFECTED;
             }
@@ -1741,6 +1768,10 @@ impl Heritage {
                         spc.get_addr_size() as int4,
                         floor,
                     ) && !self.protostack_is_aliased(fd, &spc, addr.get_offset(), size)
+                        && !(self.protostack_restored_frame_alias(fd)
+                            && crate::kuna_calleeprotostack::pointer_input_may_alias(
+                                fd, fc, addr.get_offset(), size,
+                            ))
                     {
                         effecttype = effect_type::UNAFFECTED;
                     }
@@ -2845,7 +2876,7 @@ impl Heritage {
                 fd.obank().get(op).map(|o| o.uses_spacebase_ptr()).unwrap_or(false);
             let contained =
                 container.as_ref().map(|c| Rc::ptr_eq(c, &store_space)).unwrap_or(false);
-            let escaped = crate::kuna_stackeffects::enabled_for(fd, addr)
+            let escaped = crate::kuna_stackeffects::enabled_for(fd, addr, size)
                 && self.protostack_is_aliased(fd, &spc, addr.get_offset(), size);
             let indirect_frame_store = contained && escaped && crate::kuna_stackeffects::unresolved_store(fd, op);
             if !((contained && uses_spacebase) || Rc::ptr_eq(&spc, &store_space) || indirect_frame_store) {
@@ -4507,6 +4538,7 @@ impl Heritage {
         writevars: &[crate::context::VarnodeId],
         inputvars: &[crate::context::VarnodeId],
         byte_copy: bool,
+        halves: bool,
     ) -> Option<usize> {
         let size = self.disjoint.get(idx).size;
         if size > 1024 {
@@ -4521,6 +4553,10 @@ impl Heritage {
         if byte_copy {
             refine.fill(1);
         }
+        if halves {
+            refine.fill(0);
+            refine[(size / 2) as usize] = 1;
+        }
         refine.pop(); // remove the fencepost
         // Convert boundary points to partition sizes.
         let mut lastpos: usize = 0;
@@ -4534,7 +4570,7 @@ impl Heritage {
             return None; // No non-trivial refinements
         }
         refine[lastpos] = size - lastpos as int4;
-        if !byte_copy {
+        if !byte_copy && !halves {
             let space = addr.get_space().expect("refinement: space");
             crate::p3_dataflow::kuna_inputrefinement::coalesce(
                 &mut refine,
@@ -4561,14 +4597,20 @@ impl Heritage {
                 },
             );
         }
+        let straddles = |vn: crate::context::VarnodeId| {
+            !halves || crate::p3_dataflow::kuna_pairrefine::straddles_middle(fd, vn, &addr, size)
+        };
+        let readvars: Vec<_> = readvars.iter().copied().filter(|&vn| straddles(vn)).collect();
+        let writevars: Vec<_> = writevars.iter().copied().filter(|&vn| straddles(vn)).collect();
+        let inputvars: Vec<_> = inputvars.iter().copied().filter(|&vn| straddles(vn)).collect();
         let mut newvn: Vec<crate::context::VarnodeId> = Vec::new();
-        for &vn in readvars {
+        for &vn in &readvars {
             self.refine_read(fd, vn, &addr, &refine, &mut newvn);
         }
-        for &vn in writevars {
+        for &vn in &writevars {
             self.refine_write(fd, vn, &addr, &refine, &mut newvn);
         }
-        for &vn in inputvars {
+        for &vn in &inputvars {
             self.refine_input(fd, vn, &addr, &refine, &mut newvn);
         }
 
@@ -4635,9 +4677,14 @@ impl Heritage {
                 fd.vbank().get(vn).and_then(|v| v.get_def())
                     .is_some_and(|op| fd.is_stack_byte_copy_op(op))
             });
-            if byte_copy || (memrange.size > 4 && maxw < memrange.size) {
+            let pair_split = !byte_copy
+                && crate::p3_dataflow::kuna_pairrefine::split_pair(
+                    fd, &memrange.addr, memrange.size, maxw, &readvars, &writevars, &inputvars,
+                );
+            let normal = memrange.size > 4 && maxw < memrange.size;
+            if byte_copy || pair_split || normal {
                 if let Some(refiter) =
-                    self.refinement(fd, idx, &readvars, &writevars, &inputvars, byte_copy)
+                    self.refinement(fd, idx, &readvars, &writevars, &inputvars, byte_copy, pair_split && !normal)
                 {
                     idx = refiter;
                     memrange = self.disjoint.get(idx).clone();
@@ -4726,7 +4773,11 @@ impl Heritage {
     /// (kuna decompile-all watchdog) Has the running pass's budget run out —
     /// its deadline passed, or its drive over the memory limit?
     fn deadline_passed(&self) -> bool {
-        self.deadline.is_some_and(crate::decompile_drive::budget_spent)
+        let passed = self.deadline.is_some_and(crate::decompile_drive::budget_spent);
+        if passed {
+            crate::decompile_drive::note_budget_site(|| "heritage".to_string());
+        }
+        passed
     }
 
     /// Generate a guard record for an indexed LOAD into a stack space (C++
@@ -5429,6 +5480,14 @@ impl Heritage {
         // (kuna `calleeprotostack`) The alias gather is only valid for the
         // data-flow as it stands, so it is dropped at every pass boundary.
         self.protostack_alias = None;
+        // Preserve positive raw-frame evidence before SSA simplification can
+        // remove the nested frame setup. Later prototype recovery may be the
+        // first time the caller-frame-floor rule becomes applicable.
+        self.protostack_frame_reload = Some(
+            self.protostack_frame_reload.unwrap_or(false)
+                || crate::kuna_calleeprotostack::rebound_frame_base(fd),
+        );
+        self.global_call_ranges.clear();
         self.spill_stores.clear();
         self.spill_store_guards.clear();
         self.indexed_store_guards.clear();
