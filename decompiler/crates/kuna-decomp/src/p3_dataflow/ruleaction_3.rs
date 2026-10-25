@@ -642,6 +642,15 @@ impl Rule for RuleIndirectCollapse {
                 if o.is_indirect_creation() || o.no_indirect_collapse() {
                     return 0;
                 }
+                let output = data.vbank().get(op_out(data, op).expect("indirect output"))
+                    .expect("live indirect output");
+                if data.get_call_specs_index(indop).is_some_and(|index| {
+                    crate::kuna_calleeprotostack::declared_pointer_reaches(
+                        data, data.get_call_specs(index), output.get_addr(), output.get_size(),
+                    )
+                }) {
+                    return 0;
+                }
             } else if data.obank().get(indop).expect("RuleIndirectCollapse: stale indop").uses_spacebase_ptr()
             {
                 if op_code(data, indop) == OpCode::CPUI_STORE {
@@ -1826,6 +1835,19 @@ impl Rule for RulePropagateCopy {
             if !vn_is_heritage_known(data, invn) {
                 continue; // Don't propagate free's away from their first use
             }
+            // Preserve explicit pointer declarations across integer storage so
+            // address recovery also sees dynamically computed pointers.
+            if data.vbank().get(vn).is_some_and(|value| {
+                value.is_type_lock()
+                    && value.get_type().get_metatype() == crate::dtype::type_metatype::TYPE_PTR
+                    && data.get_scope_local().is_some_and(|scope| {
+                        scope.has_isolated_symbols()
+                            && scope.query_container_for_link(value.get_addr(), &data.vn_use_point(vn))
+                                .is_some_and(|entry| entry.is_isolated)
+                    })
+            }) {
+                continue;
+            }
             // (kuna) a store of a value used as an address into a global keeps
             // its COPY; see [`crate::p3_dataflow::kuna_pointeestorekeep`].
             if crate::p3_dataflow::kuna_pointeestorekeep::declines(data, op, vn, invn) {
@@ -1853,6 +1875,11 @@ impl Rule for RulePropagateCopy {
             if !is_marker
                 && (crate::p3_dataflow::kuna_indexaliasguard::keeps_store_before_load(data, op, vn)
                     || crate::p3_dataflow::kuna_indexaliasguard::keeps_forced_self_copy(data, op, vn))
+            {
+                continue;
+            }
+            if is_marker && (crate::kuna_localstackviews::publication(data, vn)
+                || crate::kuna_localstackviews::native_store(data, vn))
             {
                 continue;
             }
