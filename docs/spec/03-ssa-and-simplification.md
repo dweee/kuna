@@ -79,6 +79,20 @@ parameter accounts for. A copy of those pieces to memory was then dead to
 `ActionDeadCode`, and `use3(&s)` printed as `use3(&v1)` with only `v1.z = s.z`
 stored. kuna splits the join on the first pass that heritages any of its pieces.
 
+**Preferred register splits.** Heritage pass 0 also runs the compiler spec's
+`<prefersplit>` table (`PreferSplitManager`, ported from `prefersplit.cc`): each
+listed whole register is rewritten into two independent pieces, and a free or
+input register read only through one of them becomes that scalar input on the
+next pass. AArch64 states `inhalf` for `q0`..`q30`, so a callee reading only `d0`
+recovers an 8-byte parameter instead of a 16-byte aggregate; the undefined upper
+half never becomes a value. The records are decoded from the cspec once
+(`Architecture::decode_split_records`) and delivered to every function's handle.
+The split pass keeps its record table in place while walking, because each
+candidate is matched against that table.
+When a constant is split above the 64 bits carried by its literal, the upper
+piece is zero; splitting a 128-bit register must neither shift a 64-bit literal
+by 64 nor repeat the lower piece into the upper one.
+
 **Address-range worklists.** The unit of work is an address range, not a
 varnode. Two disjoint-cover maps drive each pass
 (`heritage.rs (LocationMap::add)`): `globaldisjoint` accumulates every range
@@ -193,6 +207,40 @@ smaller size, the stale MULTIEQUAL/INDIRECT/return-COPY markers from the earlier
 pass are deleted and the old outputs re-derived as SUBPIECEs of the new full
 range (`heritage.rs (Heritage::remove_revisited_markers)`).
 
+**Register pairs refined at their midpoint** (`option pairrefine`,
+`decompiler/crates/kuna-decomp/src/p3_dataflow/kuna_pairrefine.rs (split_pair)`,
+default **on**). The size test above never refines a range that some access
+covers whole, so a SPARC32 even/odd integer register pair that an `ldd` or `std`
+moves as one 8-byte value is heritaged as an 8-byte range even where its two
+registers also hold unrelated 32-bit values (a loop index in `%l4`, a counter in
+`%l5`). Every 4-byte access is joined to the pair through `PIECE`/`SUBPIECE`,
+the phis are placed on the whole pair, and variable merging fuses the two
+registers into one 64-bit variable updated by `CONCAT44`. With the option on, a
+range is refined at its midpoint only when it is a named 8-byte pair register
+whose halves are named 4-byte registers, at least one whole-pair load writes it,
+it is accessed whole only by memory
+moves (written by a `LOAD` or the `COPY` of a memory varnode a frame load
+becomes, read by a `STORE` or a `COPY` into memory), one of its halves is written
+as a 4-byte value, no access feeds or is produced by a floating-point op, and
+every access that crosses the midpoint covers the whole pair. Only those
+whole-pair moves are cut in two; the 4-byte accesses keep their varnodes, so
+each register is heritaged on its own, and the input-join healing of ordinary
+refinement is not applied. A pair that a call takes or returns whole, or that
+an 8-byte op reads or writes, keeps the whole-range heritage. SPARC32 64-bit
+arithmetic runs on the two registers (`addcc`/`addx`, `subcc`/`subx`), so a
+`long long` that `ldd` loads and that is added half by half is refined like any
+other selected pair; the double-precision rules rebuild the 64-bit value from
+the halves where they can. A pair in a floating-point register file is never
+selected, whatever ops touch it: the file is the run of contiguous, equally
+sized named registers that holds a float-class entry of the function's or the
+default prototype model (ARM `s0`..`s31` and `d0`..`d31` from the `s0`/`d0`
+entries, SPARC `fs`/`fd`, MIPS32 `f0_1`, an x86-64 `XMM0_Qa` lane), so a
+callee-saved ARM `d8` that `vpush` saves and `vpop` restores, with `s16` and
+`s17` written by `vmov.f32` copies, stays whole. Neither is an 8-byte register
+read through a half that is not a register of its own (x86-64 `rax`/`eax`).
+A pair assembled only from half-register writes and stored whole is not
+selected. `option pairrefine off` restores the whole-range heritage.
+
 **Refinement pieces keep the store mark** (`option splitstorekeep`,
 `decompiler/crates/kuna-decomp/src/p3_dataflow/kuna_splitstorekeep.rs
 (keep_store_mark)`, default **on**). A frame store reaches this phase as a
@@ -233,6 +281,32 @@ call has on the (callee-translated) range (`decompiler/crates/kuna-decomp/src/p4
 - a callee returning a struct into locked stack storage materializes the
   delayed CALL output and SUBPIECEs/PIECEs it into the range
   (`heritage.rs (Heritage::try_output_stack_guard)`).
+
+Under `option globalcallranges` (default on), a persistent RAM range needs no
+call guard when the callee's complete memory-effect summary proves every read
+and write disjoint from it. The bounded `kuna_calleememory` walker and its cache
+are shared with frame analysis, but the global proof excludes absolute memory
+accesses, direct memory input or output varnodes in any processor space,
+nonreturn frame accesses and any opaque or incomplete path. Exact self-XOR zeroing and constant zero extension preserve
+known scalar values in constructor summaries. Every memory-effect root must
+match a full-width register parameter or a backed active-input trial, whose
+recorded CALL slot resolves to a definite constant address. Partial storage,
+unreferenced trials, unknown actuals, explicit effect overrides, overlapping
+reads or writes, and wrapping intervals retain the guard. A summary that reads
+the return address also requires a solved caller stack offset and the matching
+architectural return slot, excluding visible stack pivots. Types and presumed
+noalias properties provide no evidence.
+
+`kuna_globalcallranges.rs (Calls)` resolves each call once per heritage pass and
+keeps its intervals in a generation-aware op side table; pass changes and
+analysis reset discard them. Only functions with at least 16 calls and 64 direct
+RAM writes seed the additional summaries. Existing frame-effect consumers still
+require their own frame options even when global summaries are present. This
+avoids the global-range by call-site IR cross product in large initializers:
+small constructors affect their explicit destination objects, while unrelated
+global stores keep their original statements and ordering. Turning the option
+off restores the previous guards without changing the function's time or memory
+budgets.
 
 **A range the call returns in.** Upstream skips a call whose output varnode
 covers the heritaged range exactly: the call defines the range itself, so no
@@ -310,11 +384,29 @@ return instruction writes and then transfers through, which `ARM.cspec` lists as
 (`kuna_calleepreserves.rs (body_departs_from_convention)`). That is the
 signature of the hand-rolled helper the rule exists for — the get-PC thunk's
 `EBX` is callee-saved, so the convention is already not a description of it —
-and it is a positive finding rather than an absence. Only a processor-space
-range is ever answered, because a callee's memory writes are `STORE`s through an
+and it is a positive finding rather than an absence. This register-preservation
+arm answers only processor-space ranges, because a callee's memory writes are `STORE`s through an
 address the walk cannot follow; only *killed by call* is downgraded, never
 promoted; and a prototype carrying its own effect-record override has had a
 deliberate statement made about it and is left alone.
+
+The call guard also reuses the same cached body summary to preserve caller stack
+unaliased slots across a direct helper that performs no memory writes
+(`p3_dataflow/kuna_leafmemory.rs (preserves)`). This arm requires a complete walk
+of at least two instructions, no STORE into any space, direct writes confined to
+the register space, and a write beyond the stack pointer and return target.
+Non-return memory reads disqualify the helper; only a direct ESP/RSP return-
+address fetch into the returned program counter is exempted. Any stack-pointer
+write outside a return instruction invalidates that return-fetch exemption. Both endpoints
+of the caller range must pass the alias checker, independently of stack-view
+options. Exposed objects and read-only observers retain call guards. It
+requires a known call stack offset and a pointer-width return address at stack
+offset zero; only caller ranges wholly above that return slot qualify. Explicit
+effect overrides, unresolved calls, memory-writing helpers and return-only
+stubs retain their existing effects. The rule follows `calleepreserves`, adds no
+callee scan, and preserves the call instruction's own return-address store.
+A saved frame pointer therefore survives a register-only helper, allowing later
+frame-relative reads to remain associated with earlier conditional stores.
 
 **A well-behaved helper is invisible to that test.** Requiring a write the
 model marks `<unaffected>` is a positive finding, but only for a callee that
@@ -660,6 +752,11 @@ time, at 1024 about 1%, and 23 of 15,942 functions over 20 binaries print
 differently at the lower budget, 12 of them in that firmware. Chapter 06 adds the mirror image at this level: a value loaded through a
 pointer stays ahead of a store to a global
 (`kuna_indexaliasguard.rs (load_crosses_global_store)`, `kuna_loadorder.rs`).
+The crossing check rejects operations outside the loaded value's current cover
+before inspecting their HighVariable members for global storage. This uses the
+same cover boundary policy as the final crossing decision, preserving which
+stores qualify while avoiding repeated member scans for unrelated operations.
+
 
 At `global` heritage also gives a global the LOAD guard
 (`heritage.rs (Heritage::guard_global_loads)`). Upstream builds load guards only for indexed stack
@@ -937,6 +1034,14 @@ mainloop reporting one change forever on certain stripped binaries
 (`tests/hang-repro/README.md`).
 
 ## 3.2 The rule pools
+
+Explicit isolated register declarations are applied to matching values already
+created during flow before simplification starts. Matching uses the storage,
+size, and defining instruction address, so a declaration does not type another
+write to the same register. A COPY with an isolated declared pointer output keeps
+that output when propagated into integer storage: the declared address remains
+available for named-global recovery instead of becoming an image-address integer.
+This also applies to computed interior addresses: losing the declaration before pointer recovery can leave a base address embedded in integer arithmetic. Without a pointer declaration, integer expressions retain their ordinary meaning.
 
 A `decompiler/crates/kuna-decomp/src/infra/action.rs (Rule)` is a stateless
 pattern→rewrite unit: `get_op_list` declares the opcodes it can fire on
@@ -1554,6 +1659,17 @@ value. A disjoint guard is replaced by its previous input. Guards for another
 operation are untouched, and a write with no surviving uses can still be
 removed as dead.
 
+Conversion also requires complete effect coverage when the destination is an
+already-heritaged persistent global
+(`kuna_storecopyeffects.rs (can_materialize)`). The contiguous INDIRECTs that name
+this STORE must cover every byte of the write; adjacent ranges can cover a wide
+write together, but a gap or an effect belonging to another operation cannot.
+If global alias guarding exhausted its budget, no such chain may exist.
+`RuleStoreVarnode` then leaves the original STORE intact rather than creating
+an unread COPY that dead-code removal can discard. Newly discovered locations
+and nonpersistent frame storage retain the existing conversion path. This does
+not raise the global guard budget or make an artificial SSA definition live.
+
 **Retyping an op mid-rule.** A rule that rewrites an op in place usually changes
 its op-code, and the op-code is not just a tag: `set_opcode` caches the
 op-code's *property word* (`unary`/`binary`/`booloutput`/`commutative`/`marker`/
@@ -1578,6 +1694,21 @@ had not enumerated (`INT_SRIGHT` out of `RuleBitUndistribute`, or a
 `FLOAT_INT2FLOAT`/`FLOAT_LESS`/`FLOAT_ADD` phi collapsing through
 `RuleMultiCollapse`) unwound the entire decompilation — the caller saw one error
 record and no C at all for that function.
+
+**Commuting a right shift through zero extension.**
+`decompiler/crates/kuna-decomp/src/p3_dataflow/ruleaction_4.rs
+(RuleZextCommute)` rewrites `zext(V) >> n` into `zext(V >> n)` only when the
+count's constant value or nonzero-bit mask proves it is below the width the
+narrowed shift evaluates at. That width is `V`'s, except that when the output
+language promotes a sub-`int` operand to a 4-byte `int` (C: the
+`int_promotion` architecture flag), a 1- or 2-byte `V` shifts as 32 bits, so
+counts below 32 are safe for it. Otherwise it retains the wide shift. P-code
+defines a logical right shift at or beyond its operand width as zero, but
+narrowing such a shift can produce undefined C or an overflowing Rust shift.
+In particular, a zero-extended 16- or 32-bit value shifted by a count masked
+to 63 must keep the 64-bit operation, while a byte rotate's `x >> (n & 31)`
+still prints narrow in C. Rust, which shifts at the operand's own width, keeps
+the `V`-width bound. This is a correctness requirement, with no option.
 
 **Lowering a non-least-significant truncation.** A SUBPIECE carries a byte
 offset, and only the offset-0 form has a C spelling: it is a cast. Every other
@@ -1797,6 +1928,33 @@ Conversion-only round trips and arithmetic already performed in binary32
 retain their existing simplifications and grouping. This is a correctness
 constraint on both forward and backward traces, including divided SIMD lanes.
 
+Both engines also keep every narrowing rounding. `RuleFloatCast` combines two
+successive `FLOAT_FLOAT2FLOAT` conversions only when the first is exact (an
+identity or a widening); two narrowings round twice, and the direct
+narrowing can differ: `(float)(double)0x1.000001000000001p0L` is `0x1p+0`,
+while `(float)0x1.000001000000001p0L` is `0x1.000002p+0`. A `SubfloatFlow`
+backward trace that reaches a narrowing conversion declines to lower its
+result below the narrowed width, since the lowered conversion would bypass
+that rounding. Widening-then-narrowing round trips still collapse under the
+default NaN policy. This is a value-correctness repair with no option.
+
+(kuna) A widening-then-narrowing round trip can also quiet a signaling NaN:
+an x87 `fld`/`fstp` pair or `cvtss2sd; cvtsd2ss` returns `0x7fc00001` for the
+input `0x7f800001`. Kuna keeps that effect only under `option nanignore none`,
+the policy that keeps every NaN behaviour. The shipped `nanignore compare`
+default and `all` drop it as upstream does, since the source most likely held
+a plain copy (`*d = *s` compiles to `fldl; fstpl` on i386) and C does not
+promise signaling-NaN preservation. Under `none`,
+`decompiler/crates/kuna-decomp/src/p3_dataflow/kuna_floatquiet.rs (can_elide)`
+permits removing the final conversion only when the input is already quiet.
+Floating arithmetic, integer conversion and a conversion to another floating
+format produce quiet values; copies and merges require their sources to be
+quiet. Non-NaN constants also qualify. Unknown loads, inputs and bitwise sign
+operations do not. The provenance walk has a shared 32-node budget; cycles and
+larger ambiguous graphs conservatively retain the conversion. `RuleFloatCast`
+uses this guard before making an identity COPY; `SubfloatFlow::trace_backward`
+uses it before replacing a conversion by a COPY at the reduced precision.
+
 Integer-to-float conversions also retain their rounding width (`option
 intfloatround`, default on;
 `decompiler/crates/kuna-decomp/src/p3_dataflow/kuna_intfloatround.rs`). `RuleFloatCast`
@@ -1820,6 +1978,13 @@ exception or rounding-mode contract. It is an option because declining also
 moves correct output: an x87 comparison of an int64 conversion stays in long
 double where the narrowed form happened to be exact. `off` is upstream's
 unconditional fold.
+
+`RuleFloatCast` removes a floating conversion ahead of `FLOAT_TRUNC` only
+when that conversion is exact: an identity or a widening. A narrowing keeps
+its rounding, because rounding to the narrower format can carry a value
+across an integer boundary before truncation: `(int)(float)0.99999999` is 1,
+while `(int)0.99999999` is 0. Upstream folds every such pair. This is a
+value-correctness repair with no option.
 
 `subflow.rs (SplitDatatype)` (triggers `RuleSplitCopy`/`RuleSplitLoad`/
 `RuleSplitStore`, cleanup pool) splits a whole-struct COPY/LOAD/STORE into
@@ -1952,6 +2117,72 @@ type_match the declared width is what moves: a
 x86-64 `int` matches `int`; a local the source declares `int` or an enum but
 only ever loads from a byte field narrows too, and the binary cannot tell the
 two apart (`tests/stages/kuna-regnarrow.xml`, `kuna-regnarrow-x86.xml`).
+
+### (kuna) `regsigned` — a register local at the width its values are sign extended from
+
+The signed counterpart of `regnarrow`. A `signed char` read with `ldrsb` or
+`movsx`, a `short` counter the compiler re-extends with `sxth` after every
+update, and an x86-64 `int` widened with `movsxd` all live sign-extended in a
+whole register. Their nonzero-bit masks fill the register whenever the value can
+be negative, so the masks `regnarrow` reads cannot fit them, and the local
+prints as `int` or `long` with an `(int)` cast on every load.
+
+The option is off by default (`narrow_signed`; `option regsigned on` turns it
+on, and it is read only while `regnarrow` is on), so the default output keeps
+these locals at the register's width. With it on, the same pass
+(`kuna_regnarrow.rs (signed_width)`) also takes the webs the masks cannot fit,
+seeding at a sign extension or a MULTIEQUAL. Every member must
+be defined by a sign extension from at most 1, 2 or 4 bytes narrower than the
+register (one of them from exactly that width `w`, which must not be of a value
+tied to memory), a MULTIEQUAL, a copy, or a NEGATE, XOR, AND or OR; a constant
+copied in must be the sign extension of its low `w` bytes. Any other definition
+(arithmetic, a load at the register's width, a call, a function input) leaves the
+web alone. So does a member whose value was stored to a frame slot wider than
+`w` before simplification removed the slot (`wide_frame_home`, read from the
+storage homes the copy propagation keeps): the `-O0` spill of `int v = c;` is an
+`int` that holds a sign-extended `char`, and the program's own home for it says
+so. A web with no MULTIEQUAL whose sign extensions all widen function inputs is
+left alone as well: its narrow value would be the input itself, which every
+reader then widens again (`(long)a0 * (long)a0` gains nothing by becoming
+`(long)a0 * a0`). And so is a web whose values reach a BRANCHIND within a few
+ops (`feeds_switch`): the switch's jump table was recovered for the selector at
+its own width, and its model is matched again on the final p-code, through the
+selector's definition (an ARM `tbb` indexed by a `short` would otherwise lose
+its table).
+
+The web is rebuilt by upstream's sign-extended `SubvariableFlow`
+(`subflow.rs (run_sext_uses)`; `sextrestrictions`), extended the way
+`regnarrow` extends the zero-extended one (`subflow.rs (sext_route)`). Going
+forward, a copy, a phi, a wider sign extension, a NEGATE, XOR, AND or OR, an
+arithmetic right shift by a constant, a truncation to at most `w` bytes and a
+call argument whose parameter is no wider than `w` carry the narrow value
+(each keeps a sign-extended value sign-extended). Every other reader that needs
+the register's width (arithmetic, a compare, an index, a store, a wider call
+argument, a copy into memory) reads the `INT_SEXT` of the narrow value in that
+input slot (`ZextUsePatch` with a sign extension), which is exactly the value it
+read before. Going backward the upstream rules stand: only a copy, a phi, a
+bitwise op, a sign extension from `w` bytes, a zero extension from fewer bytes
+or a constant right shift may define a member, a constant must be the sign
+extension of its low part, and a function input of the register's width is
+refused, so a value the flow cannot prove sign-extended aborts the whole
+rewrite. The flow aborts at an `INDIRECT`, a `RETURN` (or the copy in front of
+one), a user-op operand and a switch, as `regnarrow`'s does. The p-code
+computes the same values. In the C, the integer promotions make a narrowed
+`short` or `signed char` operand an `int` again, which is what the sign
+extension computed.
+
+The narrow values are recorded (`Funcdata::kuna_regsigned_values`), and type
+inference gives one the signed integer of its width when nothing else types it,
+or when the only vote is the `uint` a bitwise op gives its output
+(`unsigned_vote`): the program sign-extends the value, so it is signed. A
+`short` local therefore prints `short` (`int2`) and a byte `char`. On decbench's
+type_match the declared width is what moves: on ARM firmware `int16_t` and
+`int8_t` locals that were `int` match, while a source `int` that only ever
+holds a sign-extended byte in a register is declared `char`, which the binary
+cannot tell apart. The net is small (a few perfect functions on ARM firmware,
+none on x86-64), and a narrowed value that a wider reader takes back gains a
+cast (`(long)(int)v` on AArch64), which is why the option stays off by default
+(`tests/stages/kuna-regsigned.xml`).
 
 ## 3.4 Conditional execution
 
@@ -2334,6 +2565,32 @@ also resolves the spacebase-placeholder tail that a bare COPY would drop; a
 free pointer is declined. Settable `constspaceload`,
 shipped default **on** (DIV-158).
 
+**x87truncate** —
+`decompiler/crates/kuna-decomp/src/p3_dataflow/kuna_x87truncate.rs
+(RuleX87Truncate)`, oppool1, fires on CALLOTHER. *Pattern:* one of the x87
+`x87_float_to_int16/32/64` user operations that `FIST`/`FISTP` lift to (§2,
+x87 integer conversions), whose control-word operand provably has both
+rounding-control bits (10 and 11) set. Compilers emit exactly this shape for a C
+float-to-integer conversion on x87: save the control word, OR in `0xc00`, load
+it, convert, restore. The proof is a bounded walk over the operand's definitions
+that keeps the bits known to be 1 through constants, `COPY`, `INT_ZEXT`,
+`INT_OR`, `INT_AND`, `PIECE`, `SUBPIECE` and `MULTIEQUAL` (every input must
+agree); any other definition, an input, or an exhausted visit budget proves
+nothing. The walk trusts the lift to define the control word at every
+instruction that replaces it (§2, x87 integer conversions); a call between the
+load and the conversion leaves an `INDIRECT`, which proves nothing. *Rewrite:*
+the operation becomes `FLOAT_TRUNC` of its extended-precision
+operand at the same output width, the same conversion `FISTTP` lifts to, so the
+control-word computation dies and the function prints `(int)x`. A conversion
+whose output dead-code removal has already cleared is deleted instead, since
+its only remaining effect would be the unmodeled status flags. Precision
+control, exception masks and infinity control do not change the result of an
+in-range conversion. *Bounds:* a control word with unknown, nearest, downward or
+upward rounding keeps the opaque operation; out-of-range and NaN operands, which
+x87 converts to the integer indefinite value when invalid is masked, take
+`FLOAT_TRUNC`'s unspecified result, as for `FISTTP`. Not settable: the rewrite
+is the conversion the instruction performs under that control word.
+
 **flagcompare** (GH-1276 / GH-8777) —
 `decompiler/crates/kuna-decomp/src/p3_dataflow/kuna_flagcompare.rs`, two rules
 under one gate, for architectures that model condition flags as explicit bits.
@@ -2561,6 +2818,24 @@ without any restart (§0.7): the next mainloop iteration simply re-heritages
 the smaller graph.
 
 
+`localstackviews` adds only positively proved local byte ranges to
+`decompiler/crates/kuna-decomp/src/p3_dataflow/kuna_stackeffects.rs`.
+The native STORE hook exposes those ranges before the next heritage pass;
+waiting for dead-code preparation can incorrectly fold a later frame read
+across an escaped pointer write. Unknown pointer STOREs retain the existing
+memory-version barriers. Literal global destinations and unrelated frame ranges
+keep their existing policy, including the separate narrow-formal eligibility.
+Recorded persistent publications also refuse COPY propagation into memory-SSA
+markers while their original receiver and fixed input contracts remain valid;
+this retains the actual write rather than replaying it after a call or loop.
+The same marker boundary retains a lowered COPY of an original native STORE
+only when its generational identity, source point, recorded stack address and
+width, stack-store flag and live output still match, and one admitted local
+footprint contains the whole write. This prevents a memory marker from carrying
+the backing's aggregate type into an external packed numeric source and later
+hiding the initializer as a self-copy. Ordinary value reads, explicit full views
+and disabled local policy retain their existing propagation behavior.
+
 With `stackviews on`, unresolved STOREs in the containing memory space guard
 escaped frame ranges with an INDIRECT memory version. A reloaded pointer need
 not remain syntactically derived from the stack pointer: it can still designate
@@ -2568,6 +2843,12 @@ those bytes. The existing deferred alias checker gates these additional guards;
 literal global addresses retain their ordinary disjoint behavior. This prevents
 folding a direct stack read to the old constant after an indirect whole or byte
 write. Unknown call effects retain their existing frame guards.
+
+Default narrow-parameter recovery uses the same unresolved-STORE barriers only
+for its recorded reused extent of at most four bytes (§6). An escaped pointer
+reloaded from memory can change those bytes before a direct stack read; the
+barrier prevents that read from folding to the preceding register-carried store.
+Other frame ranges retain their existing policy.
 
 `decompiler/crates/kuna-decomp/src/p3_dataflow/kuna_calleememory.rs` derives
 read, write and pointer-escape summaries from a direct callee's instructions

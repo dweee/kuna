@@ -394,6 +394,12 @@ pub fn passes_for(compiler: Compiler, format: object::BinaryFormat) -> Vec<Box<d
     // facts idempotently (a real `.symtab` name still wins, so only a *stripped*
     // Go binary's `sub_<addr>` functions take the recovered name).
     if compiler.is_golang() {
+        // (kuna `gonoreturn`) BEFORE `gopclntab`, preserving that pass's
+        // appended-last contract: apply the vendored Go no-return list to the
+        // pclntab's own function list, so a STRIPPED Go binary (no .symtab for
+        // `noreturn_known` to scan) still gets its runtime.panic*/throw/goexit
+        // facts. Go-only: a structural no-op on every other binary.
+        passes.push(Box::new(crate::pclntab::kuna_gonoreturn::GoNoReturnPass));
         passes.push(Box::new(crate::pclntab::GoPclntabPass));
     }
 
@@ -1408,7 +1414,7 @@ pub fn run_default_analyses(
     // Source-language detection runs once, before pass selection, and shapes the
     // pass list (the kuna analog of `SourceLanguageAnalyzer` running early and
     // gating the language-specific analyzers).
-    let compiler = crate::sourcelang::detect_compiler(&file, bytes);
+    let compiler = crate::sourcelang::effective_compiler(&file, bytes);
     // Listing/xref tier (design §1.3): built once, before the pass loop, only
     // when `--option listing on` (default-off ⇒ `None` ⇒ no decode work, byte
     // -identical to today). Owned here so it outlives the pass loop, borrowed
@@ -1457,7 +1463,7 @@ pub fn run_default_analyses_per_pass(
     // below produces an already-rebased fact. `None` ⇒ the raw pre-link view.
     let view = crate::loader::kuna_relocrebase::rebased_view(&raw, bytes);
     let (file, bytes) = crate::loader::kuna_relocrebase::select(raw, bytes, &view);
-    let compiler = crate::sourcelang::detect_compiler(&file, bytes);
+    let compiler = crate::sourcelang::effective_compiler(&file, bytes);
     // Listing/xref tier (design §1.3): built once, before the pass loop, only
     // when `arch.analysis_listing` (i.e. `--option listing on`). Default-off ⇒
     // `.then(...)` is `None` ⇒ no decode work, `ctx.listing == None`, and the
@@ -1638,23 +1644,28 @@ mod tests {
     #[test]
     fn non_go_compilers_have_same_pass_ids() {
         let base = ids(&passes_for(Compiler::Gcc, NON_PE));
-        for c in [Compiler::Rustc, Compiler::Clang, Compiler::Unknown] {
+        for c in [Compiler::Rustc, Compiler::Clang, Compiler::Swift, Compiler::Unknown] {
             assert_eq!(ids(&passes_for(c, NON_PE)), base, "{c:?} pass ids must match the base set");
         }
     }
 
-    /// The Go pass set is exactly the base set plus the `gopclntab` pass appended
-    /// (the Go-only function-name recovery); no other compiler carries it.
+    /// The Go pass set is exactly the base set plus the two Go-only passes:
+    /// `gonoreturn` (the pclntab no-return list) then `gopclntab` (the
+    /// function-name recovery, keeping its appended-last contract); no other
+    /// compiler carries either.
     #[test]
-    fn go_adds_only_gopclntab_pass() {
+    fn go_adds_only_the_two_go_passes() {
         let base = ids(&passes_for(Compiler::Gcc, NON_PE));
         let go = ids(&passes_for(Compiler::Go, NON_PE));
         assert_eq!(&go[..base.len()], &base[..], "Go set is the base set + extras");
-        assert_eq!(go.last(), Some(&"gopclntab"), "Go appends the gopclntab pass");
-        assert_eq!(go.len(), base.len() + 1, "Go adds exactly one pass");
-        // No non-Go compiler carries the gopclntab pass.
-        for c in [Compiler::Gcc, Compiler::Rustc, Compiler::Clang, Compiler::Unknown] {
-            assert!(!ids(&passes_for(c, NON_PE)).contains(&"gopclntab"), "{c:?} must not carry gopclntab");
+        assert_eq!(go.last(), Some(&"gopclntab"), "Go appends the gopclntab pass last");
+        assert_eq!(go.get(go.len() - 2), Some(&"gonoreturn"), "gonoreturn precedes gopclntab");
+        assert_eq!(go.len(), base.len() + 2, "Go adds exactly two passes");
+        // No non-Go compiler carries either Go-only pass.
+        for c in [Compiler::Gcc, Compiler::Rustc, Compiler::Clang, Compiler::Swift, Compiler::Unknown] {
+            let set = ids(&passes_for(c, NON_PE));
+            assert!(!set.contains(&"gopclntab"), "{c:?} must not carry gopclntab");
+            assert!(!set.contains(&"gonoreturn"), "{c:?} must not carry gonoreturn");
         }
     }
 

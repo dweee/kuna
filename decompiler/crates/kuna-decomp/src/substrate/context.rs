@@ -619,6 +619,11 @@ mod tests;
 /// queries can use the remote scope. [`ArchHandle`] shares this context between
 /// the function and its analysis passes.
 pub struct ArchContext {
+    pub x87_empty_storage: Option<crate::p4_calls::kuna_x87emptyreturn::Storage>,
+
+    pub call_mechanisms: Rc<crate::kuna_callmechanisms::Mechanisms>,
+    /// (kuna) `callmechanisms` — apply compiler-spec prototype entry/return p-code.
+    pub call_mechanism_effects: bool,
     /// Shared spaces retain the pointer identities and indices used by lifted
     /// Varnodes. [`Self::new_shared`] accepts the engine's manager; [`Self::new`]
     /// wraps an owned manager for fixtures.
@@ -635,6 +640,10 @@ pub struct ArchContext {
     /// as the C++ `Architecture::getLanedRegister` does.  Empty for hand-built
     /// fixtures and non-vector architectures.
     pub lanerecords: Vec<crate::transform::LanedRegister>,
+    /// (kuna) The compiler spec's `<prefersplit>` rows: whole registers heritage
+    /// pass 0 splits into two independent pieces.  Copied from the engine
+    /// `Architecture` in `build_arch_handle`; empty when the spec states none.
+    pub split_records: Vec<crate::p5_types::prefersplit::PreferSplitRecord>,
     /// The p-code OpBehavior emulation table (C++ `glb->inst[opc]->getBehavior()`),
     /// indexed by op-code.
     ///
@@ -732,16 +741,22 @@ pub struct ArchContext {
     /// high word in the first register where the ABI puts it?  Read by
     /// [`crate::p4_calls::kuna_bejoin::mode`].
     pub be_join: crate::kuna_bejoin::BeJoinMode,
+    pub call_wide: bool,
     /// (kuna) `option rustabi` (0 off / 1 auto / 2 always): keep a rustc
     /// two-register `ScalarPair` return intact; read by [`crate::kuna_rustabi`].
     pub rust_abi: u8,
-    /// (kuna) The loader's source-language verdict for this image (rustc or not);
-    /// what `option rustabi auto` tests.  Copied from the engine `Architecture`
-    /// in `build_arch_handle`.
-    pub source_is_rust: bool,
-    /// (kuna) The loader's Go verdict for this image; `option reloadarg`
-    /// stands down on Go.  Copied from the engine `Architecture`.
-    pub source_is_go: bool,
+    /// (kuna) The source language of this image (`option sourcelang` override
+    /// applied): what `option rustabi auto` tests and `option reloadarg`
+    /// stands down on.  Copied from the engine `Architecture` in
+    /// `build_arch_handle`.
+    pub source_lang: crate::kuna_sourcelang::SourceLang,
+    /// (kuna) `option fatstr` mode; read by [`crate::p5_types::kuna_fatstr`].
+    /// Copied from the engine `Architecture` in `build_arch_handle`.
+    pub fat_str: u8,
+    /// (kuna) `option gomorestack` mode; read by
+    /// [`crate::p2_lift::kuna_gomorestack`].  Copied from the engine
+    /// `Architecture` in `build_arch_handle`.
+    pub go_morestack: u8,
     /// (kuna) `option reloadarg`; read by [`crate::p4_calls::kuna_reloadarg`].
     pub reload_arg: bool,
     /// (kuna) angr-style default naming: an unknown callee / global prints as
@@ -804,6 +819,12 @@ pub struct ArchContext {
     /// [`RuleSimdShuffleLane`](crate::kuna_simdlane::RuleSimdShuffleLane) can
     /// name a CALLOTHER without reaching the full `Architecture`.
     pub simd_shuffle_userops: Vec<kuna_base::types::uint4>,
+    /// (kuna) CALLOTHER ids of the x87 integer conversions read by
+    /// [`RuleX87Truncate`](crate::kuna_x87truncate::RuleX87Truncate).
+    pub x87_float_to_int_userops: Vec<kuna_base::types::uint4>,
+    /// SLEIGH FIST/FISTP conversion userops and their signed output widths.
+    /// Resolved by name once when building the architecture snapshot.
+    pub x87_integer_userops: Vec<(kuna_base::types::uint4, int4)>,
     /// (kuna) GH-1276/8777: fold flag-modelled comparison idioms (C++
     /// `fold_flag_compare`, DIV-3 default-on).  Read by
     /// [`RuleBoolSignLess`](crate::kuna_flagcompare::RuleBoolSignLess) /
@@ -1014,6 +1035,14 @@ pub struct ArchContext {
     /// (kuna) `armfloatargs` is on and the image states the ARM VFP calling
     /// convention.  Read by [`crate::p4_calls::kuna_armfloatargs`].
     pub arm_float_args: bool,
+    /// (kuna) The default model before `armfloatreturn` widens it, kept for the
+    /// AEABI helpers that use the base standard in every image.  Read by
+    /// [`crate::p4_calls::kuna_armfloatreturn::helper_model`].
+    pub arm_base_model: Option<Rc<crate::fspec::ProtoModel>>,
+    /// (kuna) The core-register (soft-float) model a declared AEABI helper
+    /// prototype is laid out under while `armfloatreturn` applies.  Read by
+    /// [`crate::p4_calls::kuna_armfloatreturn::declared_helper_model`].
+    pub arm_helper_model: Option<Rc<crate::fspec::ProtoModel>>,
     /// What the image says about floating-point arguments (`Some(false)`: they
     /// travel in integer registers).  Read by [`crate::p4_calls::kuna_typedcallabi`].
     pub float_arg_registers: Option<bool>,
@@ -1069,6 +1098,7 @@ pub struct ArchContext {
     /// Read by `Heritage::guard_calls` through
     /// [`crate::p4_calls::kuna_calleepreserves::callee_preserves_range`].
     pub callee_preserves: bool,
+    pub global_call_ranges: bool,
     /// (kuna) let the callee's decoded body answer for the call's RETURN
     /// register too (`calleeretpreserves`).  Read by `Heritage::guard_calls`
     /// through
@@ -1099,6 +1129,9 @@ pub struct ArchContext {
     /// (kuna) a call reads the narrow value its callee returns zero-extended
     /// (`narrowret`). Read by [`crate::kuna_narrowret`].
     pub narrow_ret: bool,
+    /// (kuna) also narrow a register-local web of sign extensions
+    /// (`regsigned`). Read by [`crate::kuna_regnarrow`].
+    pub narrow_signed: bool,
     /// (kuna) at a CALL SITE, let an unreferenced argument register whose next
     /// slot is on the stack end the argument list (`stackarggap`).  Read by
     /// `ActionActiveParam`, which stamps it onto the
@@ -1216,6 +1249,8 @@ pub struct ArchContext {
     pub stack_alias_deadstore: bool,
     /// Operation-specific typed views over shared physical frame storage.
     pub stack_views: bool,
+    /// Bounded native local storage and declared pointer views.
+    pub local_stack_views: bool,
     /// (kuna `libcnames`) Name locals from the library calls they meet.
     /// See [`crate::kuna_libcnames`].
     pub libc_names: bool,
@@ -1255,6 +1290,8 @@ pub struct ArchContext {
     pub tied_phi_trim: bool,
     /// (kuna) `splitstorekeep` — carry `stack_store` onto refinement pieces.
     pub split_store_keep: bool,
+    /// (kuna) `pairrefine` — refine integer register pairs at their midpoint.
+    pub pair_refine: bool,
     /// (kuna) `wideslice` — slice reduction through synthetic-width SSA trees.
     pub wide_slice_reduce: bool,
     /// (kuna) `devectorize` — re-roll a vectorized reduction into its scalar loop.
@@ -1507,6 +1544,11 @@ pub struct ArchContext {
     /// `nanignore all` option and shared from the real
     /// [`crate::architecture::Architecture`] through `build_arch_handle`.
     pub nan_ignore_all: bool,
+    /// Ignore NaN effects around comparisons (C++ `nan_ignore_compare`; the
+    /// shipped `nanignore compare` default). Also lets a floating round trip
+    /// drop its signaling-NaN quieting
+    /// ([`crate::p3_dataflow::kuna_floatquiet`]); fixtures default to off.
+    pub nan_ignore_compare: bool,
     /// The data-type factory (C++ `glb->types`), shared from the real
     /// [`crate::architecture::Architecture`] through `build_arch_handle`.
     /// `ActionInferTypes` reaches `getBase`/`getTypePointer`/`down_chain` through
@@ -1719,9 +1761,13 @@ impl ArchContext {
         // C++ default: getMinimumLanedRegisterSize() returns the configured
         // minimum; the upstream default when unset is 4.
         ArchContext {
+            call_mechanisms: Rc::default(),
+            call_mechanism_effects: false,
             manage,
             min_laned_register_size: 4,
+            x87_empty_storage: None,
             lanerecords: Vec::new(),
+            split_records: Vec::new(),
             opbehaviors: Vec::new(),
             floatformats: Vec::new(),
             callee_proto_models: Vec::new(),
@@ -1763,12 +1809,18 @@ impl ArchContext {
             // (kuna) `option bejoin`; the real value is copied from the engine
             // Architecture in `build_arch_handle`.
             be_join: crate::kuna_bejoin::BeJoinMode::Off,
+            call_wide: false,
             multi_reg_args: false,
             // (kuna) `option rustabi` default-off; the real value is copied from
             // the engine Architecture in `build_arch_handle`.
             rust_abi: 0,
-            source_is_rust: false,
-            source_is_go: false,
+            source_lang: Default::default(),
+            // (kuna) `option fatstr` default auto; the real value is copied
+            // from the engine Architecture in `build_arch_handle`.
+            fat_str: 1,
+            // (kuna) `option gomorestack` default auto; the real value is
+            // copied from the engine Architecture in `build_arch_handle`.
+            go_morestack: 1,
             // (kuna) `option reloadarg` default-on; the real value is copied
             // from the engine Architecture in `build_arch_handle`.
             reload_arg: true,
@@ -1795,6 +1847,8 @@ impl ArchContext {
             const_space_load_fold: false, // constspaceload (the ArchSeam carries the real default)
             drop_call_push: false,        // callpush (the ArchSeam carries the real default)
             simd_shuffle_userops: Vec::new(),
+            x87_float_to_int_userops: Vec::new(),
+            x87_integer_userops: Vec::new(),
             fold_flag_compare: false,    // GH-1276/8777 flagcompare
             add_carry_chain: false,      // GH-8913 addcarrychain
             ov_less_simplify: false,     // GH-7190 ovlesssimplify
@@ -1866,6 +1920,8 @@ impl ArchContext {
             arg_clobber: true, // (kuna) option argclobber (default on)
             arm_float_args: false, // (kuna) option armfloatargs (default off)
             arm_float_return: false, // (kuna) option armfloatreturn (default off)
+            arm_base_model: None,
+            arm_helper_model: None,
             float_arg_registers: None,
             soft_float_model: None,
             soft_float_declarations: None,
@@ -1885,6 +1941,7 @@ impl ArchContext {
             zero_fill_return: true,
             zero_call_regs: true,
             callee_preserves: true,
+            global_call_ranges: true,
             callee_ret_preserves: true,
             callee_scratch_body: true,  // calleescratchbody (DIV-149 default-on)
             indirect_anchor: true,      // indirectanchor (default-on)
@@ -1892,6 +1949,7 @@ impl ArchContext {
             narrow_args: true,
             narrow_locals: true,
             narrow_ret: true,
+            narrow_signed: false,
             stack_arg_gap: true,         // stackarggap (DIV-140 default-on)
             vararg_stack_args: true,     // varargstackargs (DIV-101 default-on)
             vararg_forward: true,        // varargforward (default-on)
@@ -1913,6 +1971,7 @@ impl ArchContext {
             array_extent: 0,             // arrayextent (Architecture::reset_defaults sets the shipped default)
             array_size: 0,               // arraysize (Architecture::reset_defaults sets the shipped default)
             stack_alias_deadstore: false,
+            local_stack_views: true,
             stack_views: false, // stackviews (opt-in)
             libc_names: false, // libcnames (opt-in)
             guarded_read_trim: false,
@@ -1923,6 +1982,7 @@ impl ArchContext {
             int_float_round: false,      // intfloatround (Architecture::reset_defaults sets the shipped default: on)
             tied_phi_trim: false,        // tiedphitrim (Architecture::reset_defaults sets the shipped default: on)
             split_store_keep: false,     // splitstorekeep (Architecture::reset_defaults sets the shipped default: on)
+            pair_refine: false,          // pairrefine (Architecture::reset_defaults sets the shipped default: on)
             wide_slice_reduce: false,    // wideslice (Architecture::reset_defaults sets the shipped default: on)
             devectorize_reduction: false, // devectorize (opt-in default-off)
             strlen_scan: false, // strlenscan (live value copied from the Architecture)
@@ -1980,6 +2040,7 @@ impl ArchContext {
             // only `nanignore all` flips it. nan_ignore_compare drives the rule's
             // enabled state at registration, not this flag.
             nan_ignore_all: false,
+            nan_ignore_compare: false,
             types: None,
             internal_strings: None,
             max_jumptable_size: 0,
@@ -2538,6 +2599,15 @@ impl ArchContext {
                 continue;
             }
             let entry_addr = Address::new(std::rc::Rc::clone(space), e.first);
+            if let Some(mut proto) = crate::kuna_qualifiedcall::prototype(self, &entry_addr) {
+                if e.func_inject_id >= 0 {
+                    proto.set_inject_id(e.func_inject_id);
+                }
+                if e.func_no_return && self.peimportcall {
+                    proto.set_no_return(true);
+                }
+                return Some((e.symbol_name.clone(), entry_addr, std::rc::Rc::new(proto)));
+            }
             // Prefer a recovered code prototype when the type carries one (a
             // declared callee, e.g. `parse line extern void f(...)`); otherwise
             // hand back the default void proto the C++ funcsym's `getFuncProto`
