@@ -11,7 +11,8 @@ use std::process::Command;
 use kuna_decomp::{
     kuna_calltargettype, kuna_dwarfstructs, kuna_dwarfvariants, kuna_dynrelocs, kuna_i386_pie_plt,
     kuna_ifuncfpret, kuna_libctypes, kuna_msvcfpconst, kuna_pdatachained, kuna_peordinal,
-    kuna_relocrebase, kuna_rexthunk, kuna_symbolnamebound, kuna_symbolnamechars,
+    kuna_goabi, kuna_goreg, kuna_relocrebase, kuna_rexthunk, kuna_sourcelang, kuna_symbolnamebound, kuna_symbolnamechars,
+    kuna_variantnames,
     kuna_symbolnamerepair, kuna_typedepth, options::RELOC_OBJECTS_ENV,
 };
 
@@ -24,6 +25,7 @@ enum Encoding {
     SymbolNameChars,
     Trimmed,
     LibcTypes,
+    SourceLang,
 }
 
 fn binding(name: &str) -> Option<(&'static str, Encoding)> {
@@ -36,6 +38,8 @@ fn binding(name: &str) -> Option<(&'static str, Encoding)> {
         "dynrelocs" => (kuna_dynrelocs::DYNRELOCS_ENV, DefaultOn),
         "pdatachained" => (kuna_pdatachained::PDATACHAINED_ENV, DefaultOn),
         "rexthunk" => (kuna_rexthunk::REXTHUNK_ENV, DefaultOn),
+        "goabi" => (kuna_goabi::GOABI_ENV, DefaultOn),
+        "goreg" => (kuna_goreg::GOREG_ENV, DefaultOn),
         "peordinal" => (kuna_peordinal::PEORDINAL_ENV, DefaultOn),
         "msvcfpconst" => (kuna_msvcfpconst::MSVCFPCONST_ENV, DefaultOn),
         "symbolnamerepair" => (kuna_symbolnamerepair::SYMBOLNAMEREPAIR_ENV, DefaultOn),
@@ -45,8 +49,10 @@ fn binding(name: &str) -> Option<(&'static str, Encoding)> {
         "libctypes" => (kuna_libctypes::LIBCTYPES_ENV, LibcTypes),
         "dwarfstructs" => (kuna_dwarfstructs::DWARFSTRUCTS_ENV, DefaultOn),
         "dwarfvariants" => (kuna_dwarfvariants::DWARFVARIANTS_ENV, DefaultOn),
+        "variantnames" => (kuna_variantnames::VARIANTNAMES_ENV, DefaultOn),
         "calltargettype" => (kuna_calltargettype::CALLTARGETTYPE_ENV, DefaultOff),
         "macho-arm64e" => ("KUNA_MACHO_ARM64E", Arm64e),
+        "sourcelang" => (kuna_sourcelang::SOURCELANG_ENV, SourceLang),
         _ => return None,
     })
 }
@@ -78,6 +84,13 @@ impl Encoding {
                 } else {
                     token
                 }
+            }
+            // A forced language travels as its token; `auto` (and any value the
+            // console `option` arm will refuse anyway) clears the variable so
+            // detection decides.
+            Self::SourceLang => {
+                return kuna_sourcelang::SourceLang::parse_forced(value)
+                    .map(|lang| lang.as_str().into());
             }
         })
     }

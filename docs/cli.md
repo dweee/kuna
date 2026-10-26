@@ -192,10 +192,21 @@ Drives `decomp_dbg` as a subprocess and captures `print C` via `openfile write`,
 interactive prompts never pollute the output. `--option NAME VALUE` (repeatable) and
 `--kassert "<args>"` flip phase-model sub-phase assertions per run; `--mode
 auto|reliable|aggressive|fast` applies an option preset (`docs/modes.md`).
+For an AArch64 target (any compiler spec with `<prefersplit>`), a single-function
+decompile also bootstraps its direct callees' recovered parameter types — at most
+32, no recursion, types only — so a split-register argument takes the callee's
+type; `--option protoorder off` disables it. Batch, `--jobs`, and
+`decompile-project` keep their own documented schedules.
 `--max-fn-memory MiB` stops the decompile once `decomp_dbg` holds more than MiB
 resident and the function has added 64 MiB (see *Per-function memory limit*
 under `decompile-all`, including its cgroup default) and reports `per-function
-memory limit exceeded` instead of being killed.
+memory limit exceeded` instead of being killed. `--max-fn-seconds N` is the
+wall-clock half (default 120, the same as `--json`; `0` disables): `decomp_dbg`
+arms it as the drive's cooperative deadline (see *Per-function watchdog* under
+`decompile-all`), and separately for the flow follow of its `load function`
+step, and a function still running at N seconds in either fails with
+`per-function decompile budget exceeded (N s) in <pass>`, a note naming the
+flag, and exit 1 instead of spinning on.
 
 An option **name** is checked before anything is loaded, on every surface that takes
 `--option`, and an unrecognized one exits 2 rather than running as if it had not been
@@ -498,6 +509,10 @@ decimal unless it carries a `0x`, and `<addr> <size>` is accepted wherever
 `<addr>+<size>` is. A C type may be anything the console's `parse line` accepts,
 including a `typedef` you asserted earlier in the same run.
 
+A `data` declaration replaces inferred strings that overlap its byte range,
+including one that runs past either end. Interior named data and previous
+explicit declarations retain their mappings.
+
 **`name`/`type` reach the register locals, not just the stack ones.** A local
 kuna prints with a storage comment — `unsigned long v6; // rax` — has no symbol
 behind it; naming one used to answer `No symbol named: v6` no matter how it was
@@ -523,7 +538,7 @@ function `score`), is `applied`, with a detail saying what it was printed as,
 and later directives reach it by that name (`name score_1 total`). A `type`
 that gives a stack local a scalar of another width is `rejected` before it
 applies (`Storage is 32 bytes, the stated type is 8`); a structure, union or
-array may grow or narrow it, within the stack.
+array may grow or narrow it, within the stack. Two independently retyped whole-frame locals may not cover the same stack bytes: that would emit separate C objects and lose their alias. Declare one aggregate or union covering the shared storage instead. A whole scalar local keeps its explicitly stated type even when a merged storage instance retains a weaker recovered type. If coalescing drops the direct Symbol binding, a matching type-locked member must still confirm the carried declaration type.
 
 ```bash
 kuna decompile ./graphy sub_1005350 --json --assert 'type v6 unsigned long *'
@@ -999,9 +1014,14 @@ preset it selects; an explicit `--mode reliable` keeps the catalog's
 explicit `--option` wins over the resolved preset.
 Address-selected single-function decompilation suppresses a preset-provided
 `fast_funcdisc` whole-image walk because the requested entry is already known.
-Name selection keeps it enabled so generated `sub_<addr>` names can resolve;
-explicitly spelling `--option fast_funcdisc on` opts an address run back into
-that analysis.
+Name selection suppresses it too on the first attempt, because a name the
+loader or the remaining discovery already carries needs no whole-image walk to
+resolve; that attempt then renders what `--addr` on the same entry renders. A
+name that misses retries with the preset's walk restored, so a miss reports
+what it reported before, and a placeholder spelling (`sub_<hex>`, `FUN_<hex>`,
+`func_0x<hex>`) keeps the walk from the start, since its entry may exist only
+because the walk found it. Explicitly spelling `--option fast_funcdisc on|off`
+always wins. Only the text surface defers it; `--json` keeps the preset.
 
 `--target <SLEIGH-language-id>` selects the decoder while a recognized object
 container continues to own its section mappings and image base. `--target default`
@@ -1759,15 +1779,24 @@ Behaviors specific to `decompile-all`:
   preset defaults to 10 seconds per function. On native, selected-function runs
   and the other presets retain 120 seconds; an explicit value always wins. WASM
   arms only the fast whole-binary 10-second policy and leaves its other commands
-  unbudgeted. A function whose decompile drive exceeds the budget is cut off
-  cooperatively (deadline probes at the action/rule-pool/heritage loop
-  boundaries, including each range heritage guards, and each region-structuring
-  round) and recorded as that function's `error`
-  (`"per-function decompile budget exceeded (N s)"`), the batch continuing. This is not a hard process timer: it does not bound
+  unbudgeted. `kuna decompile` takes the same flag (default 120). A function
+  whose decompile drive exceeds the budget is cut off cooperatively (deadline
+  probes at the action/rule-pool/heritage loop boundaries, including each range
+  heritage guards, each region-structuring round, and before, between and after
+  the models of each flow-time jump-table recovery) and recorded as that
+  function's `error`
+  (`"per-function decompile budget exceeded (N s) in <pass>"`), the batch
+  continuing. `<pass>` is the first probe that saw the deadline pass, the
+  innermost loop that was running: an action (a rule pool adds its busiest rule
+  this function), `heritage`, `region structuring`, or a jump-table step, and
+  anything inside a flow-time table recovery adds `during jump-table recovery at
+  <indirect-jump address>`, e.g. `in action oppool1 (busiest rule earlyremoval)`
+  or `in jump-table recovery at 0x1820e009b`. This is not a hard process timer: it does not bound
   discovery, unprobed decoder work, C/variable rendering, artifact
   construction, total export time, or memory. Driver policy, not a stage-model
   settable — zero output change for a function whose drive completes before
-  expiry; the console / `decomp_dbg` parity path never arms it.
+  expiry; the console / `decomp_dbg` parity path arms it only when given
+  `decomp_dbg --max-fn-seconds N`, which `kuna decompile` passes.
 
 - **Per-function memory limit** — `--max-fn-memory MiB` (`0` disables) on
   `decompile-all`, `decompile-project`, `decompile-graph` and `kuna decompile`.
@@ -2944,7 +2973,10 @@ remain comments/prototype tombstones and count in the final README. A mixed expo
 at least one body exits `0`; a non-empty selection that produces zero bodies exits `1`
 with the completed-file summary on stdout and a run-level diagnostic on stderr. The
 verdict is taken only after the `.c`, `.h`, `.asm`, README and, under `--stream`,
-`index.jsonl` have been finalized.
+`index.jsonl` have been finalized. `--assert` directives follow the same rules as on
+`decompile-all`: every rejection is printed on stderr, `--assert-strict` makes one exit
+`1`, and a directive the pipeline refused exits `1` on its own, again only after the
+artifacts are written.
 
 Writes a project folder — default `<binary-filename>.kuna/` next to the binary,
 `-o/--output DIR` overrides — of four artifacts designed so a human or LLM can study the

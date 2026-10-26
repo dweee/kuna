@@ -2098,7 +2098,19 @@ mod tests {
         // and kuna-arm-frame-inventory / validated A32 frames join the default inventory
         // and kuna-arraysize / an escaped stack buffer ends at its call's stated count
         // and kuna-narrowret, -x86 / a single-function decompile states no narrow call result
-        assert_eq!(count, 573, "corpus file count drifted");
+        // and kuna-bodyreads / a self-call keeps the register its own body reads
+        // and kuna-regsigned / a register local at the width its values are sign extended from
+        // and kuna-armfloat-preset / ARM hard-float VFP contracts in the aggressive preset
+        // and kuna-pointer-storage-literal / typed pointer byte-copy initializers
+        // and kuna-sparc-register-pair / an ldd-loaded SPARC register pair whose
+        // registers then hold two 32-bit values keeps them apart (option off = one
+        // 64-bit local updated with CONCAT44)
+        // and kuna-prefersplit / the compiler spec's split registers reach heritage pass 0
+        // and kuna-gomorestack / the Go stack-growth entry guard folds (option gomorestack)
+        // and kuna-fatstr / a read-only (ptr,len) constant pair prints as a bounded literal
+        // and kuna-variantnames / variant-part discriminants print as variant names
+        // and kuna-gowritebarrier / the Go GC write-barrier diamond folds (option gowritebarrier)
+        assert_eq!(count, 588, "corpus file count drifted");
     }
 
     /// ~20 representative SLEIGH spec files across varied processors
