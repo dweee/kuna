@@ -672,7 +672,10 @@ fn run_jobs_worker(args: &Args) -> Result<(), String> {
     let inventory = dir.join(jobs::INVENTORY_FILE);
     if !args.jobs_full_load && inventory.is_file() {
         seed_worker_inventory(&mut prog, &inventory.to_string_lossy())?;
+    } else if !args.jobs_full_load {
+        prog.callwide_unavailable("worker did not receive a complete function inventory");
     }
+    kuna_console::kuna_callwide::prepare(&mut prog);
     faults.after_load(dir);
     arm_fn_budgets(&mut prog, args);
     // (kuna `structsynth`) A recording worker reports every ledger lookup and
@@ -859,7 +862,11 @@ fn seed_worker_inventory(prog: &mut ConsoleProgram, path: &str) -> Result<(), St
         .map(std::rc::Rc::clone)
         .ok_or("no default code space")?;
     let manage = prog.arch().manage();
-    let entries: Vec<(String, Address)> = jobs::read_spec(path)?
+    let inventory = jobs::read_spec(path)?;
+    let callwide_inventory = prog.arch().call_wide.then(|| inventory.iter().map(|entry| kuna_console::kuna_callwide::InventoryEntry {
+        address: entry.addr, size: entry.size, name: entry.name.clone(), aliases: entry.aliases.clone(),
+    }).collect());
+    let entries: Vec<(String, Address)> = inventory
         .into_iter()
         .map(|t| {
             let space = manage
@@ -870,8 +877,11 @@ fn seed_worker_inventory(prog: &mut ConsoleProgram, path: &str) -> Result<(), St
         })
         .collect();
     prog.seed_function_inventory(&entries)
-        .map(|_| ())
-        .map_err(|e| format!("seeding the worker function inventory failed: {}", e.explain()))
+        .map_err(|e| format!("seeding the worker function inventory failed: {}", e.explain()))?;
+    if let Some(inventory) = callwide_inventory {
+        kuna_console::kuna_callwide::replay_inventory(prog, inventory);
+    }
+    Ok(())
 }
 
 /// The parent side of `--jobs N`: flatten the resolved targets (an `Address`
@@ -1692,6 +1702,9 @@ pub(crate) fn load_program(
         kuna_console::assertions::apply_program_scoped(&mut prog);
     }
     crate::kuna_allocrelease::after_analysis();
+    if args.jobs_worker.is_none() {
+        kuna_console::kuna_callwide::prepare(&mut prog);
+    }
     Ok(prog)
 }
 
@@ -1796,10 +1809,24 @@ fn resolve_targets_with_policy(
 /// Returns `None` when the file is not a Rust binary or cannot be parsed, which
 /// leaves the C default in place: this can only ever ADD a language, never take
 /// one away.
-pub fn detected_output_language(binary: &str) -> Option<&'static str> {
-    let bytes = kuna_analysis::loader::elf_shdr::read_image(binary).ok()?;
-    let file = kuna_analysis::loadimage_object::parse_object(&bytes).ok()?;
-    match kuna_analysis::sourcelang::detect_compiler(&file, &bytes) {
+pub fn detected_output_language(
+    binary: &str,
+    options: &[(String, String)],
+) -> Option<&'static str> {
+    // A per-run `--option sourcelang` force wins over the image: this policy
+    // runs in the parent process, before the loadtime environment is bound
+    // onto the engine (sub)process, so the options list is consulted directly.
+    let compiler = match crate::loadtime::last_option_value(options, "sourcelang")
+        .and_then(kuna_decomp::kuna_sourcelang::SourceLang::parse_forced)
+    {
+        Some(lang) => kuna_analysis::sourcelang::Compiler::from_forced_lang(lang),
+        None => {
+            let bytes = kuna_analysis::loader::elf_shdr::read_image(binary).ok()?;
+            let file = kuna_analysis::loadimage_object::parse_object(&bytes).ok()?;
+            kuna_analysis::sourcelang::effective_compiler(&file, &bytes)
+        }
+    };
+    match compiler {
         kuna_analysis::sourcelang::Compiler::Rustc => Some("rust-language"),
         _ => None,
     }
@@ -2354,6 +2381,9 @@ mod provenance_json_tests {
             code: Some("int f(int x)\n{\n  return x;\n}".into()),
             error: None,
             proto: None,
+            emitted_c_name: None,
+            call_declarations: Vec::new(),
+            callwide_prototypes: Vec::new(),
             variables: vec![VarInfo {
                 name: "x".into(),
                 type_name: "int".into(),
@@ -2363,6 +2393,7 @@ mod provenance_json_tests {
                 arg_index: Some(0),
                 line_numbers: vec![3],
                 addresses: vec![0x401004],
+                split_piece: false,
             }],
             types: vec![TypeInfo {
                 name: "mystruct".into(),
@@ -2722,7 +2753,7 @@ pub(crate) fn parse_args_with_filters(
         && cmd != "decompile-graph"
         && !options.iter().any(|(n, _)| n == "setlanguage")
     {
-        if let Some(lang) = detected_output_language(&binary) {
+        if let Some(lang) = detected_output_language(&binary, &options) {
             options.push(("setlanguage".into(), lang.into()));
         }
     }
