@@ -75,6 +75,13 @@ pub(crate) fn output_type_local(data: &Funcdata, op: OpId) -> Rc<Datatype> {
             .and_then(|v| data.vbank().get(v))
             .map(|v| v.get_offset())
             .unwrap_or(0);
+        let integer_width = arch.x87_integer_userops.iter()
+            .find_map(|&(id, width)| (u64::from(id) == in0_off).then_some(width));
+        if integer_width == Some(out_size) {
+            if let Some(Ok(ty)) = arch.types().map(|types| types.get_base(out_size, type_metatype::TYPE_INT)) {
+                return ty;
+            }
+        }
         if in0_off == crate::userop::BUILTIN_STRINGDATA as u64 {
             if let Some(out) = o.get_out().and_then(|v| data.vbank().get(v)) {
                 return Rc::clone(out.get_type());
@@ -392,6 +399,7 @@ fn get_local_type(data: &Funcdata, vn: VarnodeId) -> (Rc<Datatype>, bool) {
 fn build_localtypes(data: &mut Funcdata) {
     let order: Vec<VarnodeId> = data.vbank().iter_loc().collect();
     let mut elem_cache = crate::kuna_elemptr::Cache::default();
+    crate::kuna_armfloatreturn::unlock_unspelled(data);
     let float_bits = crate::kuna_floatbits::Plan::of(data);
     if float_bits.types_a_return() {
         data.kuna_note_float_bits_return();
@@ -450,6 +458,8 @@ fn build_localtypes(data: &mut Funcdata) {
         let ct = if from_seed { ct } else { crate::kuna_elfmaindecl::input_type(data, vn).unwrap_or(ct) };
         // (kuna `regnarrow`) A narrowed register value nothing else types is unsigned.
         let ct = if from_seed { ct } else { crate::kuna_regnarrow::unsigned_vote(data, vn, &ct).unwrap_or(ct) };
+        // (kuna `narrowargs callers`) A parameter its callers narrow takes their extension's type.
+        let ct = if from_seed { ct } else { crate::kuna_callerargs::input_vote(data, vn, &ct).unwrap_or(ct) };
         // (kuna `ptrfromuse`) A function input whose only memory role is to be a
         // LOAD/STORE base has no pointer candidate in the fold above, because
         // `TypeOpIntAdd` votes `int<N>` for it and refuses to carry the pointer
@@ -1078,6 +1088,16 @@ fn propagate_load_store(
     // STORE: propagating value (slot 2) to ptr is inslot == 2.
     let to_pointer = if is_load { inslot == -1 } else { inslot == 2 };
     if to_pointer {
+        // (kuna) A float VALUE may become the pointer's pointee only when the
+        // base's whole access map is that one width.  Otherwise the object is a
+        // record/union with several views (a u32 at one offset, a pointer at
+        // another), and promoting it to `double *` changes the element stride
+        // and turns every other access into a bit-cast.
+        if alttype.get_metatype() == type_metatype::TYPE_FLOAT
+            && !float_pointee_admits(data, op, alttype.get_size())
+        {
+            return None;
+        }
         let spc = space_from_const(data, op, 0)?;
         propagate_to_pointer(tlst, alttype, out_size, spc.get_word_size() as int4)
     } else {
@@ -1097,6 +1117,27 @@ fn propagate_load_store(
         // (kuna `structsynth nest`) A record's pointer to itself names its shell.
         Some(crate::kuna_structsynth::resolve_self_pointer(tlst, &value).unwrap_or(value))
     }
+}
+
+/// Does every `LOAD`/`STORE` through this base's constant offsets use exactly
+/// `value_size` bytes?
+///
+/// The object plane is owned by the access map, not by one value's type.  A
+/// base read at several widths is a record (or a union member) and keeps its
+/// storage type; the float access then prints as its own cast
+/// (`*(double *)a0`) instead of re-typing the whole object and forcing every
+/// other access through a bit-cast.  A dynamic access is admitted only when its
+/// `PTRADD` scale proves the element width is `value_size`: that is a float
+/// array, not a mixed-width object.  An unknown stride refuses.
+///
+/// The evidence walk starts at the base, not at the function's op bank, so its
+/// answer does not depend on how many unrelated ops the function holds.
+fn float_pointee_admits(data: &Funcdata, op: OpId, value_size: int4) -> bool {
+    let Some(pointer) = data.obank().get(op).and_then(|o| o.get_in(1)) else { return false };
+    let Some((base, _dynamic, _stride)) = crate::kuna_structsynth::peel_base_stride(data, pointer) else {
+        return false;
+    };
+    crate::kuna_structsynth::every_access_through(data, base, value_size)
 }
 
 /// C++ `TypeOpPiece::propagateType` (typeop.cc:2076).
