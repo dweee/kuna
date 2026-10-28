@@ -26,5 +26,10 @@
   "forge": "github",
   "repository": "dweee/kuna",
   "branch": "flakey",
-  "remote": "https://github.com/dweee/kuna.git"
+  "remote": "https://github.com/dweee/kuna.git",
+  "inputCheckWorkflows": [
+    "release-channels.yml",
+    "darwin-actions.yml",
+    "others-actions.yml"
+  ]
 }
