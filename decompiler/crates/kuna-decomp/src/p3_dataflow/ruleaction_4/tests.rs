@@ -50,9 +50,13 @@ fn build_fd() -> Funcdata {
 }
 
 fn build_fd_with_cancel_byte_arithmetic(gate: bool) -> Funcdata {
+    build_fd_with(|ctx| ctx.cancel_byte_arithmetic = gate)
+}
+
+fn build_fd_with(configure: impl FnOnce(&mut ArchContext)) -> Funcdata {
     let manage = build_manager();
     let mut ctx = ArchContext::new(manage);
-    ctx.cancel_byte_arithmetic = gate;
+    configure(&mut ctx);
     let glb = Rc::new(ctx);
     let ram = Rc::clone(glb.manage().get_space_by_name("ram").unwrap());
     let addr = Address::new(ram, 0x1000);
@@ -1189,6 +1193,53 @@ fn zextcommute_pushes_shift_inside() {
     assert_eq!(fd.obank().get(newshift).unwrap().get_in(1), Some(c));
 }
 
+#[test]
+fn zextcommute_preserves_wide_shifts_unless_the_count_fits() {
+    for bytes in [1, 2, 4] {
+        for promotion in [false, true] {
+            for constant in [false, true] {
+                let bits = bytes as u64 * 8;
+                let limit = if promotion { bits.max(32) } else { bits };
+                for bound in [0, bits - 1, bits, bits * 2 - 1, 31, 32, 63, u32::MAX as u64] {
+                    let mut fd = build_fd_with(|ctx| ctx.int_promotion = promotion);
+                    let bl = mk_block(&mut fd);
+                    let value = mk_vn(&mut fd, bytes, 0x10);
+                    let (_, extended) = mk_def(&mut fd, bl, OpCode::CPUI_INT_ZEXT, 8, 0x20, &[value]);
+                    let amount = if constant {
+                        fd.new_constant(4, bound)
+                    } else {
+                        let vn = mk_vn(&mut fd, 4, 0x18);
+                        fd.vbank_mut().get_mut(vn).unwrap().set_nz_mask(bound);
+                        vn
+                    };
+                    let (shift, _) = mk_def(&mut fd, bl, OpCode::CPUI_INT_RIGHT, 8, 0x30, &[extended, amount]);
+                    let applied = RuleZextCommute::new().apply_op(shift, &mut fd);
+                    assert_eq!(
+                        applied,
+                        (bound < limit) as int4,
+                        "{bytes} bytes, bound {bound}, constant {constant}, promotion {promotion}"
+                    );
+                    let op = fd.obank().get(shift).unwrap();
+                    if bound >= limit {
+                        assert_eq!(op.code(), OpCode::CPUI_INT_RIGHT);
+                        assert_eq!(op.get_in(0), Some(extended));
+                        assert_eq!(op.get_in(1), Some(amount));
+                    } else {
+                        assert_eq!(op.code(), OpCode::CPUI_INT_ZEXT);
+                        let narrow = op.get_in(0).unwrap();
+                        assert_eq!(fd.vbank().get(narrow).unwrap().get_size(), bytes);
+                        let inner = fd.vbank().get(narrow).unwrap().get_def().unwrap();
+                        let inner = fd.obank().get(inner).unwrap();
+                        assert_eq!(inner.code(), OpCode::CPUI_INT_RIGHT);
+                        assert_eq!(inner.get_in(0), Some(value));
+                        assert_eq!(inner.get_in(1), Some(amount));
+                    }
+                }
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // RuleSubZext  (the intricate sub-then-zext masking rule)
 // ---------------------------------------------------------------------------
@@ -1379,6 +1430,47 @@ fn concatcommute_or_lower() {
     assert_eq!(fd.obank().get(inner).unwrap().get_in(1), Some(w));
     let cc = fd.obank().get(cat).unwrap().get_in(1).unwrap();
     assert_eq!(fd.vbank().get(cc).unwrap().get_offset(), 0x00ff);
+}
+
+#[test]
+fn loadvarnode_promotes_only_proven_disjoint_or_offsets() {
+    for (offset, mask, expected) in [
+        (0x120, 0x120, Some(0x124)),
+        (0x124, 0x124, None),
+        (0x120, u64::MAX, None),
+    ] {
+        for commuted in [false, true] {
+            let mut fd = build_fd();
+            let bl = mk_block(&mut fd);
+            // A constant pseudo-spacebase is the existing global-space form.
+            // The CLI regression exercises the same rewrite on real frame SSA.
+            let base = fd.new_constant(8, 0);
+            fd.vbank_mut().get_mut(base).unwrap().set_spacebase();
+            let displacement = fd.new_constant(8, offset);
+            let (_, address) = mk_def(
+                &mut fd, bl, OpCode::CPUI_INT_ADD, 8, 0x20, &[base, displacement],
+            );
+            fd.vbank_mut().get_mut(address).unwrap().set_nz_mask(mask);
+            let word = fd.new_constant(8, 4);
+            let inputs = if commuted { [word, address] } else { [address, word] };
+            let (_, pointer) = mk_def(&mut fd, bl, OpCode::CPUI_INT_OR, 8, 0x30, &inputs);
+            let space = fd.new_constant(8, ram_space(&fd).get_index() as u64);
+            let (load, _) = mk_def(&mut fd, bl, OpCode::CPUI_LOAD, 4, 0x40, &[space, pointer]);
+            let changed = RuleLoadVarnode::new().apply_op(load, &mut fd);
+            if let Some(expected) = expected {
+                assert_eq!(changed, 1);
+                assert_eq!(fd.obank().get(load).unwrap().code(), OpCode::CPUI_COPY);
+                let input = fd.obank().get(load).unwrap().get_in(0).unwrap();
+                let value = fd.vbank().get(input).unwrap();
+                assert_eq!(value.get_offset(), expected);
+                assert_eq!(value.get_size(), 4);
+                assert_eq!(value.get_space().get_name(), "ram");
+            } else {
+                assert_eq!(changed, 0);
+                assert_eq!(fd.obank().get(load).unwrap().code(), OpCode::CPUI_LOAD);
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
