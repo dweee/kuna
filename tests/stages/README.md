@@ -1,5 +1,10 @@
 # Stage-model issue testcases
 
+`kuna-callwide.xml` loads the committed sealed MIPS32-BE ELF and checks the
+four-byte OFF result against the proved eight-byte result and high-piece callers.
+Its CLI companion executes the original bytes and untouched emitted C/header
+under MIPS QEMU at O0/O2, including selected exports, workers and streaming.
+
 `kuna-stack-byte-copy.xml` checks pushed scratch bytes, partial reads and a
 saved snapshot with `stackstoreguard` off and on. Its CLI companion compiles
 and executes the exact C at O2 in default, stackviews and stackalias modes, and checks
@@ -118,6 +123,7 @@ writeup, not here.
 | `kuna-aifnoppad.xml` | [Kuna #299](https://github.com/Noelo-Lab/kuna/issues/299) | P1 code/data partition (no AIF gap entry starts on nop padding: padding in front of a known function is not probed, and an accept behind padding moves to the code after it) | `option aifnoppad on\|off` |
 | `kuna-condcall.xml` | [Kuna #299](https://github.com/Noelo-Lab/kuna/issues/299) | P1 code/data partition (a predicated call's skip to the next instruction is its fall-through, not a second call target, so the next instruction is not a function and the callee is not no-return) | default correctness fix (no option) |
 | `kuna-thumbswitch.xml` | [Kuna #299](https://github.com/Noelo-Lab/kuna/issues/299) | P1 code/data partition (the Listing walk reads a range-checked Thumb `tbb`/`tbh` offset table and decodes the case bodies as the dispatcher's own code, so no gap entry lands on a case) | `option thumbswitch on\|off` |
+| `kuna-x86listingswitch.xml` | [Kuna #299](https://github.com/Noelo-Lab/kuna/issues/299) | P1 code/data partition (a locally proved i386 switch decodes exactly four cases before the gap walk; the independent function between cases remains and a case's real callee is recovered) | `option x86listingswitch off\|on` |
 | `kuna-aifpoolslide.xml` | [Kuna #299](https://github.com/Noelo-Lab/kuna/issues/299) | P1 code/data partition (an AIF gap candidate on a word a PC-relative load reads is pool data: its accept moves to the code after the pool) | `option aifpoolslide on\|off` |
 | `kuna-pushimmediateret.xml` | RE-friction duplicate needs `entry-point-push-return` + `push-immediate-ret-transfer` | S2 flow classification (a proven one-store `push immediate; ret` becomes a terminal branch; no target function is synthesized) | `option pushimmediateret on\|off` |
 | `kuna-subcommuteshift.xml` | RE-friction need `cancelling-byte-arithmetic-splits` | S3 simplification quiescence (exact modulo-256 multiply/shift cancellation) | `option cancelbytearithmetic on\|off` |
@@ -301,7 +307,14 @@ with undefined-behavior checks and exercises every case and signed boundaries.
 
 - `kuna-sparc-double-sign.xml`, `kuna-sparc64-double-sign.xml`: binary64 negation from a high-word `fnegs`, without a numeric high-word cast.
 
+- `kuna-sparc-register-pair.xml`: a SPARC32 register pair loaded whole by `ldd` on one path and set as two 32-bit values on the other keeps a loop index and a counter as separate locals (`option pairrefine`; the second pass runs it `off`, which fuses them into one 64-bit local updated with `CONCAT44`).
+
 - `kuna-integer-float-rounding.xml`, `kuna-integer-float-rounding64.xml`, `kuna-integer-float-rounding-x87.xml`: an integer-to-float conversion keeps its rounding through a later float conversion or a narrower float trace (`option intfloatround`; the first passes run it `off`), while exact intermediates, x87 extended conversions and `fld1` still combine.
 
 `kuna-global-load-call-order.xml` keeps a post-call memory-loaded global write after the getter, including a later call, a loop marker and a no-final-call control. The CLI roundtrips check an impure getter, a computed-value reload control and overlapping x86-64 SIMD reads using GCC/Clang at O0/O2. Its first pass runs `option globalcallstore off`, which prints the write before the getter.
 - `kuna-register-pair-call-args.xml`: overwritten wide-return register components at an undeclared call, with single-half and unchanged-pair controls.
+
+`kuna-pointer-storage-literal.xml` publishes a pointer through a mapped byte frame
+and checks that its compound initializer converts the integer carrier back to a
+pointer. The CLI companion compiles fresh PE32/ELF64 examples with Clang and runs
+the Linux native/recompiled functions at O0/O2. Source: `src/pointer_storage_literal.c`.
