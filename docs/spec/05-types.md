@@ -342,6 +342,25 @@ non-zero mask (§5.3) admits values above 1. When the incoming type is a union
 markers, where the unresolved union flows on so one phi input cannot lock the
 facet for all of them.
 
+The LOAD/STORE value→pointee edge is guarded for floats: a float value becomes
+the base's pointee only when every `LOAD`/`STORE` through that base uses the same
+width and every dynamic access proves the same element width. A base read at
+several widths is an object with several views; it keeps its storage type and the
+float access prints as its own cast (`*(double *)a0`) instead of re-typing the
+whole object and forcing every other access through a bit-cast. A dynamic access
+whose `PTRADD` scale is the same width is a float array and keeps the promotion;
+an unknown stride refuses it. The evidence is the base's own pointer family, not
+the function's op bank: the audit follows `COPY`, `CAST`, constant `INT_ADD`/
+`PTRSUB` and `PTRADD` forward from the base and peels each address back to prove
+it names the same base, so a function growing unrelated ops cannot change the
+answer and there is no whole-scan budget to hit. A family the walk cannot complete
+refuses the promotion.
+Every dynamic term in a nested address must prove that width; a later matching
+scale cannot erase an unknown or conflicting term, and a scale must fit the
+element-size representation without truncation. An access whose address cannot
+be peeled within the walk's depth bound also refuses promotion, even if another
+access through the same base was proven.
+
 With stackviews enabled, `decompiler/crates/kuna-decomp/src/p5_types/kuna_stackwordtypes.rs`
 separates a generated frame backing from the value stored through another
 pointer. A one-, two-, four-, or eight-byte STORE value uses its resolved scalar
@@ -1652,6 +1671,20 @@ and COPY propagation see the declared two-byte character type. Neighboring
 data mappings and function symbols are never replaced, and no global string
 length or encoding heuristic is changed.
 
+The declaration also owns every other byte of its span. An inferred string --
+a character array whose type is locked but whose synthetic `s_<addr>` name is
+not, mapped at one address -- that shares any byte with the declared range is
+removed, whether it starts inside the range or straddles either end. Otherwise
+the narrower string wins the container lookup for an interior read (a `float
+values[3]` table whose middle bytes happen to spell text read back as
+`s_2002[2]`), and the header refuses both overlapping objects, leaving each
+name undeclared. Name-locked data, earlier explicit declarations, and symbols
+mapped at more than one address are kept. A constant pointing into the middle
+of a declared aggregate then follows the ordinary exact-hit rule above: it is
+recovered as a pointer into the declaration when its sink is typed as a
+pointer, and otherwise prints as the bare address, the same as for an
+aggregate the DWARF tier declared.
+
 Two (kuna) escapes hook exactly here, both shipped default-on (DIV-2,
 `decompiler/crates/kuna-decomp/phases.toml`):
 
@@ -2022,6 +2055,13 @@ ledger probes `find_by_name` from `struct_0` up to the first free name, reads
 each one's layout back, and declines any whose members are not all named
 `field_0x<hex>` — that name is held by a type from somewhere else (DWARF, a
 parsed header) and is never handed out as the answer to an access pattern.
+A lookup therefore makes up to 1,024 name probes. Each probe is a binary search
+of the factory's name index, which is kept sorted by (name, id) as the C++
+`nametree` set is (`decompiler/crates/kuna-decomp/src/substrate/dtype.rs
+(find_by_id_local)`). The port used to scan the whole index on every probe. A
+lookup then cost the full ledger times every named type the program holds, and
+once a whole-image MSVC run filled the ledger, that cost grew to half of each
+later function's decompile.
 Every mint declines on an error rather than propagating one: `find_add` rejects
 a second, different definition of a held name.
 
@@ -2323,7 +2363,8 @@ can take it without a factory: it scans the `struct_<n>` slots as the ledger
 does, skipping a name another type holds, calls the same `best_of` and
 `keeps_unclaimed`, and mints at the first free slot. A `--jobs` worker records
 each lookup a function makes, with a recipe for every field type (a named type
-by name and id, a pointer or byte array around its rebuilt element), and the
+by name and id, a pointer or byte array around its rebuilt element, and the
+unnamed unknown a Varnode starts with built afresh), and the
 answer its own ledger gave, with the lookup that minted that structure in the
 worker. The parent replays the records in target order. A structure is its
 members, so when a function's own answers and the serial ones name structures
@@ -2341,7 +2382,18 @@ type gets a recipe only if the worker's load created it
 (`decompiler/crates/kuna-decomp/src/p5_types/kuna_structsynth/shard.rs (AtLoad)`): a pass
 that interns a type the first time a function needs it, as `pebnames` does
 `PEB` and `TEB`, leaves it in some workers and not in others, so a structure
-with such a field is named by one ordered worker instead. The parent also
+with such a field is named by one ordered worker instead. The unnamed unknown
+is different. No factory holds it: it is the `Datatype::new(size,
+TYPE_UNKNOWN)` skeleton that stands in for `getBase` where no factory is
+consulted. A pointer to it still reaches a field type, so every process builds
+it identically
+(`decompiler/crates/kuna-decomp/src/substrate/dtype.rs
+(Datatype::is_unknown_placeholder)`), and it travels as itself. A type that
+differs from that skeleton in any property, the interned `undefined8`
+included, does not pass for it. Without that recipe, one onnxruntime.dll
+function whose structure held a pointer to a pointer to the placeholder sent all 5,241
+of the image's synthesizing functions to the one ordered worker. In
+dxcompiler.dll, nine functions sent 8,989. The parent also
 answers the sweep: a structure still answers every layout it answered once, so
 the sweep's lookups never mint, and the ones whose answer changes are renamed
 or decompiled in the same pool. The synthesized structures of a sharded run are
@@ -3056,14 +3108,15 @@ is walked on in turn. The cast pass reinterprets the float for an ordered
 comparison, and for an `==` or `!=` too except against such a constant
 (chapter 09, *Integer equality on float bits*), where the float comparison
 holds for exactly the bits the binary tests (`ABS(a0) == INFINITY`, `a0 ==
-1.0`, `a0 == 16777218.0`), while `-0.0` equals `0.0`, a NaN equals nothing,
+1.0f`, `a0 == 16777218.0f`), while `-0.0` equals `0.0`, a NaN equals nothing,
 and a flushed denormal equals zero. The refusals below predate that cast and
 are kept: an accepted input against any other constant would now print as
-the union reinterpretation of its bits rather than a wrong float comparison. The printer writes a float
-constant by its shortest digits with no `f` suffix, which C reads as a
-`double`, so `0.1f` prints `0.1`, another value, and `a0 == 0.1` is false for
-`a0 = 0.1f`; the literal is printed (`FloatFormat::print_decimal`, in both
-notations) and read back as a `double`, which must be the constant's value. So
+the union reinterpretation of its bits rather than a wrong float comparison. The
+test predates the `f` suffix the C printer now puts on a 4-byte constant
+(chapter 09) and still reads the constant's shortest digits
+(`FloatFormat::print_decimal`, in both notations) back as a `double`, which must
+be the constant's value: `0.1f` prints `0.1`, another double, so it is refused
+even though `a0 == 0.1f` would now compare exactly. So
 an `==` or `!=` with zero, a NaN pattern, a denormal, `0.1f`, `FLT_MAX` or
 another value refuses the input (`v.u == 0`, `(v.u & 0x7fffffff) ==
 0x7fc00000`, `x.u == y.u`, `v.u == 0x3dcccccd`). Anything else refuses the input as well:
@@ -3102,7 +3155,11 @@ or is a constant a float literal spells (`returned_beside_ok`). A slot that
 fails refuses every input that reaches it, and the plan is taken again without
 them, so the helper prints float on both sides or on neither: `fb_mix(float x,
 u32 k)` ors its integer parameter into the bits it returns in `s0`, and keeps
-`unsigned int fb_mix(unsigned int,unsigned int)`. A returned value in an
+`unsigned int fb_mix(unsigned int,unsigned int)`. Under `armfloatreturn`
+(chapter 04) a value returned in `s0` or `d0` is already locked to the float
+of its width; the walk passes that lock as it would an unlocked value, so
+`copysignf` still takes two floats, while `fb_mix` returns the convention's
+float and keeps its integer parameters. A returned value in an
 integer register is the classifier's answer and keeps its own type, so
 `isnanf`, `signbit` and newlib's `isfinitef` take a float parameter only. The
 bit ops in the body then read a float, the cast pass inserts the cast each
@@ -3254,6 +3311,24 @@ partition component until it stabilizes — under a chosen `Widener`. Where the
 C++ threads a `Varnode -> ValueSet` back-pointer and mark bits through the IR,
 the port keeps a `VarnodeId -> node` map plus side sets on the solver, which
 is observationally identical.
+
+For a numeric condition, `ValueSetSolver::constraints_from_path` also
+forwards its range through an immediate `INT_ZEXT` already in the value-set
+system (`apply_zext_constraints`). This is needed when a 32-bit counter is
+compared before the branch but its zero-extended 64-bit value feeds the
+loop phi and indexed address. The extension executes on the exit path too,
+so the solver applies the extended condition through the existing
+conditional-read equations, including the phi's individual incoming edge;
+it does not globally restrict the extension's output.
+
+`zext_constraint` handles unit-stride predicates and uses the ordinary
+forward range transfer when exact. A wrapped signed predicate can produce
+two disjoint pieces after zero extension. In that case it keeps both in a
+wider wrapped hull. The additional high values are outside the zero
+extension's possible output domain, so both the predicate and its
+complement remain exact on reachable values. Empty constraints retain the
+wider mask before complementation. Strided predicates and relative
+stack-pointer constraints keep their existing path.
 
 The solver's one in-tree client is the LoadGuard range refinement at
 `decompiler/crates/kuna-decomp/src/p3_dataflow/heritage.rs (LoadGuard)`,
@@ -3493,6 +3568,62 @@ slice assignments. Failure mode: any guard miss declines silently and the
 output is byte-identical to `off` — the destination stack slices the run wrote
 survive as unread declarations, because the local variable map still sees the
 frame carved by the original wide stores.
+
+**Length-carried string literals (kuna, option [`fatstr`](../options.md),
+default auto; `docs/multilang.md` W3/W4).**
+`decompiler/crates/kuna-decomp/src/p5_types/kuna_fatstr.rs (RuleFatStr)`
+covers the fourth shape: the string never reaches a frame at all, because a
+fat-pointer language passes it as a `(ptr, len)` pair. Rust (`&str`, `&[u8]`)
+and Go (`string`) carry the length beside the pointer and never NUL-terminate
+the bytes, so the terminator-scanning literal path declines and every constant
+string argument renders as a raw rodata address beside a magic length. The
+rule reads exactly `len` bytes and reuses the same bounded mechanism the
+sequence rules above produce
+(`Funcdata::get_internal_string` → `BUILTIN_STRINGDATA`), which needs no
+terminator. A CALL argument pair is rewritten only when: both are adjacent
+p-code constants (the shape the two words take after constant propagation);
+`2 <= len <= 4096`; the pointed-at bytes are **read-only** in the image
+(`ArchContext::query_global_properties`, the same literal test
+`msvcstrappend` applies), so the rendered literal is a fact of the binary; and
+the bytes decode as UTF-8 text — no control characters beyond
+newline/tab/CR, at least one alphanumeric — or the pointer's facing type
+carries a text **language facet**. The length argument is kept, because the
+call really does pass it. At `auto` (the default) the rule acts only when the
+image's source language is Rust or Go (the `sourcelang` fact, chapter 01), so
+it is a structural no-op on every other binary; `always` drops the language
+test for no-signal corpora (a stage-test bytechunk); `off` keeps the raw
+pointer. Failure mode mirrors `rodatastring`: any guard miss declines
+silently and the output is byte-identical to `off`.
+
+The **language-facet table** the rule consults is the multilang W3 plane's
+first slice (`decompiler/crates/kuna-decomp/src/p0_knowledge/kuna_langfacet.rs
+(LangFacet)`): a name-keyed side record on the type factory
+(`decompiler/crates/kuna-decomp/src/substrate/dtype.rs
+(kuna_register_lang_facet, kuna_lang_facet)`) stating what a C-shaped type
+*means* in the source language — `RustStr`, `RustSlice` — exactly the
+`VariantLayout` pattern, and for the same reason: `type_metatype`'s consumers
+match it non-exhaustively, so language meaning rides beside the type, never
+inside the lattice. Facets are registered by type providers (the DWARF
+import and the language packs, in later slices); nothing populates the table
+in this one, so the facet arm of `fatstr`'s evidence test is reachable only
+through an explicit registration today.
+
+The option's second recognizer is analysis-side
+(`decompiler/crates/kuna-analysis/src/analyzers/strings/kuna_strrecords.rs
+(StrRecordPass)`, pass id `fatstrrecords`, registered for a rustc-detected
+image, committed under the same `fatstr` mode gate). rustc packs its
+unterminated literals back to back in `.rodata`, so the NUL-run string scan
+glues adjacent literals into one wrong row — the measured witness read its
+three literals as a single 39-byte string. The static `(ptr, len)` records
+every Rust literal's length lives in (a PIE's `R_*_RELATIVE` slots in
+`.data.rel.ro`, with the length in the unrelocated companion word; absolute
+word pairs on a non-PIE) are re-read as length-BOUNDED string facts — exact
+byte extents, no terminator — and committed AHEAD of the NUL stream, so the
+occupied-address guard retires the glued rows and the data symbol at each
+literal spans exactly the literal. Chapter [01](01-program-prep.md) carries
+the pass's place in the string family; the guards are the engine rule's own
+(read-only backing, `1..=4096`, UTF-8 text, and for the no-relocation direct
+arm the NUL scan's minimum of four bytes).
 
 **Bitfields** (`decompiler/crates/kuna-decomp/src/p5_types/bitfield.rs`).
 Pattern: a struct with sub-byte fields is accessed through shift/mask soup on

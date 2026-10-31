@@ -50,6 +50,8 @@ pub(crate) struct PltSym {
     pub addr: u64,
     /// Imported function name (raw `.dynstr` bytes, `@VERSION` stripped).
     pub name: Vec<u8>,
+    /// The GOT slot the stub jumps through, when it was decoded from the stub.
+    pub slot: Option<u64>,
 }
 
 /// Resolve PLT-stub call targets to their imported function names.
@@ -76,6 +78,9 @@ pub(crate) fn resolve_plt_imports(file: &object::File, bytes: &[u8]) -> Vec<PltS
 /// intact — which is every image that ever reached this code before.
 fn resolve_from_sections(file: &object::File) -> Vec<PltSym> {
     let arch = file.architecture();
+    if arch == Architecture::PowerPc {
+        return super::kuna_ppc32_imports::resolve(file);
+    }
 
     // MIPS has no regular `.plt` code section and emits NO `R_MIPS_JUMP_SLOT`
     // relocations for its lazy imports: the stub→name correspondence is carried by
@@ -348,7 +353,7 @@ fn decode_x86_64_ifunc_stubs(
                 if !named.contains_key(&got) && named_got.insert(got) {
                     let stub =
                         vma + x86_stub_start(data, i, &[0xF3, 0x0F, 0x1E, 0xFA]) as u64;
-                    out.push(PltSym { addr: stub, name: format!("ifunc_{resolver:x}").into_bytes() });
+                    out.push(PltSym { addr: stub, name: format!("ifunc_{resolver:x}").into_bytes(), slot: None });
                 }
             }
             i += 6;
@@ -425,7 +430,7 @@ fn record(
 ) {
     if let Some(name) = map.get(&got) {
         if named_got.insert(got) {
-            out.push(PltSym { addr: stub, name: name.clone() });
+            out.push(PltSym { addr: stub, name: name.clone(), slot: Some(got) });
         }
     }
 }
@@ -774,10 +779,7 @@ fn decode_riscv(
 /// avoids relying on a `.TOC.` symbol being present.  If there is no `.got`
 /// section the binary has no TOC-relative imports and we resolve nothing.
 ///
-/// PPC32 (`Architecture::PowerPc`, big-endian) uses a different secure-PLT stub
-/// shape that this routine does not model, so it no-ops there — left as a hook
-/// (`decode_ppc_text` reads words honoring endianness, so a future PPC32 arm can
-/// slot in here).
+/// PPC32 uses the separate relocation-validated `kuna_ppc32_imports` resolver.
 fn decode_ppc_text(
     file: &object::File,
     arch: Architecture,
@@ -978,7 +980,7 @@ fn resolve_mips_imports(file: &object::File) -> Vec<PltSym> {
         // import's `refAddr`); this is the indirect call target the decompiler
         // resolves after $gp recovery.  Skip a 0 slot (unresolvable).
         if ext.stub_addr != 0 {
-            out.push(PltSym { addr: ext.stub_addr, name: ext.name });
+            out.push(PltSym { addr: ext.stub_addr, name: ext.name, slot: None });
         }
     }
     out

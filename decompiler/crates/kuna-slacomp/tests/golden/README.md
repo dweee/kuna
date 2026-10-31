@@ -4,7 +4,7 @@
 stream produced by Ghidra's C++ `sleigh_opt` at revision
 `cef869af04c4740a71ad31a55704045b1b0d1644`. Compression bytes are excluded because
 flate2 and zlib can compress the same stream differently. The manifest covers
-48 specs, including both endiannesses, Toy variants, major processor families,
+49 specs, including both endiannesses, Toy variants, major processor families,
 Hexagon's named sections and crossbuilds, and inherited context assignments
 across nested `with` blocks. The named-bitrange fixtures exercise reads and
 writes of one-bit, nine-bit and byte-aligned aliases in both endiannesses.
@@ -19,7 +19,31 @@ The SPARC entries include kuna's destination corrections for `fdtoi`, `fqtoi`,
 `fstox` and `fqtox`. The first three were regenerated with Ghidra's C++
 compiler on the corrected sources, which reproduces the previous hashes on the
 unmodified sources; the `fqtox` correction was regenerated with `slacomp`,
-which reproduces those C++ digests.
+which reproduces those C++ digests. The current digests also cover the branch
+conditions sampled before a delay slot (`icc`/`xcc` `cs`, `neg` and `vs`, and
+the non-annulled register branches). They were regenerated with the recorded
+C++ compiler, which reproduces the previous SPARC digests on the previous
+sources; `slacomp` produces the same digests.
+
+The x86 entries include the width-specific x87 integer-conversion operations,
+the control-word writes of `FXRSTOR` and `XRSTOR`/`XRSTORS`, and the signed
+BOUND operand loads and bounds-check user-ops.
+They were regenerated with the recorded C++ compiler after checking that it
+reproduces both unmodified x86 hashes; kuna’s compiler produces the same changed
+element streams.
+The combined digests were produced with `slacomp`, which reproduces the
+pinned C++ digests for each of those changes applied alone.
+`x86-16.slaspec` (16-bit x86 with the real-mode code segment in the decode
+context) was added with a digest from the recorded C++ compiler, which
+`slacomp` matches. Its `ia.sinc` hook replaces three blank lines, so the
+`x86.slaspec` and `x86-64.slaspec` digests are unchanged, source lines
+included.
+Its digest was regenerated with the recorded C++ compiler, which `slacomp`
+matches, when 16-bit x86 gained the 8087-emulator decode: the x87 ESC
+constructors moved into an `x87` table there. Their `ia.sinc` lines changed
+in place (each quoted mnemonic and `X87_Dn` macro expands back to the old
+text outside 16-bit x86, and the table's `with` block is under `@ifdef IA16`),
+so the `x86.slaspec` and `x86-64.slaspec` digests are again unchanged.
 
 `xml_ops.xml` is the same pinned C++ compiler's `-y` output for
 `snips/xml_ops.slaspec`. The CLI test compares XML output byte-for-byte in both

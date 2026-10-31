@@ -575,6 +575,9 @@ impl Funcdata {
     /// `BlockWhileDo::testTerminal` (block.cc:3304).  Verify the statement read
     /// by `loopDef` from `slot` is an explicit, printed, last-in-block op (or
     /// can be moved to be so).  Returns the root explicit op or `None`.
+    /// When `finalOp` is a hidden COPY, the op feeding it is what the header
+    /// prints, so it must also move up to the COPY past every printed statement
+    /// between them (kuna; upstream only moves the COPY).
     fn while_test_terminal(&mut self, wd: BlockId, slot: int4) -> Option<OpId> {
         let loop_def = self.sblocks_ref().block(wd).get_loop_def()?;
         let vn = self.obank().get(loop_def).and_then(|o| o.get_in(slot))?;
@@ -613,6 +616,12 @@ impl Funcdata {
         }
         if !self.op_move_respecting_cover(final_op, last_op) {
             return None;
+        }
+        if res_op != final_op {
+            let before_copy = self.op_previous_op(final_op)?;
+            if !self.op_move_respecting_cover(res_op, before_copy) {
+                return None;
+            }
         }
         Some(res_op)
     }
@@ -2595,7 +2604,12 @@ impl Funcdata {
         let addr2 = partial.obank().get(partop).unwrap().get_addr().clone();
         jt.set_indirect_op_addr(partop, addr2);
         let res = if jt.is_partial() {
-            jt.recover_multistage(partial)
+            let targets = self.get_override().multistage_targets(&addr).map(<[Address]>::to_vec);
+            jt.recover_multistage(partial).map(|()| {
+                if let Some(targets) = targets {
+                    jt.kuna_adopt_multistage_targets(targets);
+                }
+            })
         } else {
             jt.recover_addresses(partial)
         };
@@ -3002,6 +3016,17 @@ impl Funcdata {
         )
     }
 
+    /// The number of ops in basic block `b`.
+    fn bb_op_count(&self, b: BlockId) -> usize {
+        let mut n = 0;
+        let mut cur = self.bb_op_head(b);
+        while let Some(op) = cur {
+            n += 1;
+            cur = self.obank().get(op).and_then(|o| o.basic_neighbours().1);
+        }
+        n
+    }
+
     /// Split the epilog of the function (C++ `ActionReturnSplit::apply`,
     /// `blockaction.cc:2265`).  Returns the number of edges split (the action's
     /// change count).
@@ -3035,6 +3060,7 @@ impl Funcdata {
             }
 
             let mut splitcount = 0;
+            let first = retnode.len();
             // splitedge holds edges to split, biggest index first, so edge removal
             // does not shift the index of remaining edges.
             let size_in = self.bblocks_ref().block(parent).size_in();
@@ -3061,6 +3087,15 @@ impl Funcdata {
             if size_in == splitcount {
                 splitedge.pop();
                 retnode.pop();
+            }
+            // (kuna `retsplitlimit`) a block too big to clone this many times keeps its gotos.
+            if crate::p8_structure::kuna_retsplitlimit::split_is_declined(
+                self.get_arch().ret_split_limit,
+                self.bb_op_count(parent),
+                retnode.len() - first,
+            ) {
+                splitedge.truncate(first);
+                retnode.truncate(first);
             }
         }
 
