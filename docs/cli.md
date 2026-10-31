@@ -129,7 +129,7 @@ tree could not be unpacked.
 | `KUNA_DECODE_STATS` | `1` prints one line of lane/interval/round/crossing/decode counts and the walk, merge and lane-memory figures. It also keeps the runtime's panic report for a lane fault, which the fallback otherwise silences. |
 | `KUNA_DECODE_FAULT` | Test-only: `<n>` panics lane `n` once, `spawn:<n>` makes lane `n`'s spawn fail — the two fallback paths. |
 | `KUNA_CGROUP_ROOT` | Test-only: the directory read in place of `/sys/fs/cgroup` by the `--max-fn-memory` cgroup default and when `--jobs auto` reads a cgroup's headroom. |
-| `KUNA_JOBS_FAULT` | Test-only, comma-separated: `panic:<addr>` / `panic-once:<addr>` / `stall:<addr>` make a `--jobs` worker panic (the first time only) or wedge as it starts the target at that byte address (`*` for every target), `spawn:<n>` refuses every worker spawn after the first `n`, and `load-abort:<n>` makes the first `n` worker loads of the run abort as a refused allocation does (`*` for every one) — the pool's re-run paths. `stall` only ends when `--max-fn-seconds` is non-zero. |
+| `KUNA_JOBS_FAULT` | Test-only, comma-separated: `panic:<addr>` / `panic-once:<addr>` / `stall:<addr>` make a `--jobs` worker panic (the first time only) or wedge as it starts the target at that byte address (`*` for every target), `stall-again:<addr>` wedges it only the second time that target starts in a run, `spawn:<n>` refuses every worker spawn after the first `n`, and `load-abort:<n>` makes the first `n` worker loads of the run abort as a refused allocation does (`*` for every one) — the pool's re-run paths. A stall only ends when `--max-fn-seconds` is non-zero. |
 
 An override wins over all of these, and one pointing at nothing is reported as
 such rather than silently re-probed.
@@ -192,10 +192,23 @@ Drives `decomp_dbg` as a subprocess and captures `print C` via `openfile write`,
 interactive prompts never pollute the output. `--option NAME VALUE` (repeatable) and
 `--kassert "<args>"` flip phase-model sub-phase assertions per run; `--mode
 auto|reliable|aggressive|fast` applies an option preset (`docs/modes.md`).
+For an AArch64 target (any compiler spec with `<prefersplit>`), a single-function
+decompile also bootstraps its direct callees' recovered parameter types — at most
+32, no recursion, types only — so a split-register argument takes the callee's
+type; `--option protoorder off` disables it. Batch, `--jobs`, and
+`decompile-project` keep their own documented schedules.
 `--max-fn-memory MiB` stops the decompile once `decomp_dbg` holds more than MiB
 resident and the function has added 64 MiB (see *Per-function memory limit*
 under `decompile-all`, including its cgroup default) and reports `per-function
-memory limit exceeded` instead of being killed.
+memory limit exceeded` instead of being killed. The limit covers the flow
+follow too, which recovers the function's jump tables before the decompile
+starts. `--max-fn-seconds N` is the
+wall-clock half (default 120, the same as `--json`; `0` disables): `decomp_dbg`
+arms it as the drive's cooperative deadline (see *Per-function watchdog* under
+`decompile-all`), and separately for the flow follow of its `load function`
+step, and a function still running at N seconds in either fails with
+`per-function decompile budget exceeded (N s) in <pass>`, a note naming the
+flag, and exit 1 instead of spinning on.
 
 An option **name** is checked before anything is loaded, on every surface that takes
 `--option`, and an unrecognized one exits 2 rather than running as if it had not been
@@ -498,6 +511,10 @@ decimal unless it carries a `0x`, and `<addr> <size>` is accepted wherever
 `<addr>+<size>` is. A C type may be anything the console's `parse line` accepts,
 including a `typedef` you asserted earlier in the same run.
 
+A `data` declaration replaces inferred strings that overlap its byte range,
+including one that runs past either end. Interior named data and previous
+explicit declarations retain their mappings.
+
 **`name`/`type` reach the register locals, not just the stack ones.** A local
 kuna prints with a storage comment — `unsigned long v6; // rax` — has no symbol
 behind it; naming one used to answer `No symbol named: v6` no matter how it was
@@ -523,7 +540,7 @@ function `score`), is `applied`, with a detail saying what it was printed as,
 and later directives reach it by that name (`name score_1 total`). A `type`
 that gives a stack local a scalar of another width is `rejected` before it
 applies (`Storage is 32 bytes, the stated type is 8`); a structure, union or
-array may grow or narrow it, within the stack.
+array may grow or narrow it, within the stack. Two independently retyped whole-frame locals may not cover the same stack bytes: that would emit separate C objects and lose their alias. Declare one aggregate or union covering the shared storage instead. A whole scalar local keeps its explicitly stated type even when a merged storage instance retains a weaker recovered type. If coalescing drops the direct Symbol binding, a matching type-locked member must still confirm the carried declaration type.
 
 ```bash
 kuna decompile ./graphy sub_1005350 --json --assert 'type v6 unsigned long *'
@@ -999,9 +1016,14 @@ preset it selects; an explicit `--mode reliable` keeps the catalog's
 explicit `--option` wins over the resolved preset.
 Address-selected single-function decompilation suppresses a preset-provided
 `fast_funcdisc` whole-image walk because the requested entry is already known.
-Name selection keeps it enabled so generated `sub_<addr>` names can resolve;
-explicitly spelling `--option fast_funcdisc on` opts an address run back into
-that analysis.
+Name selection suppresses it too on the first attempt, because a name the
+loader or the remaining discovery already carries needs no whole-image walk to
+resolve; that attempt then renders what `--addr` on the same entry renders. A
+name that misses retries with the preset's walk restored, so a miss reports
+what it reported before, and a placeholder spelling (`sub_<hex>`, `FUN_<hex>`,
+`func_0x<hex>`) keeps the walk from the start, since its entry may exist only
+because the walk found it. Explicitly spelling `--option fast_funcdisc on|off`
+always wins. Only the text surface defers it; `--json` keeps the preset.
 
 `--target <SLEIGH-language-id>` selects the decoder while a recognized object
 container continues to own its section mappings and image base. `--target default`
@@ -1094,6 +1116,43 @@ slice and is ignored, as on any thin image. Project exports retain the TE entry
 (reported through the inventory, at its even address) and the named section
 table.
 
+### MS-DOS MZ executables
+
+A DOS `.EXE` (an `MZ` header that is not the stub of a PE, NE, LE or LX image)
+loads without `--raw-image`. kuna places the load module at segment 0x1000
+(linear 0x10000), applies the relocation table, and seeds discovery from the
+header's `CS:IP`, decoding as `x86:LE:16:Real Mode:default` unless `--target`
+names another language:
+
+```bash
+kuna functions GAME.EXE --json            # the entry, (0x1000+CS)*16+IP, then discovery
+kuna decompile GAME.EXE 0x2b580 --addr
+kuna decompile-project GAME.EXE -o out/
+```
+
+Addresses are linear real-mode addresses, `segment * 16 + offset` with the load
+segment added. The decoder is told the entry's code segment and the segment of
+every relocated far call or jump target that lies inside that segment (below
+the next segment the image names), so a near branch wraps inside its segment as
+the CPU's does. Only the load module is mapped: the header, any
+overlay past the image size, and the uninitialized memory the header asks for
+are not. The call sweep that widens discovery past the entry reads the module's
+relocations (`mzsweep`, on by default): a far call counts only through a
+relocated segment word, and a call decoded among zero fill, or to a target that
+does not open with code, is data in a far data segment rather than a function;
+`--option mzsweep off` sweeps the whole module as a raw image does. A file packed with PKLITE or LZEXE loads too, but its code is the
+decompressor stub and a packed body, so kuna says so on stderr; unpack it first
+(`kuna unpack` for PKLITE, for example `deark -m lzexe` for LZEXE).
+A program linked with Microsoft's or Borland's 8087 emulator carries its float
+instructions as `INT 34h`-`3Dh`; when the load module holds emulator code,
+kuna decodes them as the x87 instructions they stand for (`--option fpuemu
+off` keeps the interrupts, `on` forces the decode, for example on a
+`--raw-image` `.COM` program).
+`decompile`, `decompile-all`, `functions`, `disassemble`/`read`,
+`decompile-project` and the console support MZ input; `strings`, `xrefs`,
+`decompile-graph` and the graph-backed `--summary`/`--reachable-from` need an
+object-file view and refuse it with a capability error, as for a TE.
+
 ### Headerless raw images
 
 `--raw-image` loads a file that has no object header. It is separate from
@@ -1121,6 +1180,15 @@ half-open range is rejected. Duplicate entries collapse. ARM32 raw input require
 even byte address before validation. Other addresses retain every input bit, so
 an odd ARM data or property address still selects the odd byte.
 
+An x86 real-mode image (`x86:LE:16:Real Mode`) also needs its code segment, the
+CS that a linear address is CS*16 + IP in. A file that ends inside the first
+64 KiB runs with CS 0 (a `.COM` program at `--base 0x100`, a boot sector at
+`0x7c00`); any other file of at most 64 KiB is one segment that starts at its
+base paragraph (`--base 0xf0000` is `F000:0000`). A larger file states no
+segment: its near branches past the first 64 KiB decode as the linear sum of
+the next address and the displacement, until a far call or jump names the
+segment of its target.
+
 Raw images carry no symbols, so there is no object-backed discovery tier to
 run; `--option rawdiscover off` leaves the inventory at the explicit seeds.
 On (the default) `rawdiscover` sweeps the executable bytes for direct call
@@ -1145,7 +1213,9 @@ to `decompile` (text and JSON), `decompile-all`, `functions`, and
 reports the required raw-image command shape, including when its first byte is
 `<`; only a parsed document containing `<binaryimage>` is treated as XML. Quoted
 console filenames preserve paths containing whitespace; the interactive spelling
-is `load raw <target> <base> <entry[,entry...]> <filename>`.
+is `load raw <target> <base> <entry[,entry...]> <filename>`, where the target may
+be quoted too, as the DOS target needs: `load raw "x86:LE:16:Real Mode:default"
+0x0 0x70 dazzle.exe`.
 
 **Failure contract (DIV-45).** A function whose decompile pipeline aborts is
 *loud*:
@@ -1160,6 +1230,11 @@ is `load raw <target> <base> <entry[,entry...]> <filename>`.
   the generic `/* WARNING: structured blocks unavailable (structuring
   declined) */` means the pipeline *ran* and produced no structured blocks —
   a different failure.
+- **a render past the budget prints nothing**: when printing runs past what
+  the drive left of `--max-fn-seconds`, the console's `print C` refuses, stdout
+  is empty, and stderr carries `error: decompilation failed for <fn> in
+  <binary>: per-function decompile budget exceeded (<N> s) in rendering C` and
+  the `--max-fn-seconds` note.
 
 **Load and analysis failures (DIV-90).** `kuna decompile` runs the engine in a
 subprocess, so it recovers *why* a run failed from the console transcript — and
@@ -1529,7 +1604,7 @@ without emitting a function list at all, let alone pseudocode.
   | `pyinstaller` | the `MEI\x0c\x0b\x0a\x0b\x0e` CArchive cookie; `version` is its Python version | `PyInstaller bundle (Python 3.12): extract with pyinstxtractor-ng` |
   | `nuitka` | `NUITKA_ONEFILE_PARENT` / `__nuitka_binary_dir` | `Nuitka-compiled Python: …; extract a onefile payload with nuitka-extractor` |
   | `autoit` | `AU3!EA06`/`AU3!EA05` in a PE | `AutoIt compiled script: extract the script with autoit-ripper` |
-  | `upx` / `neolite` | `UPX0`/`UPX1` sections, `UPX!` in the first 4 KiB or a UPX PackHeader; the NEOLite stub | `UPX packed: run 'kuna unpack'` |
+  | `upx` / `neolite` / `pklite` | `UPX0`/`UPX1` sections, `UPX!` in the first 4 KiB or a UPX PackHeader; the NEOLite stub; a PKLITE stub at the DOS entry point | `UPX packed: run 'kuna unpack'` |
   | `twinbasic` / `vb6` | `twinBASIC` / an `MSVBVM60.DLL` import name in a PE | the runtime model and what to use for P-Code |
   | `go` / `rust` | the toolchain verdict the loader already makes | informational (`actionable: false`) |
 
@@ -1759,15 +1834,27 @@ Behaviors specific to `decompile-all`:
   preset defaults to 10 seconds per function. On native, selected-function runs
   and the other presets retain 120 seconds; an explicit value always wins. WASM
   arms only the fast whole-binary 10-second policy and leaves its other commands
-  unbudgeted. A function whose decompile drive exceeds the budget is cut off
-  cooperatively (deadline probes at the action/rule-pool/heritage loop
-  boundaries, including each range heritage guards, and each region-structuring
-  round) and recorded as that function's `error`
-  (`"per-function decompile budget exceeded (N s)"`), the batch continuing. This is not a hard process timer: it does not bound
-  discovery, unprobed decoder work, C/variable rendering, artifact
+  unbudgeted. `kuna decompile` takes the same flag (default 120). A function
+  whose decompile drive exceeds the budget is cut off cooperatively (deadline
+  probes at the action/rule-pool/heritage loop boundaries, including each range
+  heritage guards, each region-structuring round, and before, between and after
+  the models of each flow-time jump-table recovery) and recorded as that
+  function's `error`
+  (`"per-function decompile budget exceeded (N s) in <pass>"`), the batch
+  continuing. `<pass>` is the first probe that saw the deadline pass, the
+  innermost loop that was running: an action (a rule pool adds its busiest rule
+  this function), `heritage`, `region structuring`, or a jump-table step, and
+  anything inside a flow-time table recovery adds `during jump-table recovery at
+  <indirect-jump address>`, e.g. `in action oppool1 (busiest rule earlyremoval)`
+  or `in jump-table recovery at 0x1820e009b`. Printing the function and
+  extracting its variables get what the drive left of the budget; a render
+  that runs past it fails the same way, `in rendering C` or `in extracting
+  variables`. This is not a hard process timer: it does not bound
+  discovery, unprobed decoder work, artifact
   construction, total export time, or memory. Driver policy, not a stage-model
-  settable — zero output change for a function whose drive completes before
-  expiry; the console / `decomp_dbg` parity path never arms it.
+  settable — zero output change for a function whose drive and render complete
+  before expiry; the console / `decomp_dbg` parity path arms it only when given
+  `decomp_dbg --max-fn-seconds N`, which `kuna decompile` passes.
 
 - **Per-function memory limit** — `--max-fn-memory MiB` (`0` disables) on
   `decompile-all`, `decompile-project`, `decompile-graph` and `kuna decompile`.
@@ -1843,7 +1930,8 @@ Behaviors specific to `decompile-all`:
     concrete `--mode`, every resolved `--option` and the watchdog budget are
     settled once by the parent and passed to every worker.
     `decompile-project --stream` is the one surface where the schedule *is*
-    observable, and only in the order of the `.c`: a streamed export writes each
+    observable, and only in the order of the `.c` (`--progress` reports on a
+    non-stream export instead). A streamed export writes each
     function as it finishes, so under `--jobs N` the interleaving is worker
     completion order and is not reproducible run to run. The set of functions,
     the prototypes and the disassembly are what the same selection produces
@@ -1941,7 +2029,11 @@ Behaviors specific to `decompile-all`:
   - **A worker that dies costs one function, not its chunk.** A worker
     decompiles its chunk in order and writes each result as it finishes, so when
     it dies — a panic, an OOM kill, a signal, the stall watchdog — the pool knows
-    which function it was on and which never started. The thread that gave it
+    which function it was on and which never started. The one ordered
+    structsynth worker holds its results until its sweep has run. It writes a
+    marker as it starts each function instead, so the stall watchdog times each
+    of its functions and not the whole chunk, and a stall there is charged to the
+    function that stalled. The thread that gave it
     the chunk re-runs every function the worker did not deliver, one function per
     chunk: the one that was running first, on a fresh worker, so its `error`
     record is the failure it repeats on its own, then the rest. Without this, one
@@ -2033,8 +2125,9 @@ apply to `kuna functions` — which never spawns a pool — exactly as they do t
 
   The gate group, decided before any thread is spawned, so nothing is wasted:
   `language commits context` (the loaded `.sla` has a `globalset`, so a decode at one address
-  changes how another decodes — ARM, MIPS, PowerPC, PA-RISC, PIC and friends,
-  while x86, x86-64, AARCH64, RISC-V, SPARC, SuperH and Z80 pass), `language has
+  changes how another decodes — ARM, MIPS, PowerPC, PA-RISC, PIC, 16-bit x86 and
+  friends, while 32-bit x86, x86-64, AARCH64, RISC-V, SPARC, SuperH and Z80 pass),
+  `language has
   delay slots`, `no rebuildable decode engine`, `loader cannot share its bytes`,
   `per-address decode context`, `executable range not fully mapped`, `executable
   image too small` (under 8 MiB of executable bytes the engine builds cost more
@@ -2769,7 +2862,7 @@ A binary with no recognized constant is exit `0` with `count: 0`. An unreadable
 or unparseable binary, or an unknown `--section`, is exit `1` with the reason on
 stderr; a malformed command line is exit `2` with the usage block.
 
-## `kuna unpack` — statically unpack a UPX- or NEOLite-packed executable
+## `kuna unpack` — statically unpack a UPX-, NEOLite- or PKLITE-packed executable
 
 ```bash
 kuna unpack ./packed                                   # writes ./packed.unpacked
@@ -2784,10 +2877,12 @@ gives you the decompressor. `kuna unpack` reconstructs the original image so the
 of the CLI has a program to work on — on the witness that filed this gap, `kuna
 functions` goes from `count: 0` to 70, `main` included.
 
-Two packers are recognized, and which one is decided before anything is decoded, so
-the answer on a file that is neither is unchanged. A **NEOLite** image announces
-itself with a `.NEOpack` section that owns the entry point; everything else goes to
-the UPX arm, whose `no UPX PackHeader found` is still what an unpacked file gets.
+Three packers are recognized, and which one is decided before anything is decoded,
+so the answer on a file that is none of them is unchanged. A **NEOLite** image
+announces itself with a `.NEOpack` section that owns the entry point; a **PKLITE**
+DOS program with its decompressor stub at the DOS entry point (a PE, NE, LE or LX
+program whose DOS stub is one is not); everything else goes to the UPX arm, whose
+`no UPX PackHeader found` is still what an unpacked file gets.
 
 It runs **in-process**, with no external tooling: `upx -d` cannot be assumed present
 wherever a release `kuna` runs, and handing a hostile binary to a packer to look at it
@@ -2803,6 +2898,54 @@ filter,filter_hex,pack_header_offset,pack_header_offset_hex,packed_size,
 compressed_size,unpacked_size,count,blocks:[{offset,offset_hex,u_len,c_len,method,
 method_name,filter,filter_hex,stored}]}`, where `count` is the number of compressed
 blocks consumed.
+
+### PKLITE
+
+```bash
+kuna unpack ./DAZZLE.EXE -o dazzle.exe      # "packer": "pklite" with --json
+```
+
+PKLITE (PKWARE, 1990–96) compresses a DOS EXE or COM behind a decompressor stub.
+The rebuilt EXE has the original MZ header, relocation table, load module, `CS:IP`,
+`SS:SP` and allocation fields, plus any overlay; a COM comes back whole.
+
+```text
+unpacked DAZZLE.EXE -> dazzle.exe
+  packer:      PKLITE 1.00 (header says 1.00/l)
+  compression: large
+  compressed:  73824 bytes at 0x300 (packed file 74730 bytes)
+  load module: 189160 bytes, 58 relocations
+  header:      original (PKLITE's copy at 0x50)
+  entry:       1b58:0000, stack 2e68:0080
+  alloc:       min 0x0042, max 0xffff paragraphs
+  overlay:     7 bytes
+  unpacked:    189679 bytes
+```
+
+Where the compressed data starts and how it was compressed are not in any header
+field you can trust (the version word is often wrong), so they are read out of the
+stub's own code. Covered: the 1990 betas, 1.00–1.15, 1.50–2.01 and the v1.20
+in-house builds, small and large compression, extra compression (`-e`), scrambled
+stubs, the Megalite and UN2PACK variants, and the PKLAXFIX startup patch. On 64
+real PKLITE files from 1990s shareware archives, and on the file in issue #1288,
+the output is byte-identical to deark's. Without `-e`, PKLITE keeps a copy of the
+original header, and it is used when it agrees with the footer's registers and the
+relocation count. Otherwise (`"header": "reconstructed"`) the header is rebuilt
+from the footer: `MAXALLOC` is the packed file's, and `MINALLOC` is estimated from
+the stub's free-memory check. Results that do not stop the unpack come back as
+`warnings`, for example a program that checks the `PK` signature PKLITE writes into
+its PSP, or a kept header that disagrees with the footer. A stub that matches no
+known variant exits `1` naming the part (`unsupported PKLITE file: the copier
+matches no known PKLITE copier`), and data that does not decode exits `1` with
+`corrupt PKLITE file: …`. Neither writes a file.
+
+`--json` emits `{binary,output,packer,container,reported_version,detected_version,
+large,extra,v120,scrambled,compressed_offset,compressed_offset_hex,compressed_size,
+load_module_size,relocations,header,header_copy_offset,entry,stack,min_alloc,
+max_alloc,overlay_size,packed_size,unpacked_size,warnings}`. `container` is `exe` or
+`com`. `extra` is `none`, `xor` (standard `-e`) or `complement`. `header` is
+`original`, `reconstructed` or `none` (COM). `entry` and `stack` are `SEG:OFF` hex
+strings.
 
 ### NEOLite
 
@@ -2916,6 +3059,7 @@ kuna decompile-project ./a.out                         # writes ./a.out.kuna/
 kuna decompile-project ./a.out -o proj --functions main,parse
 kuna decompile-project ./a.out --jobs 12               # 12 processes, protoorder-off artifacts
 kuna decompile-project ./a.out --stream --jobs 12      # readable while it fills
+kuna decompile-project ./a.out --progress --jobs 12    # progress, artifacts at the end
 ```
 
 The project-export face of the same in-process core
@@ -2924,7 +3068,7 @@ The project-export face of the same in-process core
 web UI's Download-Binary-Source zip and `kuna_wasm project`). Identical
 load-once/decompile-many path and flags —
 `--functions`/`--addr`/`--max-fn-seconds`/`--max-fn-memory`/`--mode`/`--option`/
-`--isa`/`--slice`/`--target`/`--sleighpath`/`--jobs`/`--stream`; no `--json`. Omitted mode is the same
+`--isa`/`--slice`/`--target`/`--sleighpath`/`--jobs`/`--stream`/`--progress`; no `--json`. Omitted mode is the same
 size-based `auto` policy as the other file front-ends. In particular, a project input
 at least 2 MiB automatically suppresses the exhaustive Listing consumers, prologue
 scan, and AIF gap walk through the `fast` preset, while substituting rooted direct-call
@@ -2944,7 +3088,10 @@ remain comments/prototype tombstones and count in the final README. A mixed expo
 at least one body exits `0`; a non-empty selection that produces zero bodies exits `1`
 with the completed-file summary on stdout and a run-level diagnostic on stderr. The
 verdict is taken only after the `.c`, `.h`, `.asm`, README and, under `--stream`,
-`index.jsonl` have been finalized.
+`index.jsonl` have been finalized. `--assert` directives follow the same rules as on
+`decompile-all`: every rejection is printed on stderr, `--assert-strict` makes one exit
+`1`, and a directive the pipeline refused exits `1` on its own, again only after the
+artifacts are written.
 
 Writes a project folder — default `<binary-filename>.kuna/` next to the binary,
 `-o/--output DIR` overrides — of four artifacts designed so a human or LLM can study the
@@ -3247,6 +3394,72 @@ is the load, which is the same wait either way — and it finishes about 5% late
 static longest-first plan a non-stream `--jobs N` run uses is close to the best
 makespan available and entry-point-first order is not. At this size that is under a
 minute of tail for twenty minutes of head start.
+
+### `--progress` — progress reporting over an ordinary export
+
+```bash
+kuna decompile-project ./ssh -o ssh.kuna --progress --jobs 4
+```
+
+Two things are bundled in `--stream`: progress reporting (`.streaming` and the
+`index.jsonl` feed) and incremental artifacts (a `.c` readable while it fills). The
+second is what costs reproducibility — an append-only `.c` can only hold functions in
+the order they finish. `--progress` is the first without the second, for a caller that
+only needs to know how far the export has got, such as a pipeline that stores the
+folder content-addressed.
+
+| | progress feed | artifacts written | reproducible under `--jobs N` |
+|---|---|---|---|
+| neither flag | no | at the end | yes |
+| `--progress` | yes | at the end | yes |
+| `--stream` | yes | as the run goes, decompile order | no |
+
+`--stream` already reports progress, so with both flags the export is the streamed one.
+
+`--progress` runs the non-stream export unchanged — the same serial or pooled
+decompile, the static longest-first plan, the structure-naming replay, the positional
+merge — and reports on it while it runs. When it succeeds, `<name>.c`, `<name>.h`,
+`<name>.asm` and `README.md` are byte-identical to `kuna decompile-project` with the
+same arguments minus `--progress`, and `index.jsonl` is the address-ordered index of
+that `.c`, the same file whatever the job count. So the folder is as reproducible as
+the non-stream export: under `--jobs N` it does not depend on `N` and is the `--jobs 1
+--option protoorder off` answer (the `--jobs` bullets above give the exceptions, which
+apply here unchanged). Measured on `/usr/bin/ssh` (1,090 functions): `--progress` runs
+at `--jobs 4` and `--jobs 2` and a plain `--jobs 4` run leave identical folders apart
+from `index.jsonl`, and the CPU time of the two `--jobs 4` arms is within run-to-run
+noise (158–170 s user each).
+
+**What appears when.** The load is reported as under `--stream`: `README.md` and
+`.streaming` (phase `loading`) are written first and a previous export is untouched.
+Once the program is loaded and the target set is non-empty, the previous export's
+`<name>.c`, `<name>.h` and `<name>.asm` are removed, so a reader never takes them for this
+run's, and `index.jsonl` is truncated. `.streaming` moves to `decompiling` with
+`functions_total`, and from there:
+
+- `index.jsonl` is the **feed**: a line is appended as each function's first decompile
+  lands, in completion order, with `c_offset` and `c_len` `null` because there is no
+  `.c` to point into yet. Under `--jobs N` lines land a pool chunk at a time
+  (`--jobs-chunk K` bounds that); serially, one function at a time. The `error` field is
+  that first decompile's. A structure-naming or convergence pass that decides a function
+  again later is not fed.
+- `.streaming` counts the feed (`functions_done`, `functions_failed`,
+  `seconds_since_last_result`) on its own 500 ms clock, with `jobs` the workers the pool
+  actually started. `seeds` is `0` and `c_bytes` stays `0` until the `.c` exists; `asm`
+  is `pending` until the artifacts are built.
+- Once every function is in, `phase` is `finalizing` while the pool finishes naming
+  structures and the artifacts are built (`asm` then reads `sweeping`). The README stops
+  being rewritten at that point.
+- At the end the four artifacts are written, `index.jsonl` is **replaced** (one atomic
+  rename) by the final index, and `.streaming` is removed.
+
+So `index.jsonl` changes meaning once: while `.streaming` exists it is the feed; once
+`.streaming` is gone it is the final index, sorted by address, `seq` its line number,
+and every `c_offset`/`c_len` slicing the `.c` to exactly that function's block. A
+reader tailing the feed by byte offset should stop when `phase` reads `finalizing`.
+A failed append to the feed warns once on stderr and ends the feed; the run goes on
+and still writes the final index, which is the artifact. Failure reporting and the
+refusal to export into a folder a live run is writing are `--stream`'s. Unlike
+`--stream`, `--progress` accepts `--assert`, with the non-stream export's rules.
 
 ## `kuna decompile-graph` — the whole program as one JSON graph
 

@@ -42,10 +42,15 @@
 //!   registers, the callee's body does not read the register the next parameter
 //!   would arrive in (a variadic's register-save prologue does), the list does not
 //!   end on the last argument register, and it sits where the convention puts
-//!   those types;
+//!   those types -- or else every register the list names is one the callee's
+//!   body takes;
 //! * the callee's own body READS `R` before writing it on some path, for a value
 //!   that reaches something ([`crate::p4_calls::kuna_calleedeadarg`]'s
-//!   `proves_input`), so the parameter is not a recovery artifact of the callee;
+//!   `proves_input`), or hands it on to a declared parameter or a callee that
+//!   takes it; where that bounded walk cannot finish, the registers the callee's
+//!   first heritage saw it read ([`crate::kuna_entryreads::callee_takes`]). A
+//!   function calling itself asks its own body the same way. So the parameter is
+//!   not a recovery artifact of the callee;
 //!   a body that hands `R` unwritten to a direct call whose target takes it
 //!   on these same terms (`call f; ret`) reads it too, up to three calls deep
 //!   ([`crate::p4_calls::kuna_calleedeadarg::reads_through_calls`]);
@@ -187,14 +192,17 @@ pub struct PassThroughClaim {
 /// parameter, by its own recovered prototype and its own body.
 ///
 /// The stated prototype must have a parameter starting at `addr`, and the
-/// callee's body must read it; the answer is the narrowest of the range, that
-/// parameter and what the body consumes, so a register the callee reads as
-/// `edi` is passed as the `int` it is. `None` for a locked or variadic call spec
-/// (its argument list is not recovered from trials), an indirect call, a call
-/// the caller set up as variadic, a callee `protoorder` stated nothing for, a
-/// stated list that is not an arity claim, a register the callee's body is not
-/// seen reading, a register the calling function's own prototype could not
-/// take as a parameter, and any call of a variadic function.
+/// callee's body must take it ([`crate::kuna_entryreads::callee_takes`]); the
+/// answer is the narrowest of the range, that parameter and what the body
+/// consumes, so a register the callee reads as `edi` is passed as the `int` it
+/// is. A call of the function to itself asks its own body instead
+/// ([`self_takes`]). `None` for a locked or variadic call spec (its argument
+/// list is not recovered from trials), an indirect call, a call the caller set
+/// up as variadic, a callee `protoorder` stated nothing for, a stated list that
+/// is not an arity claim and names a register the body does not take, a
+/// register the callee's body is not seen taking, a register the calling
+/// function's own prototype could not take as a parameter, and any call of a
+/// variadic function.
 pub fn stated_width(data: &Funcdata, fc: &FuncCallSpecs, addr: &Address, size: int4) -> Option<int4> {
     if !data.get_arch().pass_through || size <= 0 || data.kuna_passthrough_variadic() {
         return None;
@@ -208,8 +216,19 @@ pub fn stated_width(data: &Funcdata, fc: &FuncCallSpecs, addr: &Address, size: i
         return None;
     }
     let entry = fc.get_entry_address();
+    if entry == data.get_address() {
+        if !general_purpose(data.get_func_proto(), addr, size) || !self_takes(data, addr, size) {
+            return None;
+        }
+        let seen = data.kuna_entry_reads().and_then(|r| r.width(addr)).unwrap_or(size).min(size);
+        let width = match data.kuna_callee_entry_dead(entry).filter(|f| f.is_complete()) {
+            Some(f) => f.live_input_width(addr, size).map_or(seen, |w| w.min(seen)),
+            None => seen,
+        };
+        return data.get_func_proto().possible_input_param(addr, width).then_some(width);
+    }
     let stated = data.kuna_protoorder_types(entry)?;
-    if !stated.arity_sound || stated.vararg_tail.iter().any(|a| a == addr) {
+    if stated.vararg_tail.iter().any(|a| a == addr) {
         return None;
     }
     let (stated_size, stated_type) = stated
@@ -220,13 +239,84 @@ pub fn stated_width(data: &Funcdata, fc: &FuncCallSpecs, addr: &Address, size: i
     if crate::kuna_armfloatargs::partial_float(data, stated_size, stated_type, size) {
         return None;
     }
-    let facts = data.kuna_callee_entry_through(entry).or_else(|| data.kuna_callee_entry_dead(entry))?;
     let size = size.min(stated_size);
-    if !facts.proves_input(addr, size) {
+    let float = stated_type.get_metatype() == crate::dtype::type_metatype::TYPE_FLOAT;
+    if !general_purpose(fc.proto(), addr, size) && !float {
+        let facts = data.kuna_callee_entry_through(entry).or_else(|| data.kuna_callee_entry_dead(entry))?;
+        if !stated.arity_sound || !facts.proves_input(addr, size) {
+            return None;
+        }
+        let width = facts.live_input_width(addr, size).unwrap_or(size);
+        return data.get_func_proto().possible_input_param(addr, width).then_some(width);
+    }
+    let takes = |a: &Address, s: int4, strict: bool| crate::kuna_entryreads::callee_takes(data, entry, a, s, strict);
+    let read = if stated.arity_sound {
+        takes(addr, size, false)
+    } else {
+        takes(addr, size, true) && stated.inputs.iter().filter(|(a, _, _)| is_register(a)).all(|(a, s, _)| takes(a, *s, true))
+    };
+    if !read {
         return None;
     }
-    let width = facts.live_input_width(addr, size).unwrap_or(size);
+    let facts = data
+        .kuna_callee_entry_through(entry)
+        .or_else(|| data.kuna_callee_entry_dead(entry))
+        .filter(|f| f.is_complete());
+    let seen = stated.reads.iter().find(|(a, _)| a == addr).map_or(size, |(_, w)| (*w).min(size));
+    let width = match &facts {
+        Some(f) => f.live_input_width(addr, size).map_or(seen, |w| w.min(seen)),
+        None => seen,
+    };
     data.get_func_proto().possible_input_param(addr, width).then_some(width)
+}
+
+/// Is `[addr, addr+size)` in a general-purpose input register of `proto`'s
+/// model? The body's own reads answer only for those, and for a register the
+/// callee's statement types as a float: a callee that only moves its `float` in
+/// `xmm0` is recovered with an integer parameter, and a forward of that
+/// register gives its wrapper a parameter of the wrong kind.
+fn general_purpose(proto: &crate::fspec::FuncProto, addr: &Address, size: int4) -> bool {
+    proto.has_model()
+        && proto.model().input().get_entry().iter().any(|e| {
+            e.get_type() == crate::dtype::type_class::TYPECLASS_GENERAL && e.justified_contain(addr, size) >= 0
+        })
+}
+
+/// Does the function's own body take `[addr, addr+size)`: its complete entry
+/// decode reads it, or it hands it to a declared parameter; without a complete
+/// decode, its first heritage saw it read ([`crate::kuna_entryreads`]).
+fn self_takes(data: &Funcdata, addr: &Address, size: int4) -> bool {
+    let Some(own) = data.kuna_entry_reads() else { return false };
+    match data.kuna_callee_entry_dead(data.get_address()).filter(|f| f.is_complete()) {
+        Some(f) => f.reads_low_byte(addr, size, false, true) || crate::kuna_entryreads::overlaps(&own.declared, addr, size),
+        None => own.takes(addr, size),
+    }
+}
+
+/// The registers the callee at `entry` takes, in order: its `protoorder`
+/// statement, or, for a call of the function to itself, the argument registers
+/// of its model up to the first its own body does not read.
+fn stated_registers(data: &Funcdata, entry: &Address) -> Option<Vec<Address>> {
+    if entry == data.get_address() {
+        data.kuna_entry_reads()?;
+        let proto = data.get_func_proto();
+        if !proto.has_model() {
+            return None;
+        }
+        let mut out = Vec::new();
+        for e in proto.model().input().get_entry() {
+            if e.get_type() != crate::dtype::type_class::TYPECLASS_GENERAL || e.get_space().get_type() != spacetype::IPTR_PROCESSOR {
+                continue;
+            }
+            let a = Address::new(std::rc::Rc::clone(e.get_space()), e.get_base());
+            if !self_takes(data, &a, e.get_size()) {
+                break;
+            }
+            out.push(a);
+        }
+        return Some(out);
+    }
+    Some(data.kuna_protoorder_types(entry)?.inputs.iter().map(|(a, _, _)| a.clone()).collect())
 }
 
 /// Does `[addr, addr+size)` hold nothing a call takes but something it gives
@@ -454,6 +544,22 @@ fn first_calls(data: &Funcdata) -> Vec<OpId> {
 /// call no other call can precede ([`first_calls`]), where the read is the
 /// function's own input. Inert with the option off.
 pub fn claim_untouched_registers(data: &mut Funcdata) {
+    claim_untouched_registers_mode(data, false)
+}
+
+/// (kuna callee-contract) [`claim_untouched_registers`] re-run after a callee's
+/// statement arrived mid-pipeline (the P4 trial-storage bootstrap).
+///
+/// The first run at `ActionFuncLink` could not know the callee, and by now the
+/// function's own input Varnode at the stated storage is already read, so
+/// `newVarnode` would mint a duplicate without the input flag.  Prefer the
+/// actual input Varnode here: `capture` recognises that as the forwarded input
+/// it is, exactly as the pre-link run would have.
+pub fn claim_untouched_registers_late(data: &mut Funcdata) {
+    claim_untouched_registers_mode(data, true)
+}
+
+fn claim_untouched_registers_mode(data: &mut Funcdata, late: bool) {
     if !data.get_arch().pass_through {
         return;
     }
@@ -472,7 +578,7 @@ pub fn claim_untouched_registers(data: &mut Funcdata) {
         .collect();
     data.kuna_set_passthrough_vararg_calls(vararg);
     let first = first_calls(data);
-    let mut claims: Vec<PassThroughClaim> = Vec::new();
+    let mut claims = if late { data.kuna_passthrough_claims().to_vec() } else { Vec::new() };
     for idx in 0..data.num_calls() {
         if !data.get_call_specs(idx).is_input_active() || !first.contains(&data.get_call_specs(idx).get_op()) {
             continue;
@@ -496,7 +602,21 @@ pub fn claim_untouched_registers(data: &mut Funcdata) {
                 continue;
             }
             let nin = data.obank().get(op).map(|o| o.num_input()).unwrap_or(0);
-            let vn = data.new_varnode(size, &addr, None);
+            let vn = if late {
+                match own_input_varnode(data, &addr, size) {
+                    Some(vn) => vn,
+                    None => {
+                        // The entry-time input at this storage is gone (dead code
+                        // removed the only read before the call site knew the
+                        // callee).  Recreate it as an input, which is the state
+                        // the pre-link claim saw.
+                        let vn = data.new_varnode(size, &addr, None);
+                        data.set_input_varnode(vn).unwrap_or(vn)
+                    }
+                }
+            } else {
+                data.new_varnode(size, &addr, None)
+            };
             if data.op_insert_input(op, vn, nin).is_err() {
                 continue;
             }
@@ -523,6 +643,18 @@ pub fn claim_untouched_registers(data: &mut Funcdata) {
         claim_tail_return(data, &mut claims, ret);
     }
     data.kuna_set_passthrough_claims(claims);
+}
+
+/// The function's own incoming Varnode at `addr:size`, if it is still unread
+/// memory of the entry (not recomputed).
+fn own_input_varnode(data: &Funcdata, addr: &Address, size: int4) -> Option<VarnodeId> {
+    data.vbank()
+        .iter_def_flag(crate::varnode::varnode_flags::input)
+        .find(|&v| {
+            data.vbank()
+                .get(v)
+                .is_some_and(|n| n.get_addr() == addr && n.get_size() == size && !n.is_written())
+        })
 }
 
 /// Can the claim of the register at `pos` in the callee's stated list be made
@@ -1095,8 +1227,7 @@ fn extend_one(data: &mut Funcdata, p: &PendingPassThrough) -> bool {
     if nin != current.len() as int4 + 1 || current.iter().any(|(a, _)| !is_register(a)) {
         return false;
     }
-    let Some(stated) = data.kuna_protoorder_types(&entry) else { return false };
-    let stated: Vec<Address> = stated.inputs.iter().map(|(a, _, _)| a.clone()).collect();
+    let Some(stated) = stated_registers(data, &entry) else { return false };
     let have: Vec<Address> = current.iter().map(|(a, _)| a.clone()).collect();
     let offered: Vec<Address> = p.candidates.iter().map(|(a, _, _)| a.clone()).collect();
     let added: Vec<(Address, int4, VarnodeId)> =

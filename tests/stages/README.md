@@ -1,5 +1,10 @@
 # Stage-model issue testcases
 
+`kuna-callwide.xml` loads the committed sealed MIPS32-BE ELF and checks the
+four-byte OFF result against the proved eight-byte result and high-piece callers.
+Its CLI companion executes the original bytes and untouched emitted C/header
+under MIPS QEMU at O0/O2, including selected exports, workers and streaming.
+
 `kuna-stack-byte-copy.xml` checks pushed scratch bytes, partial reads and a
 saved snapshot with `stackstoreguard` off and on. Its CLI companion compiles
 and executes the exact C at O2 in default, stackviews and stackalias modes, and checks
@@ -75,7 +80,9 @@ writeup, not here.
 
 | `gh1243-8051-addc.xml` | [GH-1243](https://github.com/NationalSecurityAgency/ghidra/issues/1243) | S2 pcode-lift (8051 spec-fix, no option) | SLEIGH ADDC carry-in computed in a 2-byte temp (`do_addc`) so the carry-out survives |
 
-| `gh7418-x86-call-rel16-mask.xml` | [GH-7418](https://github.com/NationalSecurityAgency/ghidra/issues/7418) | S1 decode / S2 p-code lift (x86 spec-fix, no option) | SLEIGH `rel16` masks tempEIP to low 16 bits (32/16-bit) |
+| `gh7418-x86-call-rel16-mask.xml` | [GH-7418](https://github.com/NationalSecurityAgency/ghidra/issues/7418) | S1 decode / S2 p-code lift (x86 spec-fix, no option) | SLEIGH `rel16` masks tempEIP to low 16 bits (32-bit code, 0x66 prefix; 16-bit code: kuna-x86-16-real-rel16.xml) |
+| `kuna-x86-16-real-rel16.xml` | kuna [#1288](https://github.com/Noelo-Lab/kuna/issues/1288) (a DOS program loaded at segment 0x1000: the GH-7418 mask sent every real-mode `CALL rel16` above linear 0x10000 into the first 64 KiB, so discovery found 12 of 330 functions) | S1 decode / S2 p-code lift (x86-16 spec, no option) | x86-16.sla keeps the code segment `realCS` in the decode context: a near branch wraps IP inside its segment and passes `realCS` on, a far CALL states its target's, every CALL pushes IP in its own segment, and code outside the segment takes the linear sum |
+| `kuna-x86-16-protected-rel16.xml` | kuna [#1288](https://github.com/Noelo-Lab/kuna/issues/1288) (companion: a 16-bit protected-mode branch lost its selector to the same mask) | S1 decode / S2 p-code lift (x86-16 spec, no option) | SLEIGH `rel16` keeps the selector and wraps the offset in 16-bit protected mode |
 
 | `gh7139-x86-16-disp16-signed.xml` | [GH-7139](https://github.com/NationalSecurityAgency/ghidra/issues/7139) | S1 decode / operand rendering (x86 spec-fix, no option) | SLEIGH 16-bit disp16 (modrm mod=2) uses signed `simm16` |
 
@@ -118,6 +125,7 @@ writeup, not here.
 | `kuna-aifnoppad.xml` | [Kuna #299](https://github.com/Noelo-Lab/kuna/issues/299) | P1 code/data partition (no AIF gap entry starts on nop padding: padding in front of a known function is not probed, and an accept behind padding moves to the code after it) | `option aifnoppad on\|off` |
 | `kuna-condcall.xml` | [Kuna #299](https://github.com/Noelo-Lab/kuna/issues/299) | P1 code/data partition (a predicated call's skip to the next instruction is its fall-through, not a second call target, so the next instruction is not a function and the callee is not no-return) | default correctness fix (no option) |
 | `kuna-thumbswitch.xml` | [Kuna #299](https://github.com/Noelo-Lab/kuna/issues/299) | P1 code/data partition (the Listing walk reads a range-checked Thumb `tbb`/`tbh` offset table and decodes the case bodies as the dispatcher's own code, so no gap entry lands on a case) | `option thumbswitch on\|off` |
+| `kuna-x86listingswitch.xml` | [Kuna #299](https://github.com/Noelo-Lab/kuna/issues/299) | P1 code/data partition (a locally proved i386 switch decodes exactly four cases before the gap walk; the independent function between cases remains and a case's real callee is recovered) | `option x86listingswitch off\|on` |
 | `kuna-aifpoolslide.xml` | [Kuna #299](https://github.com/Noelo-Lab/kuna/issues/299) | P1 code/data partition (an AIF gap candidate on a word a PC-relative load reads is pool data: its accept moves to the code after the pool) | `option aifpoolslide on\|off` |
 | `kuna-pushimmediateret.xml` | RE-friction duplicate needs `entry-point-push-return` + `push-immediate-ret-transfer` | S2 flow classification (a proven one-store `push immediate; ret` becomes a terminal branch; no target function is synthesized) | `option pushimmediateret on\|off` |
 | `kuna-subcommuteshift.xml` | RE-friction need `cancelling-byte-arithmetic-splits` | S3 simplification quiescence (exact modulo-256 multiply/shift cancellation) | `option cancelbytearithmetic on\|off` |
@@ -131,6 +139,7 @@ writeup, not here.
 | `kuna-loweredswitchexact.xml` | GH-468 finding 4 (install soundness) | P2 switch model (every case value keeps its label; a switch that differs from its compare tree is declined) | `option loweredswitchexact on\|off` |
 | `kuna-loweredswitchheads.xml` | GH-468 finding 4 | P2 switch model (a cascade behind a later head on the switch variable is re-rolled) | `option loweredswitchheads on\|off` |
 | `kuna-switchguardreload.xml` | [Kuna #1028](https://github.com/Noelo-Lab/kuna/issues/1028) | P2 switch model (a guard on a byte in memory bounds the index read by a second load of the same address; the adjacent table is not read) | default correctness fix (no option) |
+| `kuna-lanedivide-terminator.xml` | [Kuna #1157](https://github.com/Noelo-Lab/kuna/issues/1157) | P3 laned-register split (a SUBPIECE narrower than a lane, read from a piece holding only upper lanes, terminates in the lane its byte offset reaches from the start of the whole register; upstream GP-7434) | default correctness fix (no option) |
 | `kuna-switchunrolledsense.xml` | [Kuna #1028](https://github.com/Noelo-Lab/kuna/issues/1028) | P2 switch model (copies of the bound check on each predecessor of the dispatch, with opposite branch senses, bound the merged index) | `option switchmultipred on\|off` |
 
 | `gh8017-stackprobeloop.xml` | [GH-8017](https://github.com/NationalSecurityAgency/ghidra/issues/8017) | S2 stack-pointer normalization (stack-probe loop) | `option stackprobeloop on\|off` |
@@ -228,6 +237,7 @@ readability defaults measured on the angr `fmt` corpus binary, DIV-34+ in
 | `kuna-calleearity.xml` | one callee, two arities: the call site whose argument is also the operand of an overflow check loses it to `onlyOpUse`'s branch rejection, while its sibling keeps it (DIV-102) | `option calleearity on\|off` (new kuna settable, P4 `trial-finalization`) |
 | `kuna-rodatastring.xml` | a string block-copied out of read-only memory into the frame renders as invalid C: `v1[0] = (char[8])msg._0_8_;` (there is no array cast) and the literal never appears (DIV-113) | `option rodatastring on\|off` (new kuna settable, P5 `constsequence`) |
 | `kuna-calleenamedlocals.xml` | kuna [#762](https://github.com/Noelo-Lab/kuna/issues/762): two distinct pointer locals passed to one `consume(Node *object)` both took the name `object`, `dedupvardecls` kept one declaration, and the store after the inner loop cleared the last member's flag instead of the representative's; the same defect through a struct-by-value argument (its fields stored into another struct, or into a same-named global), a user rename (`&v2` printed as the other slot's address), and a slot named like a global (its narrow views read the global), plus a global array a suffixed local must not capture | P6 local naming (a callee-parameter name is made unique against names already bound to other highs; struct roots share only among themselves) + P9 declaration emission (the identical-line collapse only merges lines of one Symbol, and every high printed through another declaration follows its final name); correctness fix, no option. Passes 2 and 3 pin `option dedupvardecls off` and `option namestyle ghidra` |
+| `kuna-stacksolver-unsolved.xml` | kuna [#1288](https://github.com/Noelo-Lab/kuna/issues/1288) (a PKLITE-packed DOS executable decompiled as a raw real-mode image grew memory without bound: `DEC SP` in its packed body solved a stack variable to 65535, the `StackSolver` sentinel for "unsolved", and two such variables re-pushed each other forever; where the solve did finish, the genuine 65535 still read as unsolved and the function kept a raw stack-pointer local) | P6 variables, `ActionStackPtrFlow` extra-pop solve | none (strict fix): the solve terminates and the loop around the call is emitted; `h` reads its return address at entry + 2 with no raw stack-pointer local |
 
 `kuna-storecopyeffects.xml` pins the AArch64 address-spill store across calls,
 repeated stores, a load between calls, and a truly dead-store control. The
@@ -301,7 +311,14 @@ with undefined-behavior checks and exercises every case and signed boundaries.
 
 - `kuna-sparc-double-sign.xml`, `kuna-sparc64-double-sign.xml`: binary64 negation from a high-word `fnegs`, without a numeric high-word cast.
 
+- `kuna-sparc-register-pair.xml`: a SPARC32 register pair loaded whole by `ldd` on one path and set as two 32-bit values on the other keeps a loop index and a counter as separate locals (`option pairrefine`; the second pass runs it `off`, which fuses them into one 64-bit local updated with `CONCAT44`).
+
 - `kuna-integer-float-rounding.xml`, `kuna-integer-float-rounding64.xml`, `kuna-integer-float-rounding-x87.xml`: an integer-to-float conversion keeps its rounding through a later float conversion or a narrower float trace (`option intfloatround`; the first passes run it `off`), while exact intermediates, x87 extended conversions and `fld1` still combine.
 
 `kuna-global-load-call-order.xml` keeps a post-call memory-loaded global write after the getter, including a later call, a loop marker and a no-final-call control. The CLI roundtrips check an impure getter, a computed-value reload control and overlapping x86-64 SIMD reads using GCC/Clang at O0/O2. Its first pass runs `option globalcallstore off`, which prints the write before the getter.
 - `kuna-register-pair-call-args.xml`: overwritten wide-return register components at an undeclared call, with single-half and unchanged-pair controls.
+
+`kuna-pointer-storage-literal.xml` publishes a pointer through a mapped byte frame
+and checks that its compound initializer converts the integer carrier back to a
+pointer. The CLI companion compiles fresh PE32/ELF64 examples with Clang and runs
+the Linux native/recompiled functions at O0/O2. Source: `src/pointer_storage_literal.c`.
