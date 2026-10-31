@@ -160,6 +160,12 @@ kuna_options! { self, p1;
         self.x64_syscall = mode;
         Ok(msg)
     },
+    "segmentize" => {
+        let (val, msg) = crate::kuna_segmentize::OptionSegmentize.apply(p1)?;
+        self.segmentize = val;
+        self.apply_segmentize();
+        Ok(msg)
+    },
     "syscallregs" => {
         let (mode, msg) = crate::kuna_syscallregs::OptionSyscallRegs.apply(p1)?;
         self.syscall_regs = mode;
@@ -225,8 +231,15 @@ kuna_options! { self, p1;
     "stackaddrargtrial" => on_off!(stack_addr_arg_trial, "Stack-address input trials"),
     "callretpair" => on_off!(call_ret_pair, "Two-register CALL output completion"),
     "multiregargs" => on_off!(multi_reg_args, "Complete ABI register argument partitions"),
+    "callwide" => {
+        let enabled = on_or_off(p1)?;
+        self.kuna_callwide.clear();
+        self.call_wide = enabled;
+        Ok(format!("Caller-proved register-pair returns turned {}", if enabled { "on" } else { "off" }))
+    },
     "bejoin" => {
         let (mode, msg) = crate::kuna_bejoin::BeJoinMode::parse(p1)?;
+        self.kuna_callwide.clear();
         self.be_join = mode;
         Ok(msg)
     },
@@ -235,10 +248,72 @@ kuna_options! { self, p1;
         self.rust_abi = mode.as_u8();
         Ok(msg)
     },
+    "fatstr" => {
+        let (mode, msg) = crate::kuna_fatstr::parse_fatstr_mode(p1).map_err(KunaError::parse)?;
+        self.fat_str = mode.as_u8();
+        Ok(msg)
+    },
+    "gobool" => {
+        let (mode, msg) = crate::kuna_gobool::parse_gobool_mode(p1).map_err(KunaError::parse)?;
+        self.go_bool = mode.as_u8();
+        Ok(msg)
+    },
+    "gomorestack" => {
+        let (mode, msg) = crate::kuna_gomorestack::parse_gomorestack_mode(p1).map_err(KunaError::parse)?;
+        self.go_morestack = mode.as_u8();
+        Ok(msg)
+    },
+    "goreg" => {
+        let val = on_or_off(p1)?;
+        crate::kuna_goreg::set_goreg_env(val);
+        self.go_reg = val;
+        Ok(format!("Goroutine register naming turned {}", if val { "on" } else { "off" }))
+    },
+    "goabi" => {
+        let on = crate::kuna_goabi::parse_goabi(p1).map_err(KunaError::parse)?;
+        crate::kuna_goabi::set_goabi_env(on);
+        self.analysis_goabi = on;
+        Ok(format!("Golang compiler-spec selection turned {}", if on { "auto" } else { "off" }))
+    },
+    "gowritebarrier" => {
+        let (mode, msg) = crate::kuna_gowritebarrier::parse_gowritebarrier_mode(p1).map_err(KunaError::parse)?;
+        self.go_write_barrier = mode.as_u8();
+        Ok(msg)
+    },
+    "sourcelang" => {
+        let forced = crate::kuna_sourcelang::parse_option_value(p1).map_err(KunaError::parse)?;
+        crate::kuna_sourcelang::set_sourcelang_env(forced);
+        self.source_lang_forced = forced;
+        Ok(match forced {
+            Some(lang) => format!("Source language forced to {}", lang.as_str()),
+            None => "Source language follows detection (auto)".to_string(),
+        })
+    },
     "condexeplace" => on_off!(condexe_block_placement, "Conditional-const COPY block placement"),
     "sparcstructret" => on_off!(sparc_struct_return, "SPARC struct-return tail recovery"),
     "arraystride" => on_off!(recover_array_stride, "Strided-induction array recovery"),
     "stackalias" => on_off!(stack_alias_deadstore, "Stack-pointer-alias dead-store hold"),
+    "globalcallranges" => on_off!(global_call_ranges, "Global call access ranges"),
+    "readonlycalls" => {
+        let field = p1.trim();
+        let (val, msg) = match field {
+            "off" => (None, "Unguarded read-only memory at calls turned off".to_string()),
+            "on" => (Some(1), "Read-only memory is unguarded at every call".to_string()),
+            _ => {
+                let n = field
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|_| !field.is_empty() && field.bytes().all(|b| b.is_ascii_digit()))
+                    .ok_or_else(|| KunaError::parse("Must specify off, on or a decimal guard count"))?;
+                (Some(n), format!("Read-only memory is unguarded at calls from {n} guards"))
+            }
+        };
+        self.readonly_calls = val;
+        Ok(msg)
+    },
+    "prunedssa" => on_off!(pruned_ssa, "Pruned SSA heritage markers"),
+    "loadguardreads" => on_off!(load_guard_reads, "LOAD guards read at renaming"),
+    "localstackviews" => on_off!(local_stack_views, "Bounded local stack views"),
     "stackviews" => {
         let (value, message) = crate::kuna_stackviews::OptionStackViews.apply(p1)?;
         self.stack_views = value;
@@ -382,8 +457,13 @@ kuna_options! { self, p1;
         Ok(format!("ARM floating argument recovery turned {p1}"))
     },
     "narrowargs" => {
-        self.narrow_args = on_or_off(p1)?;
-        Ok(format!("Narrow register parameter recovery turned {p1}"))
+        let (body, callers) = match p1 {
+            "callers" => (true, true),
+            _ => (on_or_off(p1)?, false),
+        };
+        self.narrow_args = body;
+        self.narrow_args_callers = callers;
+        Ok(format!("Narrow register parameter recovery set to {p1}"))
     },
     "regnarrow" => {
         self.narrow_locals = on_or_off(p1)?;
@@ -393,8 +473,15 @@ kuna_options! { self, p1;
         self.narrow_ret = on_or_off(p1)?;
         Ok(format!("Narrow call result recovery turned {p1}"))
     },
+    "regsigned" => {
+        self.narrow_signed = on_or_off(p1)?;
+        Ok(format!("Signed narrow register local recovery turned {p1}"))
+    },
     "narrowext" => {
         let (mode, msg) = crate::kuna_narrowext::OptionNarrowExt.apply(p1)?;
+        if self.narrow_ext != mode {
+            self.kuna_callwide.clear();
+        }
         self.narrow_ext = mode;
         Ok(msg)
     },
@@ -547,6 +634,7 @@ kuna_options! { self, p1;
     "splitstorekeep" => {
         on_off!(split_store_keep, "Refinement-split stack store mark")
     },
+    "pairrefine" => on_off!(pair_refine, "Register-pair midpoint refinement"),
     "wideslice" => on_off!(wide_slice_reduce, "Wide SSA slice reduction"),
     "devectorize" => on_off!(devectorize_reduction, "Vectorized reduction re-roll"),
     "strlenscan" => on_off!(strlen_scan, "inline repnz scasb string length as strlen"),
@@ -757,6 +845,9 @@ kuna_options! { self, p1;
     "bytehonest" => on_off!(byte_honest, "uncommitted-byte width reporting"),
     "slotptr" => on_off!(slot_ptr, "frame-slot pointer typing"),
     "reglocals" => on_off!(reg_locals, "register-local reporting"),
+    "slotreport" => on_off!(slot_report, "frame-slot local reporting"),
+    "callmechanisms" => on_off!(call_mechanism_effects, "compiler prototype call mechanisms"),
+    "slotsplit" => on_off!(slot_split, "frame-row splitting at declarations"),
     "voidtailreturn" => on_off!(voidtailreturn, "void tail-return elision"),
     "castimplied" => on_off!(cast_implied, "C-implied cast elision"),
     "castsign" => on_off!(cast_sign, "signed declarations for signed-only locals"),
@@ -824,6 +915,7 @@ kuna_options! { self, p1;
     "peimportcall" => on_off!(analysis_peimportcall, "PE/Mach-O import-slot call binding"),
     "libproto" => on_off!(analysis_libproto, "Library-prototype analysis pass"),
     "libcsigs" => on_off!(analysis_libcsigs, "Measured libc signature extension"),
+    "libgccsigs" => on_off!(analysis_libgccsigs, "libgcc __divdi3 DI-mode contract"),
     "libctypes" => {
         use crate::kuna_libctypes::LibcTypesLayout;
         let layout = match p1.trim().to_ascii_lowercase().as_str() {
@@ -866,6 +958,9 @@ kuna_options! { self, p1;
     "thumbswitch" => {
         on_off!(analysis_thumbswitch, "Thumb tbb/tbh switch-table read in the Listing walk (GH-299)")
     },
+    "x86listingswitch" => {
+        on_off!(analysis_x86listingswitch, "Bounded i386 switch successors in the discovery Listing")
+    },
     "switchreach" => {
         on_off!(analysis_switchreach, "Register-chain jump-table reach in the reference walk")
     },
@@ -875,6 +970,9 @@ kuna_options! { self, p1;
     },
     "ppclocalentry" => {
         on_off!(analysis_ppclocalentry, "PPC64 ELFv2 local-entry entry suppression")
+    },
+    "gowalkprune" => {
+        on_off!(analysis_gowalkprune, "Go pclntab functions out of the fast inventory walk")
     },
     "flowmode" => {
         let (on, after_call) = match p1.trim().to_ascii_lowercase().as_str() {
@@ -1036,6 +1134,12 @@ kuna_options! { self, p1;
             if val { "on" } else { "off" }
         ))
     },
+    "swiftdemangle" => {
+        let val = on_or_off(p1)?;
+        self.analysis_swiftdemangle = val;
+        crate::kuna_swiftdemangle::set_swiftdemangle_env(val);
+        Ok(format!("Swift symbol demangling turned {}", if val { "on" } else { "off" }))
+    },
     "symbolnamechars" => {
         let mode = crate::kuna_symbolnamechars::NameChars::parse(p1).ok_or_else(|| {
             KunaError::lowlevel(format!(
@@ -1096,6 +1200,15 @@ kuna_options! { self, p1;
             if val { "on" } else { "off" }
         ))
     },
+    "variantnames" => {
+        let val = on_or_off(p1)?;
+        self.analysis_variantnames = val;
+        crate::kuna_variantnames::set_variantnames_env(val);
+        Ok(format!(
+            "Variant discriminant-value naming turned {}",
+            if val { "on" } else { "off" }
+        ))
+    },
     "dwarfvariants" => {
         let val = on_or_off(p1)?;
         self.analysis_dwarfvariants = val;
@@ -1117,6 +1230,10 @@ kuna_options! { self, p1;
     "fast_funcdisc" => {
         on_off!(analysis_fast_funcdisc, "Fast whole-project function discovery")
     },
+    "lazyfuncs" => on_off!(
+        analysis_lazyfuncs,
+        "Materialize Function objects on demand instead of one per entry"
+    ),
     "rawdiscover" => {
         on_off!(analysis_rawdiscover, "Raw-image recursive function discovery")
     },
@@ -1166,6 +1283,15 @@ kuna_options! { self, p1;
     },
     "gopclntab" => {
         on_off!(analysis_gopclntab, "Go pclntab function-name recovery pass")
+    },
+    "gotypes" => {
+        let val = on_or_off(p1)?;
+        self.analysis_gotypes = val;
+        crate::kuna_gotypes::set_gotypes_env(val);
+        Ok(format!("Go runtime-type harvest turned {}", if val { "on" } else { "off" }))
+    },
+    "gonoreturn" => {
+        on_off!(analysis_gonoreturn, "Go pclntab no-return list pass")
     },
     "objc" => on_off!(analysis_objc, "Mach-O Objective-C metadata recovery pass"),
     "pdb" => on_off!(analysis_pdb, "PE PDB metadata recovery pass"),

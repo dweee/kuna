@@ -8,7 +8,7 @@
 //! result as `summary.runtime`; every other binary subcommand prints the
 //! actionable entries as one `note:` line each on stderr (see `docs/cli.md`).
 
-use kuna_analysis::analyzers::sourcelang::{detect_compiler_bytes, Compiler};
+use kuna_analysis::analyzers::sourcelang::{effective_compiler_bytes, Compiler};
 use regex::bytes::Regex;
 use std::sync::OnceLock;
 
@@ -186,6 +186,8 @@ pub fn detect(bytes: &[u8], toolchain: bool) -> Vec<RuntimeHint> {
         out.push(hint("upx", None, "UPX packed: run 'kuna unpack'".into(), true));
     } else if pe.is_some() && kuna_analysis::neolite::detect(bytes) {
         out.push(hint("neolite", None, "NEOLite packed: run 'kuna unpack'".into(), true));
+    } else if kuna_analysis::pklite::detect(bytes) {
+        out.push(hint("pklite", None, "PKLITE packed: run 'kuna unpack'".into(), true));
     }
     if windows_only(Marker::TwinBasic) {
         out.push(hint(
@@ -207,7 +209,7 @@ pub fn detect(bytes: &[u8], toolchain: bool) -> Vec<RuntimeHint> {
         ));
     }
     if toolchain {
-        match detect_compiler_bytes(bytes) {
+        match effective_compiler_bytes(bytes) {
             Compiler::Go => out.push(hint(
                 "go",
                 None,

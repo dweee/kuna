@@ -479,7 +479,14 @@ region path is never *worse* than upstream.
 **The rest of the file.** The same module carries the structuring-adjacent
 actions from upstream: `blockaction.rs (ActionNodeJoin)` /
 `(ConditionalJoin)` rejoin a split conditional (two blocks computing the same
-branch condition merge into one decision point); `blockaction.rs
+branch condition merge into one decision point). Both merge discovery and
+exit-edge repair inspect every MULTIEQUAL in each exit block. Stack analysis
+can replace an earlier stack-pointer phi with an INT_ADD in place, leaving
+other live phis behind it. Rejoining two predecessor edges must still merge
+their two values and remove exactly one input from each later phi, preserving
+unrelated predecessors and their input order. Ordinary exit operations retain
+their operands and block; a phi that has only one input after the repair becomes
+a COPY. `blockaction.rs
 (ActionReturnSplit)` is upstream's goto-driven epilogue splitter — it
 duplicates a shared RETURN block only when structuring left a **goto** into
 it (the Ghidra analog of what angr calls `ReturnDuplicatorLow`; the gotoless
@@ -490,6 +497,15 @@ the print-prep — for-loop rerolling, switch-case label assignment and
 sorting, the §8.3 `scopeBreak` hook, `mark_unstructured` (labelling every
 goto target so the printer emits `label_N:`), and `mark_label_bump_up` (a
 loop-head label is hoisted above the loop rather than into its condition).
+A for-loop header's initializer and iterator are each a statement moved out
+of the body or the pre-loop block into the header, so the move must not
+reorder them against a printed statement. When the PHI's input is a hidden
+COPY, the statement the header prints is the one feeding that COPY, not the
+COPY itself; `decompiler/crates/kuna-decomp/src/substrate/funcdata_block.rs
+(Funcdata::while_test_terminal)` therefore requires that statement to move,
+respecting cover, up to the COPY as well. A call, or a statement whose result a
+printed statement between them reads (`n = v & 1;` ahead of a loop over
+`v = strtoul(...)`), keeps its place, and the header goes without it.
 `blockaction.rs (ActionNormalizeBranches)` remains a non-mutating compatibility
 action in the `jumptable` and `normalize` groups. It preserves its registration
 and initialized-root check, but does not traverse branches or allocate unused
@@ -899,6 +915,17 @@ would change control flow), ≤ `kuna_dedupitetail.rs (MAX_HOISTED_LEAVES)` = 8
 leaves and ≤ `(MAX_LEAF_OPS)` = 64 ops per equivalence check, exact-or-decline
 on any mismatch, and a leaf carrying a label/goto is never hoisted. Flipped
 on by DIV-14.
+
+The hoist frees tree nodes: each dropped else-arm copy, and any arm list that
+is left with one component and unwrapped to it. A goto, switch case or
+multi-goto edge elsewhere in the tree can still name one of those nodes. A
+goto from one arm into the start of the other names that whole arm. Before a
+node is freed, every branch that names it is pointed at the node that took its
+place (`decompiler/crates/kuna-decomp/src/substrate/block.rs
+(kuna_free_replaced)`). An unwrapped arm hands over to its sole component,
+which starts at the same leaf, so the goto keeps its label and lands on the
+same statement. A dropped copy hands over to the copy that was kept. Before
+this, the goto kept the freed node's id and printing its label panicked.
 
 ### iteregion — `?:` recovery (angr `ITERegionConverter`)
 
