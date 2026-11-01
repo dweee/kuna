@@ -16,6 +16,7 @@ pub mod kuna_switchmodbound;
 pub mod kuna_switchguardbound;
 pub mod kuna_switchguardrange;
 pub mod kuna_switchsharedcase;
+pub mod kuna_switchrunon; // (kuna) an unguarded jump table stops where its rows leave the function
 pub mod kuna_constselectjump; // (kuna) recover a BRANCHIND whose destination is selected between constants
 pub mod kuna_sparcstructret;
 pub mod kuna_stackprobeloop;
@@ -39,6 +40,8 @@ pub mod kuna_overlapbranch; // (kuna) a conditional branch target inside its own
 pub mod kuna_msvcftol; // (kuna) MSVC __ftol family call-fixup: recover the x87 (ST0) argument
 pub mod kuna_cortexmpriv; // (kuna) fold the Cortex-M isCurrentModePrivileged() guard around MRS/MSR
 pub mod kuna_cleanupcode; // (kuna) oxidizer CleanupCodeRemover: delete rust drop/dealloc call sites
+pub mod kuna_gomorestack; // (kuna) fold the Go stack-growth entry guard (docs/multilang.md W2)
+pub mod kuna_gowritebarrier; // (kuna) fold the Go GC write-barrier diamond (docs/multilang.md W2)
 pub mod kuna_linuxsyscall; // (kuna) name the 32-bit Linux int 0x80 sites instead of calling through swi()
 pub mod kuna_x64syscall; // (kuna) give the x86-64 SYSCALL user-op the Linux ABI register effects
 pub mod kuna_syscallregs; // (kuna) give the ARM/AArch64/RISC-V/MIPS/PowerPC system-call user-op its register effects
@@ -47,3 +50,7 @@ pub mod kuna_fastfailnoreturn; // (kuna) a Windows `int 0x29` (__fastfail) ends 
 pub mod kuna_msvcimportcall; // (kuna `msvcsig`) a call through an import slot with a locked MSVC prototype is direct from the flow on
 pub mod kuna_int3pad; // (kuna) name the int3 pad control ran into instead of printing it as a call through swi()
 pub mod kuna_decodehalt; // (kuna) a halt planted where the decode failed says so instead of printing as an ordinary return
+pub mod kuna_fpuemu; // (kuna) decode the 8087 emulator's INT 34h-3Dh as the x87 instructions they stand for
+pub mod kuna_jumptablefault; // (kuna) test-only: panic one function's jump-table recovery
+
+pub mod kuna_gojumpchain;

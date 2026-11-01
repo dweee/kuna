@@ -16,6 +16,7 @@ use crate::expression::AddExpression;
 use crate::funcdata::Funcdata;
 use crate::op::pcodeop_flags;
 use crate::context::{OpId, VarnodeId};
+use crate::kuna_fasthash::FxHashMap;
 
 // =============================================================================
 // inst-table resolution: OpCode -> TypeOp (canonical typeop.cc table)
@@ -642,6 +643,15 @@ impl Rule for RuleIndirectCollapse {
                 if o.is_indirect_creation() || o.no_indirect_collapse() {
                     return 0;
                 }
+                let output = data.vbank().get(op_out(data, op).expect("indirect output"))
+                    .expect("live indirect output");
+                if data.get_call_specs_index(indop).is_some_and(|index| {
+                    crate::kuna_calleeprotostack::declared_pointer_reaches(
+                        data, data.get_call_specs(index), output.get_addr(), output.get_size(),
+                    )
+                }) {
+                    return 0;
+                }
             } else if data.obank().get(indop).expect("RuleIndirectCollapse: stale indop").uses_spacebase_ptr()
             {
                 if op_code(data, indop) == OpCode::CPUI_STORE {
@@ -693,8 +703,81 @@ fn op_from_iop_const(data: &Funcdata, vn: VarnodeId) -> Option<OpId> {
 
 /// `RuleMultiCollapse` — collapse a `MULTIEQUAL` whose inputs all trace to the
 /// same value (C++ `RuleMultiCollapse`).
+///
+/// A failed walk keeps its witness: the input slots from the op down to the
+/// non-matching branch it stopped at. While every link of that path is still a
+/// `MULTIEQUAL` input the walk would expand and its last input is still a branch
+/// that matches nothing, the walk would reach that branch again (it is still in
+/// the walk's reach, and an earlier stop is a failure too), so the rule answers
+/// "no change" without walking a web it walked before. Both that answer and the
+/// heritage test's are "no change", so the witness is tried first.
 #[derive(Clone, Default)]
-pub struct RuleMultiCollapse;
+pub struct RuleMultiCollapse {
+    witness: FxHashMap<OpId, SmallVec<[(OpId, int4); 4]>>,
+}
+
+/// How [`RuleMultiCollapse`]'s walk treats one branch `vn` when its defining
+/// branch is `def`: skipped (seen), matching, expanded (the `MULTIEQUAL`
+/// writing it), or a branch that ends the walk in failure.
+enum MultiBranch {
+    Skip,
+    Match,
+    Expand(OpId),
+    Mismatch,
+}
+
+fn multi_branch(data: &Funcdata, vn: VarnodeId, out: VarnodeId, def: VarnodeId, nofunc: bool) -> MultiBranch {
+    if vn == out || vn_is_mark(data, vn) {
+        return MultiBranch::Skip;
+    }
+    if vn == def {
+        return MultiBranch::Match;
+    }
+    if !nofunc
+        && !crate::p3_dataflow::kuna_indexaliasguard::keeps_forced_join(data, out, def, vn)
+        && crate::expression::functional_equality(def, vn, data.vbank(), data.obank())
+    {
+        return MultiBranch::Match;
+    }
+    match vn_def(data, vn) {
+        Some(d) if vn_is_written(data, vn) && op_code(data, d) == OpCode::CPUI_MULTIEQUAL => MultiBranch::Expand(d),
+        _ => MultiBranch::Mismatch,
+    }
+}
+
+impl RuleMultiCollapse {
+    /// Test-only: is a failed walk of `op` recorded?
+    #[doc(hidden)]
+    pub fn has_witness(&self, op: OpId) -> bool {
+        self.witness.contains_key(&op)
+    }
+
+    /// Does `op`'s recorded witness still end the walk in failure?
+    fn fails_again(&self, op: OpId, data: &Funcdata, out: VarnodeId, def: VarnodeId, nofunc: bool) -> bool {
+        let Some(path) = self.witness.get(&op) else {
+            return false;
+        };
+        if path.first().map(|&(o, _)| o) != Some(op) {
+            return false;
+        }
+        for (i, &(from, slot)) in path.iter().enumerate() {
+            if data.obank().get(from).is_none_or(|o| o.code() != OpCode::CPUI_MULTIEQUAL)
+                || slot >= op_num_input(data, from)
+            {
+                return false;
+            }
+            let Some(vn) = op_in(data, from, slot) else {
+                return false;
+            };
+            match (multi_branch(data, vn, out, def, nofunc), path.get(i + 1)) {
+                (MultiBranch::Expand(next), Some(&(want, _))) if next == want => {}
+                (MultiBranch::Mismatch, None) => return true,
+                _ => return false,
+            }
+        }
+        false
+    }
+}
 
 impl Rule for RuleMultiCollapse {
     fn get_op_list(&self) -> Vec<OpCode> {
@@ -706,7 +789,11 @@ impl Rule for RuleMultiCollapse {
         // The rule's group lives in the engine-owned `RuleState` (not in this
         // zero-sized marker), and the pool only holds rules whose group W8
         // enabled, so the clone is unconditional here.  See module docs.
-        Some(Box::new(RuleMultiCollapse))
+        Some(Box::new(RuleMultiCollapse::default()))
+    }
+
+    fn reset(&mut self, _data: &mut Funcdata) {
+        self.witness.clear();
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -718,25 +805,13 @@ impl Rule for RuleMultiCollapse {
         // blocks so the CFG can structure into `&&`/`||`.
 
         let numinput = op_num_input(data, op);
-        for i in 0..numinput {
-            let vi = op_in(data, op, i).expect("RuleMultiCollapse: null input");
-            if !vn_is_heritage_known(data, vi) {
-                return 0; // Everything must be heritaged before collapse
-            }
-        }
-
         let mut func_eq = false; // Start assuming absolute equality of branches
         let mut nofunc = false; // Functional equalities are initially allowed
         let mut defcopyr: Option<VarnodeId> = None;
-        let mut j = 0usize;
 
-        let mut matchlist: SmallVec<[VarnodeId; 8]> =
-            SmallVec::with_capacity(numinput as usize);
-        for i in 0..numinput {
-            matchlist.push(op_in(data, op, i).expect("RuleMultiCollapse: null input"));
-        }
         // Find base branch to match (first input not written by a MULTIEQUAL).
-        for &copyr in matchlist.iter() {
+        for i in 0..numinput {
+            let copyr = op_in(data, op, i).expect("RuleMultiCollapse: null input");
             let is_multi = vn_is_written(data, copyr)
                 && op_code(data, vn_def(data, copyr).expect("written vn has def"))
                     == OpCode::CPUI_MULTIEQUAL;
@@ -746,66 +821,78 @@ impl Rule for RuleMultiCollapse {
             }
         }
 
-        let mut success = true;
         let outvn = op_out(data, op).expect("RuleMultiCollapse: MULTIEQUAL has no output");
+        let first = match defcopyr {
+            Some(def) => Some((def, false)),
+            None => (0..numinput)
+                .filter_map(|i| op_in(data, op, i))
+                .find(|&vn| vn != outvn && !vn_is_mark(data, vn))
+                .map(|vn| (vn, true)),
+        };
+        if first.is_some_and(|(def, nofunc)| self.fails_again(op, data, outvn, def, nofunc)) {
+            return 0;
+        }
+        for i in 0..numinput {
+            let vi = op_in(data, op, i).expect("RuleMultiCollapse: null input");
+            if !vn_is_heritage_known(data, vi) {
+                return 0; // Everything must be heritaged before collapse
+            }
+        }
+
+        let mut success = true;
         vn_set_mark(data, outvn);
         let mut skiplist: SmallVec<[VarnodeId; 8]> = SmallVec::new();
         skiplist.push(outvn);
 
+        // C++ `matchlist` as (op, next slot, input count, parent run, parent
+        // slot) runs: nothing writes an input during the walk, so a slot read
+        // when reached is the value upstream copied.
+        let mut matchlist: SmallVec<[(OpId, int4, int4, usize, int4); 8]> = SmallVec::new();
+        if numinput > 0 {
+            matchlist.push((op, 0, numinput, 0, 0));
+        }
+        let mut j = 0usize;
+        let mut stop: Option<(usize, int4)> = None;
+
         while j < matchlist.len() {
-            let copyr = matchlist[j];
-            j += 1;
+            let run = j;
+            let (from, slot, end, _, _) = matchlist[j];
+            if slot + 1 == end {
+                j += 1;
+            } else {
+                matchlist[j].1 = slot + 1;
+            }
+            let copyr = op_in(data, from, slot).expect("RuleMultiCollapse: null input");
             if vn_is_mark(data, copyr) {
                 continue; // A varnode we have seen before (loop construct) — skip
             }
-            match defcopyr {
-                None => {
-                    // This is now the defining branch; all others must match.
-                    defcopyr = Some(copyr);
-                    if vn_is_written(data, copyr) {
-                        if op_code(data, vn_def(data, copyr).expect("written vn has def"))
-                            == OpCode::CPUI_MULTIEQUAL
-                        {
-                            nofunc = true; // MULTIEQUAL cannot match by functional equal
-                        }
-                    } else {
-                        nofunc = true; // Unwritten cannot match by functional equal
+            let Some(def) = defcopyr else {
+                // This is now the defining branch; all others must match.
+                // MULTIEQUAL and unwritten branches cannot match by functional equal.
+                defcopyr = Some(copyr);
+                nofunc = match vn_def(data, copyr) {
+                    Some(d) if vn_is_written(data, copyr) => op_code(data, d) == OpCode::CPUI_MULTIEQUAL,
+                    _ => true,
+                };
+                continue;
+            };
+            match multi_branch(data, copyr, outvn, def, nofunc) {
+                MultiBranch::Skip => {}
+                MultiBranch::Match => func_eq |= copyr != def,
+                MultiBranch::Expand(newop) => {
+                    // A non-matching MULTIEQUAL branch gets one last chance: its
+                    // inputs join the list of things to match.
+                    skiplist.push(copyr);
+                    vn_set_mark(data, copyr);
+                    let newin = op_num_input(data, newop);
+                    if newin > 0 {
+                        matchlist.push((newop, 0, newin, run, slot));
                     }
                 }
-                Some(def) if def == copyr => {
-                    continue; // A matching branch
-                }
-                Some(def)
-                    if !nofunc
-                        && !crate::p3_dataflow::kuna_indexaliasguard::keeps_forced_join(data, outvn, def, copyr)
-                        && crate::expression::functional_equality(
-                            def,
-                            copyr,
-                            data.vbank(),
-                            data.obank(),
-                        ) =>
-                {
-                    func_eq = true; // Now matching by functional equality
-                    continue;
-                }
-                _ => {
-                    if vn_is_written(data, copyr)
-                        && op_code(data, vn_def(data, copyr).expect("written vn has def"))
-                            == OpCode::CPUI_MULTIEQUAL
-                    {
-                        // If the non-matching branch is a MULTIEQUAL, give it one
-                        // last chance: add its inputs to the list of things to match.
-                        let newop = vn_def(data, copyr).expect("written vn has def");
-                        skiplist.push(copyr);
-                        vn_set_mark(data, copyr);
-                        let newin = op_num_input(data, newop);
-                        for i in 0..newin {
-                            matchlist.push(op_in(data, newop, i).expect("MULTIEQUAL null input"));
-                        }
-                    } else {
-                        success = false; // A non-matching branch
-                        break;
-                    }
+                MultiBranch::Mismatch => {
+                    success = false;
+                    stop = Some((run, slot));
+                    break;
                 }
             }
         }
@@ -875,6 +962,17 @@ impl Rule for RuleMultiCollapse {
         // Failure: clear out any marks we put down.
         for v in skiplist.iter().copied() {
             vn_clear_mark(data, v);
+        }
+        if let Some((mut run, slot)) = stop {
+            let mut path: SmallVec<[(OpId, int4); 4]> = SmallVec::new();
+            path.push((matchlist[run].0, slot));
+            while run != 0 {
+                let (_, _, _, parent, parent_slot) = matchlist[run];
+                path.push((matchlist[parent].0, parent_slot));
+                run = parent;
+            }
+            path.reverse();
+            self.witness.insert(op, path);
         }
         0
     }
@@ -1826,6 +1924,19 @@ impl Rule for RulePropagateCopy {
             if !vn_is_heritage_known(data, invn) {
                 continue; // Don't propagate free's away from their first use
             }
+            // Preserve explicit pointer declarations across integer storage so
+            // address recovery also sees dynamically computed pointers.
+            if data.vbank().get(vn).is_some_and(|value| {
+                value.is_type_lock()
+                    && value.get_type().get_metatype() == crate::dtype::type_metatype::TYPE_PTR
+                    && data.get_scope_local().is_some_and(|scope| {
+                        scope.has_isolated_symbols()
+                            && scope.query_container_for_link(value.get_addr(), &data.vn_use_point(vn))
+                                .is_some_and(|entry| entry.is_isolated)
+                    })
+            }) {
+                continue;
+            }
             // (kuna) a store of a value used as an address into a global keeps
             // its COPY; see [`crate::p3_dataflow::kuna_pointeestorekeep`].
             if crate::p3_dataflow::kuna_pointeestorekeep::declines(data, op, vn, invn) {
@@ -1853,6 +1964,11 @@ impl Rule for RulePropagateCopy {
             if !is_marker
                 && (crate::p3_dataflow::kuna_indexaliasguard::keeps_store_before_load(data, op, vn)
                     || crate::p3_dataflow::kuna_indexaliasguard::keeps_forced_self_copy(data, op, vn))
+            {
+                continue;
+            }
+            if is_marker && (crate::kuna_localstackviews::publication(data, vn)
+                || crate::kuna_localstackviews::native_store(data, vn))
             {
                 continue;
             }
@@ -2261,7 +2377,7 @@ pub fn specs() -> Vec<RuleSpec> {
         RuleSpec { group: "", ctor: || Box::new(RuleBoolZext) },
         RuleSpec { group: "", ctor: || Box::new(RuleLogic2Bool) },
         RuleSpec { group: "", ctor: || Box::new(RuleIndirectCollapse) },
-        RuleSpec { group: "", ctor: || Box::new(RuleMultiCollapse) },
+        RuleSpec { group: "", ctor: || Box::new(RuleMultiCollapse::default()) },
         RuleSpec { group: "", ctor: || Box::new(RuleSborrow) },
         RuleSpec { group: "", ctor: || Box::new(RuleScarry) },
         RuleSpec { group: "", ctor: || Box::new(RuleTrivialShift) },

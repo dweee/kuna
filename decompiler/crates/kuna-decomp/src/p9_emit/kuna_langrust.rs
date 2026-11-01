@@ -355,11 +355,11 @@ impl PrintC {
         markup: &MarkupRef,
     ) {
         let display = fd.get_display_name().to_string();
-        let rt = self.rt_ctx;
+        let rt = self.rt_ctx.clone();
         let ret_type = if fd.get_func_proto().has_store() {
             fd.get_func_proto()
                 .get_output_type()
-                .map(|t| declarator_parts(t, rt).0)
+                .map(|t| declarator_parts(t, rt.clone()).0)
                 .unwrap_or_else(|| "()".to_string())
         } else {
             "()".to_string()
@@ -442,7 +442,7 @@ impl PrintC {
                 name = default_name.as_str();
             }
             let ty = match param.get_type() {
-                Some(ty) => declarator_parts(ty, self.rt_ctx).0,
+                Some(ty) => declarator_parts(ty, self.rt_ctx.clone()).0,
                 None => "()".to_string(),
             };
             self.emit.print("mut", SyntaxHighlight::KeywordColor);
@@ -905,7 +905,7 @@ impl PrintC {
     ///
     /// Counts printed ops the way `if_body_elides` does: not-printed ops,
     /// branches and implied-output ops never reach the page.
-    fn cond_block_emits_statements(&self, fd: &Funcdata, cond: BlockId) -> bool {
+    pub(crate) fn cond_block_emits_statements(&self, fd: &Funcdata, cond: BlockId) -> bool {
         use crate::block::BlockType;
         if fd.sblocks_ref().block(cond).get_type() != BlockType::Copy {
             // A condition that is itself a list or a folded condition carries

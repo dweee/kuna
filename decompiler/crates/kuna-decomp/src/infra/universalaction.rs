@@ -291,12 +291,15 @@ const ONCE: u32 = ruleflags::rule_onceperfunc;
 /// [`ActionExtraPopSetup`](crate::coreaction_protos::ActionExtraPopSetup) keeps).
 /// `extra_pool_rules` are the architecture's
 /// CPU-specific `conf->extra_pool_rules`, appended to `oppool1` exactly as the
-/// C++ loop does. The stack-space arguments do not affect listing fields;
-/// extra rules do. The default-tree snapshot uses `None`/`vec![]`.
+/// C++ loop does. `truncated` is whether the default data space is truncated
+/// (the C++ `RulePtrFlow` constructor's `hasTruncations`). The stack-space
+/// arguments do not affect listing fields; extra rules do. The default-tree
+/// snapshot uses `None`/`vec![]`/`false`.
 pub fn universal_sched(
     stackspace: Option<Rc<AddrSpace>>,
     stackspace_index: Option<i32>,
     extra_pool_rules: Vec<RuleRow>,
+    truncated: bool,
 ) -> SchedNode {
     use crate::blockaction::{
         ActionBlockStructure, ActionBranchFlip, ActionFinalStructure, ActionNodeJoin,
@@ -369,13 +372,15 @@ pub fn universal_sched(
         rrow!("boolsignshift", "analysis", crate::kuna_booleanmask::RuleBoolSignShift::with_group(false, "analysis")),
         rrow!("simdshufflelane", "analysis", crate::kuna_simdlane::RuleSimdShuffleLane::with_group(false, "analysis")),
         rrow!("constspaceload", "analysis", crate::kuna_constspaceload::RuleConstSpaceLoad::with_group(false, "analysis")),
+        rrow!("x87truncate", "analysis", crate::kuna_x87truncate::RuleX87Truncate::new("analysis")),
+        rrow!("gobool", "analysis", crate::kuna_gobool::RuleGoBoolReturn::with_group(false, "analysis")),
         rrow!("boolsignless", "analysis", crate::kuna_flagcompare::RuleBoolSignLess::with_group(false, "analysis")),
         rrow!("sborrowge", "analysis", crate::kuna_flagcompare::RuleSborrowGe::with_group(false, "analysis")),
         rrow!("shiftcompare", "analysis", crate::ruleaction_2::RuleShiftCompare),
         rrow!("shift2mult", "analysis", crate::ruleaction_3::RuleShift2Mult),
         rrow!("shiftpiece", "analysis", crate::ruleaction_3::RuleShiftPiece),
         rrow!("addcarrychain", "analysis", crate::kuna_addcarrychain::RuleAddCarryChain::with_group(false, "analysis")),
-        rrow!("multicollapse", "analysis", crate::ruleaction_3::RuleMultiCollapse),
+        rrow!("multicollapse", "analysis", crate::ruleaction_3::RuleMultiCollapse::default()),
         rrow!("indirectcollapse", "analysis", crate::ruleaction_3::RuleIndirectCollapse),
         rrow!("2comp2mult", "analysis", crate::ruleaction_3::Rule2Comp2Mult),
         rrow!("sub2add", "analysis", crate::ruleaction_3::RuleSub2Add),
@@ -451,7 +456,11 @@ pub fn universal_sched(
         rrow!("subvar_and", "subvar", crate::subflow::RuleSubvarAnd::new("subvar")),
         rrow!("subvar_subpiece", "subvar", crate::subflow::RuleSubvarSubpiece::new("subvar")),
         rrow!("splitflow", "subvar", crate::subflow::RuleSplitFlow::new("subvar")),
-        rrow!("ptrflow", "subvar", crate::ruleaction_7::RulePtrFlow::new()),
+        if truncated {
+            rrow!("ptrflow", "subvar", crate::ruleaction_7::RulePtrFlow::new(true))
+        } else {
+            rrow!("ptrflow", "subvar", crate::ruleaction_7::RulePtrFlow::new(false))
+        },
         rrow!("subvar_compzero", "subvar", crate::subflow::RuleSubvarCompZero::new("subvar")),
         rrow!("subvar_shift", "subvar", crate::subflow::RuleSubvarShift::new("subvar")),
         rrow!("subvar_zext", "subvar", crate::subflow::RuleSubvarZext::new("subvar")),
@@ -512,6 +521,7 @@ pub fn universal_sched(
         rrow!("stringstore", "constsequence", crate::constseq::RuleStringStore::new("constsequence")),
         rrow!("memsetcopy", "constsequence", crate::kuna_memsetsequence::RuleMemsetCopy::with_group(false, "constsequence")),
         rrow!("rodatastringcopy", "constsequence", crate::kuna_rodatastring::RuleRodataStringCopy::with_group(false, "constsequence")),
+        rrow!("fatstr", "constsequence", crate::kuna_fatstr::RuleFatStr::with_group(false, "constsequence")),
         rrow!("bitfield_store", "bitfields", crate::bitfield::RuleBitFieldStore),
         rrow!("bitfield_out", "bitfields", crate::bitfield::RuleBitFieldOut),
         rrow!("bitfield_load", "bitfields", crate::bitfield::RuleBitFieldLoad),
@@ -562,6 +572,9 @@ pub fn universal_sched(
             // fed the drop.  Before `outline`, so a region whose only call was drop
             // glue becomes outline-eligible.  Inert on a non-Rust binary.
             act!(crate::p2_lift::kuna_cleanupcode::ActionRemoveCleanupCode::boxed("deadcode")),
+            act!(crate::kuna_gojumpchain::ActionGoJumpChain::boxed("deadcode")),
+            act!(crate::p2_lift::kuna_gomorestack::ActionGoMorestack::boxed("deadcode")),
+            act!(crate::p2_lift::kuna_gowritebarrier::ActionGoWriteBarrier::boxed("deadcode")),
             // (kuna) outline (option `outline`, default-OFF - destructive, and inert
             // with no region supplied).  Excise a SUPPLIED single-entry region and
             // emit a call to a synthesized pseudofunction in its place.
@@ -662,6 +675,7 @@ pub fn universal_sched(
             // because it is the same edge-removal primitive pair on a different
             // trigger; the repeating fullloop re-runs mainloop's dead-code and type
             // passes over the reduced graph before P8 structures it.
+            act!(crate::kuna_gobounds::ActionGoBounds::boxed("returnsplit")),
             act!(Box::new(crate::kuna_securitycheck::ActionRemoveSecurityCheck::new(
                 false,
                 "returnsplit"
@@ -864,8 +878,9 @@ pub fn build_universal_action(
     stackspace: Option<Rc<AddrSpace>>,
     stackspace_index: Option<i32>,
     extra_pool_rules: Vec<RuleRow>,
+    truncated: bool,
 ) -> Box<dyn Action> {
-    universal_sched(stackspace, stackspace_index, extra_pool_rules).materialize()
+    universal_sched(stackspace, stackspace_index, extra_pool_rules, truncated).materialize()
 }
 
 /// Install the universal tree and the default root group sets into an
@@ -877,9 +892,10 @@ pub fn install_universal(
     stackspace: Option<Rc<AddrSpace>>,
     stackspace_index: Option<i32>,
     extra_pool_rules: Vec<RuleRow>,
+    truncated: bool,
 ) {
     crate::action::build_default_groups(db);
-    db.set_universal(build_universal_action(stackspace, stackspace_index, extra_pool_rules));
+    db.set_universal(build_universal_action(stackspace, stackspace_index, extra_pool_rules, truncated));
 }
 
 #[cfg(test)]
