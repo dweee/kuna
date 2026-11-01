@@ -41,7 +41,9 @@ use crate::args::take_value as take;
 use crate::callgraph::CallGraph;
 use crate::jobs;
 use crate::jsonfmt::{dumps_indent2, Json};
-use crate::loadtime::{apply_to_process as apply_loadtime_env, is_loadtime_gate, last_option_value};
+#[cfg(test)]
+use crate::loadtime::last_option_value;
+use crate::loadtime::{apply_to_process as apply_loadtime_env, is_loadtime_gate};
 use crate::paths;
 
 /// Parsed `decompile-all` / `functions` arguments (the two share a loader;
@@ -672,7 +674,10 @@ fn run_jobs_worker(args: &Args) -> Result<(), String> {
     let inventory = dir.join(jobs::INVENTORY_FILE);
     if !args.jobs_full_load && inventory.is_file() {
         seed_worker_inventory(&mut prog, &inventory.to_string_lossy())?;
+    } else if !args.jobs_full_load {
+        prog.callwide_unavailable("worker did not receive a complete function inventory");
     }
+    kuna_console::kuna_callwide::prepare(&mut prog);
     faults.after_load(dir);
     arm_fn_budgets(&mut prog, args);
     // (kuna `structsynth`) A recording worker reports every ledger lookup and
@@ -723,8 +728,9 @@ fn run_jobs_worker(args: &Args) -> Result<(), String> {
         let entries = rehydrate_entries(&prog, targets)?;
         let replay = if converge { entries.clone() } else { Vec::new() };
         {
-            let mut out =
-                jobs::ResultWriter::create(&dir.join(jobs::result_name(idx)).to_string_lossy())?;
+            let out = std::cell::RefCell::new(jobs::ResultWriter::create(
+                &dir.join(jobs::result_name(idx)).to_string_lossy(),
+            )?);
             // One pulled batch for the whole chunk, not one call per function:
             // the callee-hint context is built once per call, and rebuilding the
             // program's entry set per function is unaffordable on a large image.
@@ -754,6 +760,17 @@ fn run_jobs_worker(args: &Args) -> Result<(), String> {
             // the pull stops at the current function rather than decompiling the
             // rest of it into a dead file.
             let write_error: std::cell::RefCell<Option<String>> = std::cell::RefCell::new(None);
+            let write = |frame: Result<(), String>| {
+                let mut slot = write_error.borrow_mut();
+                if let (None, Err(e)) = (&*slot, frame) {
+                    *slot = Some(e);
+                }
+            };
+            let mut begin = |position: usize| {
+                if converge {
+                    write(out.borrow_mut().begin(position));
+                }
+            };
             decompile_pulled(
                 &mut prog,
                 &opts,
@@ -765,6 +782,7 @@ fn run_jobs_worker(args: &Args) -> Result<(), String> {
                     if let Some(hook) = &synth_hook {
                         hook.borrow_mut().begin(&answers[pulled]);
                     }
+                    begin(pulled);
                     pulled += 1;
                     faults.before_target(dir, entry.addr.get_offset());
                     Some(entry)
@@ -777,22 +795,18 @@ fn run_jobs_worker(args: &Args) -> Result<(), String> {
                         held.push(r);
                         return;
                     }
-                    let mut slot = write_error.borrow_mut();
-                    if slot.is_none() {
-                        if let Err(e) = out.push(&r) {
-                            *slot = Some(e);
-                        }
-                    }
+                    write(out.borrow_mut().push(&r));
                 },
             );
+            if converge && write_error.borrow().is_none() {
+                converge_synthesized_structs(&mut prog, &opts, &replay, &mut held, &mut begin);
+            }
             if let Some(e) = write_error.into_inner() {
                 return Err(e);
             }
-            if converge {
-                converge_synthesized_structs(&mut prog, &opts, &replay, &mut held);
-                for r in &held {
-                    out.push(r)?;
-                }
+            let mut out = out.into_inner();
+            for r in &held {
+                out.push(r)?;
             }
         }
         jobs::ack_chunk(idx);
@@ -859,7 +873,11 @@ fn seed_worker_inventory(prog: &mut ConsoleProgram, path: &str) -> Result<(), St
         .map(std::rc::Rc::clone)
         .ok_or("no default code space")?;
     let manage = prog.arch().manage();
-    let entries: Vec<(String, Address)> = jobs::read_spec(path)?
+    let inventory = jobs::read_spec(path)?;
+    let callwide_inventory = prog.arch().call_wide.then(|| inventory.iter().map(|entry| kuna_console::kuna_callwide::InventoryEntry {
+        address: entry.addr, size: entry.size, name: entry.name.clone(), aliases: entry.aliases.clone(),
+    }).collect());
+    let entries: Vec<(String, Address)> = inventory
         .into_iter()
         .map(|t| {
             let space = manage
@@ -870,8 +888,11 @@ fn seed_worker_inventory(prog: &mut ConsoleProgram, path: &str) -> Result<(), St
         })
         .collect();
     prog.seed_function_inventory(&entries)
-        .map(|_| ())
-        .map_err(|e| format!("seeding the worker function inventory failed: {}", e.explain()))
+        .map_err(|e| format!("seeding the worker function inventory failed: {}", e.explain()))?;
+    if let Some(inventory) = callwide_inventory {
+        kuna_console::kuna_callwide::replay_inventory(prog, inventory);
+    }
+    Ok(())
 }
 
 /// The parent side of `--jobs N`: flatten the resolved targets (an `Address`
@@ -893,6 +914,7 @@ pub(crate) fn decompile_targets_pooled(
     synth_base: Option<shard::Replay>,
     serial_callee_first: bool,
     arm_frames: Option<String>,
+    watch: Option<&dyn jobs::PoolWatch>,
 ) -> Result<jobs::PoolOutput, String> {
     let specs = flatten_targets(targets);
     let inventory = flatten_targets(inventory);
@@ -907,6 +929,7 @@ pub(crate) fn decompile_targets_pooled(
     cfg.synth_base = synth_base;
     cfg.serial_callee_first = serial_callee_first;
     cfg.arm_frames = arm_frames;
+    cfg.watch = watch;
     cfg.elem_objects = targets.len() <= 1;
     cfg.want_pointer_arguments = true;
     let mut pooled = jobs::run_pool(&cfg, &specs, &inventory)?;
@@ -999,6 +1022,7 @@ pub(crate) fn pool_config<'a>(
         serial_callee_first: false,
         elem_objects: false,
         arm_frames: None,
+        watch: None,
     }
 }
 
@@ -1279,6 +1303,7 @@ fn decompile_all(args: &Args, filters: &Filters) -> Result<AllRun, String> {
             synth,
             callee_first,
             arm_frames,
+            None,
         )?;
         return Ok(AllRun { funcs: pooled.results, discovered, assertions, interior });
     }
@@ -1692,7 +1717,21 @@ pub(crate) fn load_program(
         kuna_console::assertions::apply_program_scoped(&mut prog);
     }
     crate::kuna_allocrelease::after_analysis();
+    if args.jobs_worker.is_none() {
+        kuna_console::kuna_callwide::prepare(&mut prog);
+    }
     Ok(prog)
+}
+
+/// What a name miss says beyond the miss itself: the `; `-separated tail of
+/// [`EntryLookupError::NotFound`] (a near spelling, the count of names the
+/// image does carry, or the data object the name labels). `None` for a bare
+/// miss, which is what a stripped image answers.
+pub(crate) fn name_miss_hint(error: &EntryLookupError) -> Option<String> {
+    let EntryLookupError::NotFound { .. } = error else { return None };
+    let text = error.to_string();
+    let (_, hint) = text.split_once("\"; ")?;
+    (!hint.trim().is_empty()).then(|| hint.trim().to_string())
 }
 
 /// Build the target [`FunctionEntry`] list from the filters: `--addr` entries
@@ -1758,8 +1797,18 @@ fn resolve_targets_with_policy(
             };
             match entry {
                 Ok(entry) => targets.push(entry),
-                Err(EntryLookupError::NotFound { .. }) => {
-                    eprintln!("warning: no function named {want:?} in {}", args.binary)
+                Err(error @ EntryLookupError::NotFound { .. }) => {
+                    let tail = match &error {
+                        EntryLookupError::NotFound { data: Some(_), .. } => name_miss_hint(&error),
+                        _ => None,
+                    };
+                    match tail {
+                        Some(tail) => eprintln!(
+                            "warning: no function named {want:?} in {}; {tail}",
+                            args.binary
+                        ),
+                        None => eprintln!("warning: no function named {want:?} in {}", args.binary),
+                    }
                 }
                 Err(error) => return Err(error.to_string()),
             }
@@ -1796,10 +1845,24 @@ fn resolve_targets_with_policy(
 /// Returns `None` when the file is not a Rust binary or cannot be parsed, which
 /// leaves the C default in place: this can only ever ADD a language, never take
 /// one away.
-pub fn detected_output_language(binary: &str) -> Option<&'static str> {
-    let bytes = kuna_analysis::loader::elf_shdr::read_image(binary).ok()?;
-    let file = kuna_analysis::loadimage_object::parse_object(&bytes).ok()?;
-    match kuna_analysis::sourcelang::detect_compiler(&file, &bytes) {
+pub fn detected_output_language(
+    binary: &str,
+    options: &[(String, String)],
+) -> Option<&'static str> {
+    // A per-run `--option sourcelang` force wins over the image: this policy
+    // runs in the parent process, before the loadtime environment is bound
+    // onto the engine (sub)process, so the options list is consulted directly.
+    let compiler = match crate::loadtime::last_option_value(options, "sourcelang")
+        .and_then(kuna_decomp::kuna_sourcelang::SourceLang::parse_forced)
+    {
+        Some(lang) => kuna_analysis::sourcelang::Compiler::from_forced_lang(lang),
+        None => {
+            let bytes = kuna_analysis::loader::elf_shdr::read_image(binary).ok()?;
+            let file = kuna_analysis::loadimage_object::parse_object(&bytes).ok()?;
+            kuna_analysis::sourcelang::effective_compiler(&file, &bytes)
+        }
+    };
+    match compiler {
         kuna_analysis::sourcelang::Compiler::Rustc => Some("rust-language"),
         _ => None,
     }
@@ -2049,7 +2112,9 @@ pub(crate) fn render_selected_json(
     assertions: &[kuna_console::assertions::Outcome],
     interior: &crate::interior::Interiors,
 ) -> String {
-    let language = last_option_value(options, "setlanguage").unwrap_or("c-language");
+    let language = crate::loadtime::explicit_output_language(options)
+        .and_then(kuna_decomp::kuna_lang::OutLang::from_print_name)
+        .map(|lang| lang.print_name()).unwrap_or("c-language");
     format!(
         "{}\n",
         dumps_indent2(&result_json(binary, funcs, language, error, total, assertions, interior))
@@ -2354,6 +2419,9 @@ mod provenance_json_tests {
             code: Some("int f(int x)\n{\n  return x;\n}".into()),
             error: None,
             proto: None,
+            emitted_c_name: None,
+            call_declarations: Vec::new(),
+            callwide_prototypes: Vec::new(),
             variables: vec![VarInfo {
                 name: "x".into(),
                 type_name: "int".into(),
@@ -2363,6 +2431,7 @@ mod provenance_json_tests {
                 arg_index: Some(0),
                 line_numbers: vec![3],
                 addresses: vec![0x401004],
+                split_piece: false,
             }],
             types: vec![TypeInfo {
                 name: "mystruct".into(),
@@ -2720,9 +2789,9 @@ pub(crate) fn parse_args_with_filters(
         && jobs_worker.is_none()
         && cmd != "decompile-project"
         && cmd != "decompile-graph"
-        && !options.iter().any(|(n, _)| n == "setlanguage")
+        && crate::loadtime::explicit_output_language(&options).is_none()
     {
-        if let Some(lang) = detected_output_language(&binary) {
+        if let Some(lang) = detected_output_language(&binary, &options) {
             options.push(("setlanguage".into(), lang.into()));
         }
     }
@@ -3165,6 +3234,11 @@ mod discovery_tests {
         ];
         assert!(render_result_json("f", &[], &options, None, &[], &Default::default()).contains("\"c-language\""));
         assert!(render_result_json("f", &[], &[], None, &[], &Default::default()).contains("\"c-language\""));
+        let mut aliases = options.clone();
+        aliases.push(("outlang".into(), "go".into()));
+        assert!(render_result_json("f", &[], &aliases, None, &[], &Default::default()).contains("\"go-language\""));
+        aliases.push(("setlanguage".into(), "rust-language".into()));
+        assert!(render_result_json("f", &[], &aliases, None, &[], &Default::default()).contains("\"rust-language\""));
     }
 }
 

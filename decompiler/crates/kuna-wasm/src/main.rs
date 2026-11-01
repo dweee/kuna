@@ -58,9 +58,9 @@ fn main() -> ExitCode {
     let argv: Vec<String> = std::env::args().collect();
     if argv.len() < 4 {
         eprintln!(
-            "usage: {} <binary> <spec-root> <list|decompile|inspect|read|xrefs|strings|project> \
+            "usage: {} <binary> <spec-root> <list|decompile|inspect|read|xrefs|strings|data|uses|project> \
              [name|0xaddr|0xaddr len|display-name] [--mode auto|reliable|aggressive|fast] \
-             [--language auto|c|rust] [--assert DIRECTIVE]...",
+             [--language auto|c|rust|go] [--assert DIRECTIVE]...",
             argv[0]
         );
         return ExitCode::from(64);
