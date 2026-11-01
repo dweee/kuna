@@ -39,7 +39,9 @@
 //!    walk — the same projection [`crate::operand_refs`] makes — so it reuses that
 //!    pass's upstream `ScalarOperandAnalyzer.checkOperands` value filter
 //!    (`>= 4096`, no byte masks), and a bare integer that happens to look like an
-//!    address is not reported. A materialized address that is not dereferenced is
+//!    address is not reported. A constant the instruction computed from its own
+//!    address is an address whatever its size, so it is exempt
+//!    ([`super::kuna_pcform`]). A materialized address that is not dereferenced is
 //!    [`XrefKind::Data`]: the address-taken case — a function pointer, a string
 //!    pointer, a global's address.
 //!
@@ -77,9 +79,11 @@ use object::SectionKind;
 
 use super::classify::classify;
 use super::context::ContextPainter;
+use super::kuna_pcform::{Formed, PcForm};
 use super::kuna_picbase::{self, Ctx as PicCtx, PicBase};
-use super::kuna_picpool::PicPool;
+use super::kuna_picpool::{self, GotImage, Insn, PicPool};
 use super::kuna_poolref::PoolImage;
+use super::kuna_regcarry::{self, Machine as CarryMachine};
 use super::kuna_switchtable;
 use super::model::{FlowKind, RawOp};
 #[path = "kuna_prefixreuse.rs"]
@@ -718,6 +722,12 @@ fn descend(
     // read-only mapped section, and every relocatable object, whose sections are
     // not the runtime ones) leaves every reference below exactly as it was.
     let pool = if mapped.is_empty() { None } else { PoolImage::new(file) };
+    // (kuna) `picpool`: the GOT's file bytes, read through a PC-composed base.
+    let got = if mapped.is_empty() { None } else { GotImage::new(file) };
+    // (kuna) `pcform`: the addresses an instruction forms from its own address,
+    // which the `checkOperands` floor must not drop. `None` unless the image
+    // maps something below that floor. See [`super::kuna_pcform`].
+    let pcform = PcForm::new(file, pool.as_ref(), &mapped);
     let max_entries = match arch.max_jumptable_size {
         0 => kuna_switchtable::DEFAULT_MAX_ENTRIES,
         n => n as usize,
@@ -728,6 +738,26 @@ fn descend(
         preserved: if arch.analysis_switchreach { &preserved } else { &[] },
         far: arch.analysis_switchreach,
     };
+    let arm = file.architecture() == object::Architecture::Arm;
+    let pic_image = pool.as_ref().map(|pool| kuna_picpool::Image {
+        pool,
+        mapped: &mapped,
+        extended: [".got", ".got.plt", ".dynamic"].iter().any(|name| file.section_by_name(name).is_some()),
+        data_space: data_space.as_ref(),
+        got: got.as_ref(),
+        preserved: &preserved,
+    });
+    // (kuna) `regcarry`: the register space a carried constant lives in.
+    let carry_machine = CarryMachine::new(
+        file,
+        arch.manage().get_space_by_name("register"),
+        data_space.as_ref(),
+        &preserved,
+        &mapped,
+        pool.as_ref(),
+    );
+    // (kuna) `picpool`: odd composed addresses held for the Thumb-bit decision.
+    let mut thumb_refs: Vec<(u64, u64, XrefKind, String)> = Vec::new();
     // (kuna) `switchtable`: the dispatches whose read stopped for want of a
     // decoded instruction ending at the key, as `(dispatch, mode, branch)`.
     let mut waiting: HashMap<u64, Vec<(u64, _, VarnodeData)>> = HashMap::new();
@@ -979,6 +1009,10 @@ fn descend(
         // `add` that turns each into an address. Per function, because the values
         // it tracks are live only inside one straight-line run.
         let mut picpool = PicPool::default();
+        // (kuna) `picpool`: `poolref` rows for pool words still in flight, filed
+        // once the body drains unless a PC fold consumed the word.
+        let mut held: Vec<(u64, u64, String)> = Vec::new();
+        st.carry.begin_body();
         // (kuna) `switchtable`: a dispatch can be decoded before the code that
         // falls into it -- breadth-first, or by a `.cold` fragment's jump back
         // into its parent's loop ahead of the parent's own walk -- and the slice
@@ -1009,6 +1043,7 @@ fn descend(
                 }
                 let text = if read.cases.is_empty() { String::new() } else { assembly(translate, vma, &code_space) };
                 st.take_switch(vma, entry, &read.cases, read.stated, max_entries, &text);
+                picpool.cases(vma, &read.cases);
                 insn_queue.extend(read.cases.iter().map(|&target| (target, mode)));
             }
             insn_queue.pop_front()
@@ -1030,6 +1065,7 @@ fn descend(
                 && frame_candidates.binary_search(&vma).is_ok()
                 && !frame_cache.body_covers(entry, vma)
             {
+                st.refused.insert(vma);
                 continue;
             }
             if sections_are_runtime && !in_range(&exec_set, vma) {
@@ -1074,33 +1110,53 @@ fn descend(
                     flow.jumps.extend(c.flows.iter().map(|&to| (vma, to)));
                 }
             }
-            let drefs = if mapped.is_empty() {
+            let formed = pcform.as_ref().map_or_else(Formed::default, |p| p.formed(vma, len));
+            let mut drefs = if mapped.is_empty() {
                 Vec::new()
             } else {
                 let fall_through = vma.wrapping_add(len as u64);
-                data_refs(cap.ops(), data_space.as_ref(), &mapped, fall_through, pool.as_ref())
+                let delayed = || has_delay_slot(translate, vma, &code_space, len);
+                data_refs(cap.ops(), data_space.as_ref(), &mapped, fall_through, pool.as_ref(), &formed, &delayed)
             };
+            // (kuna) `regcarry`: the address a register pair forms across
+            // instructions. See [`super::kuna_regcarry`].
+            if let Some(m) = &carry_machine {
+                st.carry.step(m, kuna_regcarry::Insn {
+                    vma,
+                    ops: cap.ops(),
+                    fall: c.fall_through,
+                    branches: if c.flow.is_call { &[] } else { &c.flows },
+                    calls: c.flow.is_call,
+                    formed,
+                });
+            }
             // (kuna) `picpool`: the address a PC-relative literal-pool pair forms,
             // which is in neither of its two instructions on its own. See
             // [`super::kuna_picpool`].
-            let picrefs = match pool.as_ref() {
-                Some(p) => picpool.step(
+            let seeded = pic_image.as_ref().and_then(|img| {
+                let insn = Insn {
                     vma,
                     len,
-                    cap.ops(),
-                    p,
-                    &mapped,
-                    data_space.as_ref(),
-                ),
-                None => Vec::new(),
-            };
+                    fall: c.fall_through,
+                    ops: cap.ops(),
+                    branches: if c.flow.is_call { &[] } else { &c.flows },
+                };
+                picpool.step(img, insn, || insn_queue.iter().map(|&(at, _)| at).collect())
+            });
+            let pointer = seeded.and_then(|word| {
+                let i = drefs.iter().position(|&r| r == (word, XrefKind::Data))?;
+                Some(drefs.remove(i).0)
+            });
             // Every row this instruction produces carries the same render, and an
             // instruction that produces none needs no render at all.
-            let mut text = if c.flows.is_empty() && drefs.is_empty() && picrefs.is_empty() {
+            let mut text = if c.flows.is_empty() && drefs.is_empty() && pointer.is_none() {
                 String::new()
             } else {
                 assembly(translate, vma, &code_space)
             };
+            if let Some(word) = pointer {
+                held.push((vma, word, text.clone()));
+            }
 
             if cap.ops().iter().any(|op| op.opcode == OpCode::CPUI_CALLIND) {
                 st.indirect_call_sites.insert(vma);
@@ -1186,15 +1242,13 @@ fn descend(
                         text = assembly(translate, vma, &code_space);
                     }
                     st.take_switch(vma, entry, &cases, stated, max_entries, &text);
+                    picpool.cases(vma, &cases);
                     insn_queue.extend(cases.iter().map(|&target| (target, mode)));
                 }
             }
 
             for &(to, kind) in &drefs {
                 st.file(vma, to, kind, &text);
-            }
-            for &to in &picrefs {
-                st.file(vma, to, XrefKind::Data, &text);
             }
             // Both halves the deferred base-relative pass needs are pure
             // functions of this instruction's ops, so they are computed here
@@ -1212,6 +1266,24 @@ fn descend(
                         fall_through,
                     ),
                 });
+            }
+        }
+
+        let verdict = picpool.finish(&st.refused);
+        for (vma, word, text) in held {
+            if !verdict.displaced.contains(&vma) {
+                st.file(vma, word, XrefKind::Data, &text);
+            }
+        }
+        // Rendered here for the same reason as `picbase`'s rows below: few
+        // instructions compose an address. An odd address whose even half is
+        // code waits for the whole walk to say whether it is a Thumb pointer.
+        for &(vma, to, kind) in &verdict.refs {
+            let text = assembly(translate, vma, &code_space);
+            if arm && to & 1 == 1 && in_range(&exec_set, to & !1) {
+                thumb_refs.push((vma, to, kind, text));
+            } else {
+                st.file(vma, to, kind, &text);
             }
         }
 
@@ -1241,11 +1313,37 @@ fn descend(
             let _ = ctx;
         }
     }
+    // (kuna) `regcarry`: a carried reference holds only where nothing joined
+    // the run that carried it, which the whole walk has to have been seen for.
+    let mut carried_text: HashMap<u64, String> = HashMap::new();
+    for (vma, to, kind) in st.carry.finish(&st.funcs) {
+        let text = carried_text
+            .entry(vma)
+            .or_insert_with(|| assembly(translate, vma, &code_space))
+            .clone();
+        if arm && to & 1 == 1 && in_range(&exec_set, to & !1) {
+            thumb_refs.push((vma, to, kind, text));
+        } else {
+            st.file(vma, to, kind, &text);
+        }
+    }
+    for (vma, page) in st.carry.superseded(&st.funcs) {
+        st.unfile(vma, page, XrefKind::Data);
+    }
     // A focus address that did not decode is not a function: recording it as one
     // would answer `sub_<addr>` for a byte in the middle of a string.
     for f in focused {
         if !st.decoded.contains(&f) {
             st.funcs.remove(&f);
+        }
+    }
+    // (kuna) `picpool`: a Thumb pointer is its entry with bit 0 set. See
+    // [`thumb_target`].
+    if !thumb_refs.is_empty() {
+        let markers = mapping_markers(file);
+        for (vma, to, kind, text) in thumb_refs {
+            let to = thumb_target(to, &st, &markers);
+            st.file(vma, to, kind, &text);
         }
     }
 
@@ -1503,6 +1601,13 @@ struct State {
     indirect_call_sites: BTreeSet<u64>,
     flow: Option<FlowGraph>,
     switches: Vec<SwitchTable>,
+    /// (kuna) `picpool`: instructions a recovered frame's walk refused to enter.
+    /// The frame's own edges into one are in no other body's record, so a body
+    /// that decodes it later cannot trust what it carries there.
+    refused: HashSet<u64>,
+    /// (kuna) `regcarry`: the register constants in flight and the references
+    /// they wait to file.
+    carry: kuna_regcarry::Tracker,
 }
 
 impl State {
@@ -1518,6 +1623,8 @@ impl State {
                 ..FlowGraph::default()
             }),
             switches: Vec::new(),
+            refused: HashSet::new(),
+            carry: kuna_regcarry::Tracker::default(),
         }
     }
 
@@ -1547,6 +1654,7 @@ impl State {
             flow.jumps.extend(cases.iter().map(|&to| (vma, to)));
         }
         for &target in cases {
+            self.carry.enter(target);
             self.file(vma, target, XrefKind::Jump, text);
         }
     }
@@ -1555,6 +1663,20 @@ impl State {
         let r = Xref { from, to, kind, instruction: instruction.to_string() };
         self.by_target.entry(to).or_default().push(r.clone());
         self.by_source.entry(from).or_default().push(r);
+    }
+
+    /// Withdraw every `from -> to` row of `kind`.
+    fn unfile(&mut self, from: u64, to: u64, kind: XrefKind) {
+        let withdraw = |map: &mut BTreeMap<u64, Vec<Xref>>, key: u64| {
+            if let Some(refs) = map.get_mut(&key) {
+                refs.retain(|r| (r.from, r.to, r.kind) != (from, to, kind));
+                if refs.is_empty() {
+                    map.remove(&key);
+                }
+            }
+        };
+        withdraw(&mut self.by_source, from);
+        withdraw(&mut self.by_target, to);
     }
 
     /// Use the same owners for incoming rows, outgoing buckets and computed calls.
@@ -1611,6 +1733,45 @@ impl State {
             flow: self.flow,
             switches: self.switches,
         }
+    }
+}
+
+/// (kuna) `picpool`: the address an odd value `v` whose even half is in an
+/// executable section names. It is a Thumb pointer, filed at `v & !1`, when the
+/// walk decoded code or knows a function there, or when the nearest ARM mapping
+/// symbol at or below it is `$t`; a `$d` or `$a` there makes it a datum at an
+/// odd address (a string in a `.rodata` linked into `.text`), filed as it is.
+/// An image with no mapping symbols says nothing, and the Thumb pointer, by far
+/// the commoner of the two, is assumed.
+fn thumb_target(v: u64, st: &State, markers: &[(u64, u8)]) -> u64 {
+    let entry = v & !1;
+    if st.decoded.contains(&entry) || st.funcs.contains(&entry) {
+        return entry;
+    }
+    let at = markers.partition_point(|&(a, _)| a <= entry);
+    match at.checked_sub(1).map(|i| markers[i].1) {
+        Some(b'd' | b'a') => v,
+        _ => entry,
+    }
+}
+
+/// (kuna) `picpool`: the ARM mapping symbols (`$a`, `$t`, `$d`), by address.
+fn mapping_markers(file: &object::File) -> Vec<(u64, u8)> {
+    let mut out: Vec<(u64, u8)> = file
+        .symbols()
+        .filter_map(|sym| Some((sym.address(), mapping_kind(sym.name().ok()?)?)))
+        .collect();
+    out.sort_unstable();
+    out
+}
+
+/// The kind byte of an ARM mapping symbol name (`$a`, `$t`, `$d`, or one of
+/// them followed by `.` and anything), read by byte so no other name can split
+/// a character.
+fn mapping_kind(name: &str) -> Option<u8> {
+    match name.as_bytes() {
+        [b'$', kind @ (b'a' | b't' | b'd')] | [b'$', kind @ (b'a' | b't' | b'd'), b'.', ..] => Some(*kind),
+        _ => None,
     }
 }
 
@@ -1744,19 +1905,35 @@ fn assembly(translate: &dyn Translate, vma: u64, code_space: &Rc<AddrSpace>) -> 
 /// exposed as `forwardsTo`; [`XrefIndex::refs_to_unified`] still removes it from
 /// inbound alias-class queries so it is not counted as an external caller.
 ///
-/// `fall_through` (`vma + len`) is skipped as a value for the same reason: a
-/// call materializes its own return address, and every architecture spells that
-/// as this instruction's fall-through — x86 stores the constant to the stack,
-/// ARM copies it into `LR`, MIPS into `$ra`. Reported, it would put a phantom
-/// data reference on the instruction after every single call site.
+/// `fall_through` (`vma + len`) is skipped as a value where it is a return
+/// address ([`is_return_address`]): a call materializes the address it returns
+/// to, and every architecture spells that as this instruction's fall-through —
+/// x86 stores the constant to the stack, ARM copies it into `LR`, MIPS into
+/// `$ra`. Reported, it would put a phantom data reference on the instruction
+/// after every single call site. AArch64 spells it as a sum instead — `bl` and
+/// `blr` lift `x30 = inst_start + 4` to one `INT_ADD` of two constants — so in
+/// an instruction that [`links`], an op that adds two constants into the
+/// fall-through is the same return address, and neither half of it (the first
+/// is the `bl`'s own address) is a reference. `delayed` says whether the
+/// instruction ends past a delay slot ([`has_delay_slot`]); it is asked only of
+/// an instruction that moves its fall-through whole and does not branch
+/// ([`links`], [`branches`]).
+///
+/// A constant below the `checkOperands` floor is still an address where the
+/// instruction computed it from its own address: `formed`, the values
+/// [`super::kuna_pcform`] recomputes from the encoding (`adr`, `lea [rip]`).
 fn data_refs(
     ops: &[FullOp],
     data_space: Option<&Rc<AddrSpace>>,
     mapped: &[(u64, u64)],
     fall_through: u64,
     pool: Option<&PoolImage>,
+    formed: &Formed,
+    delayed: &dyn Fn() -> bool,
 ) -> Vec<(u64, XrefKind)> {
     let mut out = Vec::new();
+    let linked = links(ops);
+    let never_taken = || !branches(ops) && delayed();
     // (kuna) `poolref`: the second edge a literal-pool load forms, from this same
     // instruction to the address the pool word holds. See [`super::kuna_poolref`].
     // `width` is how many bytes the instruction READ, which a `LOAD`'s address
@@ -1784,6 +1961,9 @@ fn data_refs(
             if in_data_space(vn) {
                 out.push((vn.offset, XrefKind::Write));
             }
+        }
+        if linked && is_return_address_sum(op, fall_through) {
+            continue;
         }
         for (i, vn) in op.ins.iter().enumerate() {
             let is_target_slot = i == 0
@@ -1816,7 +1996,7 @@ fn data_refs(
                 continue;
             }
             let value = vn.offset;
-            if !looks_like_address(value) || !in_range(mapped, value) {
+            if !(looks_like_address(value) || formed.contains(value)) || !in_range(mapped, value) {
                 continue;
             }
             let kind = match op.opcode {
@@ -1824,8 +2004,11 @@ fn data_refs(
                 OpCode::CPUI_STORE if i == 1 => XrefKind::Write,
                 _ => XrefKind::Data,
             };
-            if kind == XrefKind::Data && value == fall_through {
-                continue; // this call's own return address
+            if kind == XrefKind::Data
+                && value == fall_through
+                && is_return_address(op, i, linked, &never_taken)
+            {
+                continue;
             }
             out.push((value, kind));
             if kind == XrefKind::Read {
@@ -1836,6 +2019,84 @@ fn data_refs(
     out.sort_unstable();
     out.dedup();
     out
+}
+
+/// Does this instruction leave a return address behind? It does when it
+/// transfers control — a `CALL`/`CALLIND`, a `BRANCH` to an address, a
+/// `BRANCHIND`, or a `CALLOTHER` trap — since whatever it writes that equals its
+/// fall-through is where control comes back. Not every link is a `CALL`: x86's
+/// `call $+5` lifts to a push and a `BRANCH`, PowerPC's `bcl 20,31,$+4` and
+/// RISC-V's `jal t0` to a link-register write and a `BRANCH`, a RISC-V PLT
+/// entry's `jalr t1,t3` to a `BRANCHIND`, and x86-64's `syscall` saves it in
+/// `RCX` beside a `CALLOTHER`. A p-code-relative `BRANCH` stays inside the
+/// instruction and transfers nothing.
+pub(super) fn links(ops: &[FullOp]) -> bool {
+    ops.iter().any(|op| match op.opcode {
+        OpCode::CPUI_CALL | OpCode::CPUI_CALLIND | OpCode::CPUI_BRANCHIND | OpCode::CPUI_CALLOTHER => {
+            true
+        }
+        OpCode::CPUI_BRANCH => op.ins.first().is_some_and(|vn| {
+            vn.space.as_ref().is_some_and(|s| s.get_type() != spacetype::IPTR_CONSTANT)
+        }),
+        _ => false,
+    })
+}
+
+/// Is the constant `op` takes in `slot`, which equals the instruction's
+/// fall-through, the return address the instruction leaves rather than an
+/// address it forms (GH #1360)? An instruction that [`links`] (`linked`) leaves
+/// one. One that does not forms its fall-through only where it moves that
+/// constant whole — `adr x0,.+4` and `lea rax,[rip]` copy it into a register,
+/// `push offset next` stores it — and is no branch. A fall-through combined
+/// with another constant is one half of a link value: A32 `mov lr,pc` lifts to
+/// `lr = inst_next + 4` for the `bx` after it, microMIPS `bgezal` to `ra =
+/// inst_next | 1`. MIPS `nal` (`bltzal $zero`) is a branch never taken, which
+/// lifts to nothing but `ra = inst_next`; only a delay slot behind an
+/// instruction with no branch (`never_taken`) says it is one, on MIPS64 as on
+/// MIPS32. A delay slot behind a branch is just another instruction: SuperH
+/// `rts; mova` forms the address after it.
+fn is_return_address(op: &FullOp, slot: usize, linked: bool, never_taken: &dyn Fn() -> bool) -> bool {
+    let whole = op.ins.len() == 1 || (op.opcode == OpCode::CPUI_STORE && slot == 2);
+    linked || !whole || never_taken()
+}
+
+/// Does the instruction leave for an address other than by [`links`]: a
+/// `CBRANCH` there, or a `RETURN`? A p-code-relative `CBRANCH` (MIPS `movz`)
+/// stays inside the instruction.
+fn branches(ops: &[FullOp]) -> bool {
+    ops.iter().any(|op| match op.opcode {
+        OpCode::CPUI_RETURN => true,
+        OpCode::CPUI_CBRANCH => op.ins.first().is_some_and(|vn| {
+            vn.space.as_ref().is_some_and(|s| s.get_type() != spacetype::IPTR_CONSTANT)
+        }),
+        _ => false,
+    })
+}
+
+/// Does the instruction at `vma` end past a delay slot? Its `len` is where it
+/// falls through to, and only a branch has a slot between its own encoding and
+/// that address.
+fn has_delay_slot(translate: &dyn Translate, vma: u64, code_space: &Rc<AddrSpace>, len: u32) -> bool {
+    let addr = Address::new(Rc::clone(code_space), vma);
+    let own = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        translate.instruction_length(&addr)
+    }));
+    matches!(own, Ok(Ok(n)) if n > 0 && (n as u32) < len)
+}
+
+/// Does `op` add two constants into `fall_through` (AArch64's `x30 =
+/// inst_start + 4`)? Only a link's value: a Thumb-2 `vldr s0,[pc,#8]` reads
+/// `pc` as the same sum, and that is not a return address. See [`data_refs`].
+fn is_return_address_sum(op: &FullOp, fall_through: u64) -> bool {
+    let constant = |vn: &VarnodeData| {
+        vn.space.as_ref().is_some_and(|s| s.get_type() == spacetype::IPTR_CONSTANT)
+    };
+    let (Some(out), [a, b]) = (&op.out, op.ins.as_slice()) else { return false };
+    let mask = if out.size >= 8 { u64::MAX } else { (1u64 << (8 * out.size)) - 1 };
+    op.opcode == OpCode::CPUI_INT_ADD
+        && constant(a)
+        && constant(b)
+        && a.offset.wrapping_add(b.offset) & mask == fall_through
 }
 
 /// How many single-instruction `COPY`s may stand between a `CALLIND` and the
@@ -1898,6 +2159,13 @@ pub(super) fn looks_like_address(value: u64) -> bool {
 /// does. Only the no-section-table arm takes the fallback: an image that has
 /// sections which are not the runtime layout (a relocatable object) is declined
 /// before this is ever called.
+///
+/// (kuna) A Mach-O section carries no allocation bit, and `object` classifies
+/// only a dozen `(segment, section)` name pairs, so `__DATA_CONST,__got`,
+/// `__la_symbol_ptr`, `__DATA_CONST,__const`, `__cfstring`, `__objc_selrefs` and
+/// `__TEXT,__stubs` read as unknown and every reference into them was dropped
+/// (GH #1376). dyld maps every section of a loaded segment, so on Mach-O each
+/// section is mapped except a debug one.
 fn mapped_ranges(file: &object::File) -> Vec<(u64, u64)> {
     let mut out = Vec::new();
     if file.sections().next().is_none() {
@@ -1921,6 +2189,9 @@ fn mapped_ranges(file: &object::File) -> Vec<(u64, u64)> {
         }
         let allocated = match sec.flags() {
             object::SectionFlags::Elf { sh_flags } => sh_flags & SHF_ALLOC != 0,
+            object::SectionFlags::MachO { flags } => {
+                flags & object::macho::S_ATTR_DEBUG == 0 && sec.kind() != SectionKind::Debug
+            }
             _ => matches!(
                 sec.kind(),
                 SectionKind::Text
@@ -1971,6 +2242,19 @@ mod tests {
 
     use super::*;
 
+    /// Only `$a`, `$t`, `$d` and their `.`-suffixed forms are mapping symbols,
+    /// and a `$` name with a multi-byte character after it is read without
+    /// slicing through that character.
+    #[test]
+    fn mapping_symbol_names_are_read_by_byte() {
+        for (name, kind) in [("$a", b'a'), ("$t", b't'), ("$d", b'd'), ("$t.foo", b't'), ("$d.realdata", b'd')] {
+            assert_eq!(mapping_kind(name), Some(kind), "{name}");
+        }
+        for name in ["$", "$x", "$é", "$\u{e9}t", "$ta", "$t_", "t", "", "é"] {
+            assert_eq!(mapping_kind(name), None, "{name:?}");
+        }
+    }
+
     /// A throwaway `(ram, constant)` space pair. `ram` stands in for the default
     /// data space; its index is what [`data_refs`] is told to match.
     fn spaces() -> (Rc<AddrSpace>, Rc<AddrSpace>) {
@@ -2003,7 +2287,7 @@ mod tests {
     /// Run [`data_refs`] with `ram` as the default data space and a fall-through
     /// no op under test materializes.
     fn refs(ram: &Rc<AddrSpace>, ops: &[FullOp]) -> Vec<(u64, XrefKind)> {
-        data_refs(ops, Some(ram), &MAPPED, 0, None)
+        data_refs(ops, Some(ram), &MAPPED, 0, None, &Formed::default(), &|| false)
     }
 
     /// The shape a constant-address memory operand actually lifts to: a direct
@@ -2015,6 +2299,21 @@ mod tests {
         assert_eq!(refs(&ram, &[load]), vec![(0x4014, XrefKind::Read)]);
         let store = op(OpCode::CPUI_COPY, Some(vn(&ram, 0x4010)), vec![]);
         assert_eq!(refs(&ram, &[store]), vec![(0x4010, XrefKind::Write)]);
+    }
+
+    /// GH #1364: below the `checkOperands` floor a mapped constant is a
+    /// reference only where the instruction computed it from its own address
+    /// (`adr x0, 0x378` in a dylib's first page); `mov x0, #0x378` is a number.
+    #[test]
+    fn a_pc_relative_constant_below_the_floor_is_a_reference() {
+        let (ram, cst) = spaces();
+        let low = [(0x300, 0x2000)];
+        let copy = [op(OpCode::CPUI_COPY, None, vec![vn(&cst, 0x378)])];
+        let formed = data_refs(&copy, Some(&ram), &low, 0x3a4, None, &Formed::one(0x378), &|| false);
+        assert_eq!(formed, vec![(0x378, XrefKind::Data)]);
+        assert!(data_refs(&copy, Some(&ram), &low, 0x3a4, None, &Formed::default(), &|| false).is_empty());
+        let unmapped = [op(OpCode::CPUI_COPY, None, vec![vn(&cst, 0x200)])];
+        assert!(data_refs(&unmapped, Some(&ram), &low, 0x3a4, None, &Formed::one(0x200), &|| false).is_empty());
     }
 
     /// A branch/call target is also a data-space varnode, and it is already
@@ -2128,22 +2427,138 @@ mod tests {
     }
 
     /// Every architecture materializes a call's return address as this
-    /// instruction's fall-through — x86 stores it, ARM copies it to `LR`. It is
-    /// never a reference, so it must not survive either spelling.
+    /// instruction's fall-through, and it is never a reference: not beside a
+    /// `CALL` (x86 `call` pushes it, A32 `bl` copies it to `lr`), nor beside the
+    /// `BRANCH` of x86 `call $+5` and PowerPC `bcl 20,31,$+4`, the `BRANCHIND`
+    /// of a RISC-V PLT's `jalr t1,t3`, or x86-64 `syscall`'s `CALLOTHER`; nor
+    /// where nothing branches but the value is a link: A32 `mov lr,pc` adds the
+    /// fall-through to 4, and MIPS `nal` copies it into `ra` from behind a delay
+    /// slot.
     #[test]
     fn a_calls_own_return_address_is_never_a_data_reference() {
         let (ram, cst) = spaces();
-        let arm = [op(OpCode::CPUI_COPY, None, vec![vn(&cst, 0x1104)])];
-        let x86 = [op(
-            OpCode::CPUI_STORE,
-            None,
-            vec![vn(&cst, 0x1b), vn(&ram, 0x4010), vn(&cst, 0x1104)],
-        )];
-        assert!(data_refs(&arm, Some(&ram), &MAPPED, 0x1104, None).is_empty());
-        assert_eq!(
-            data_refs(&x86, Some(&ram), &MAPPED, 0x1104, None),
-            vec![(0x4010, XrefKind::Read)]
-        );
+        let reg = Rc::new(AddrSpace::new_for_decode(spacetype::IPTR_PROCESSOR));
+        let r = |offset| VarnodeData { space: Some(Rc::clone(&reg)), offset, size: 4 };
+        let fall = || vn(&cst, 0x1104);
+        let push = op(OpCode::CPUI_STORE, None, vec![vn(&cst, 0x1b), r(0x10), fall()]);
+        let to_lr = op(OpCode::CPUI_COPY, Some(r(0x58)), vec![fall()]);
+        let call = op(OpCode::CPUI_CALL, None, vec![vn(&ram, 0x1180)]);
+        let to_next = op(OpCode::CPUI_BRANCH, None, vec![vn(&ram, 0x1104)]);
+        let links = [
+            ("x86 call", vec![push.clone(), call.clone()]),
+            ("A32 bl", vec![to_lr.clone(), call]),
+            ("x86 call $+5", vec![push, to_next.clone()]),
+            ("PowerPC bcl 20,31,$+4", vec![to_lr, to_next]),
+            (
+                "RISC-V jalr t1,t3",
+                vec![
+                    op(OpCode::CPUI_COPY, Some(r(0x30)), vec![fall()]),
+                    op(OpCode::CPUI_BRANCHIND, None, vec![r(0xe0)]),
+                ],
+            ),
+            (
+                "x86-64 syscall",
+                vec![
+                    op(OpCode::CPUI_COPY, Some(r(0x8)), vec![fall()]),
+                    op(OpCode::CPUI_CALLOTHER, None, vec![vn(&cst, 5)]),
+                ],
+            ),
+            ("A32 mov lr,pc", vec![op(OpCode::CPUI_INT_ADD, Some(r(0x58)), vec![fall(), vn(&cst, 4)])]),
+        ];
+        for (what, ops) in &links {
+            let decoded = || panic!("{what}: a link needs no second decode");
+            assert!(data_refs(ops, Some(&ram), &MAPPED, 0x1104, None, &Formed::default(), &decoded).is_empty(), "{what}");
+        }
+        let nal = [op(OpCode::CPUI_COPY, Some(r(0x7c)), vec![fall()])];
+        assert!(data_refs(&nal, Some(&ram), &MAPPED, 0x1104, None, &Formed::default(), &|| true).is_empty());
+        let nal_movz = [
+            op(OpCode::CPUI_COPY, Some(r(0x7c)), vec![fall()]),
+            op(OpCode::CPUI_CBRANCH, None, vec![vn(&cst, 2), r(0x200)]),
+        ];
+        assert!(data_refs(&nal_movz, Some(&ram), &MAPPED, 0x1104, None, &Formed::default(), &|| true).is_empty());
+    }
+
+    /// A delay slot behind a branch is an ordinary instruction: SuperH `rts;
+    /// mova` and `bt/s; mova` form the address right after the slot in `r0`.
+    #[test]
+    fn an_address_formed_in_a_branchs_delay_slot_is_a_data_reference() {
+        let (ram, cst) = spaces();
+        let reg = Rc::new(AddrSpace::new_for_decode(spacetype::IPTR_PROCESSOR));
+        let r = |offset| VarnodeData { space: Some(Rc::clone(&reg)), offset, size: 4 };
+        let mova = op(OpCode::CPUI_COPY, Some(r(0)), vec![vn(&cst, 0x1104)]);
+        for (what, flow) in [
+            ("rts", op(OpCode::CPUI_RETURN, None, vec![r(0x188)])),
+            ("bt/s", op(OpCode::CPUI_CBRANCH, None, vec![vn(&ram, 0x1180), r(0x200)])),
+        ] {
+            let ops = [mova.clone(), flow];
+            assert_eq!(
+                data_refs(&ops, Some(&ram), &MAPPED, 0x1104, None, &Formed::default(), &|| true),
+                vec![(0x1104, XrefKind::Data)],
+                "{what}"
+            );
+        }
+    }
+
+    /// An instruction that transfers no control and moves its own fall-through
+    /// whole has formed that address (GH #1360): AArch64 `adr x0,.+4` and x86-64
+    /// `lea rax,[rip]` copy it, `mov eax,offset next` zero-extends it, `push
+    /// offset next` stores it, and a predicated A32 `adreq` only branches to skip
+    /// itself.
+    #[test]
+    fn an_address_formed_at_the_fall_through_is_a_data_reference() {
+        let (ram, cst) = spaces();
+        let reg = Rc::new(AddrSpace::new_for_decode(spacetype::IPTR_PROCESSOR));
+        let r = |offset| VarnodeData { space: Some(Rc::clone(&reg)), offset, size: 4 };
+        let fall = || vn(&cst, 0x1104);
+        let formed = [
+            ("adr x0,.+4", vec![op(OpCode::CPUI_COPY, Some(r(0)), vec![fall()])]),
+            ("mov eax,offset next", vec![op(OpCode::CPUI_INT_ZEXT, Some(r(0)), vec![fall()])]),
+            (
+                "push offset next",
+                vec![
+                    op(OpCode::CPUI_INT_SUB, Some(r(0x10)), vec![r(0x10), vn(&cst, 8)]),
+                    op(OpCode::CPUI_STORE, None, vec![vn(&cst, 0x1b), r(0x10), fall()]),
+                ],
+            ),
+            (
+                "A32 adreq r0,.+4",
+                vec![
+                    op(OpCode::CPUI_CBRANCH, None, vec![vn(&ram, 0x1104), r(0x200)]),
+                    op(OpCode::CPUI_COPY, Some(r(0)), vec![fall()]),
+                ],
+            ),
+        ];
+        for (what, ops) in &formed {
+            assert_eq!(
+                data_refs(ops, Some(&ram), &MAPPED, 0x1104, None, &Formed::default(), &|| false),
+                vec![(0x1104, XrefKind::Data)],
+                "{what}"
+            );
+        }
+    }
+
+    /// An AArch64 `bl`/`blr` lifts its link value as `x30 = inst_start + 4`: the
+    /// sum is the fall-through, so neither constant is the instruction
+    /// referencing itself. A real self-reference (`adr x0,.`), a PC-relative sum
+    /// that is not the fall-through, and the same sum outside a call (Thumb-2's
+    /// `pc` read) are reported as before.
+    #[test]
+    fn an_aarch64_link_value_is_never_a_data_reference() {
+        let (ram, cst) = spaces();
+        let reg = Rc::new(AddrSpace::new_for_decode(spacetype::IPTR_PROCESSOR));
+        let x30 = VarnodeData { space: Some(Rc::clone(&reg)), offset: 0xf0, size: 8 };
+        let x0 = VarnodeData { space: Some(Rc::clone(&reg)), offset: 0, size: 8 };
+        let bl = [
+            op(OpCode::CPUI_INT_ADD, Some(x30), vec![vn(&cst, 0x1100), vn(&cst, 4)]),
+            op(OpCode::CPUI_CALL, None, vec![vn(&ram, 0x1180)]),
+        ];
+        assert!(data_refs(&bl, Some(&ram), &MAPPED, 0x1104, None, &Formed::default(), &|| false).is_empty());
+        let adr = [op(OpCode::CPUI_COPY, Some(x0.clone()), vec![vn(&cst, 0x1100)])];
+        assert_eq!(data_refs(&adr, Some(&ram), &MAPPED, 0x1104, None, &Formed::default(), &|| false), vec![(0x1100, XrefKind::Data)]);
+        let add_pc = [op(OpCode::CPUI_INT_ADD, Some(x0.clone()), vec![vn(&cst, 0x1100), vn(&cst, 0x10)])];
+        assert_eq!(data_refs(&add_pc, Some(&ram), &MAPPED, 0x1104, None, &Formed::default(), &|| false), vec![(0x1100, XrefKind::Data)]);
+        let pc_read = [op(OpCode::CPUI_INT_ADD, Some(x0), vec![vn(&cst, 0x1100), vn(&cst, 4)])];
+        assert_eq!(data_refs(&pc_read, Some(&ram), &MAPPED, 0x1104, None, &Formed::default(), &|| false), vec![(0x1100, XrefKind::Data)]);
     }
 
     /// (kuna) `poolref`: a pointer-sized read of a read-only word files the
@@ -2162,7 +2577,7 @@ mod tests {
             vec![vn(&cst, 0x1b), vn(&ram, 0x1000)],
         );
         assert_eq!(
-            data_refs(&[load], Some(&ram), &MAPPED, 0, Some(&pool)),
+            data_refs(&[load], Some(&ram), &MAPPED, 0, Some(&pool), &Formed::default(), &|| false),
             vec![(0x1000, XrefKind::Read), (0x4000, XrefKind::Data), (0x4020, XrefKind::Write)]
         );
     }
@@ -2182,7 +2597,7 @@ mod tests {
             vec![vn(&cst, 0x1b), vn(&ram, 0x1000)],
         );
         assert_eq!(
-            data_refs(&[load], Some(&ram), &MAPPED, 0, Some(&pool)),
+            data_refs(&[load], Some(&ram), &MAPPED, 0, Some(&pool), &Formed::default(), &|| false),
             vec![(0x1000, XrefKind::Read), (0x4020, XrefKind::Write)]
         );
     }
@@ -2197,7 +2612,7 @@ mod tests {
         src.size = 4;
         let copy = op(OpCode::CPUI_COPY, None, vec![src]);
         assert_eq!(
-            data_refs(&[copy], Some(&ram), &MAPPED, 0, Some(&pool)),
+            data_refs(&[copy], Some(&ram), &MAPPED, 0, Some(&pool), &Formed::default(), &|| false),
             vec![(0x1008, XrefKind::Read), (0x4010, XrefKind::Data)]
         );
     }
@@ -2261,6 +2676,8 @@ mod tests {
             indirect_call_sites: BTreeSet::new(),
             flow: None,
             switches: Vec::new(),
+            refused: HashSet::new(),
+            carry: kuna_regcarry::Tracker::default(),
         };
         for e in edges {
             st.file(e.from, e.to, e.kind, "");
@@ -2318,6 +2735,8 @@ mod tests {
             indirect_call_sites: BTreeSet::from([0x1188]),
             flow: None,
             switches: Vec::new(),
+            refused: HashSet::new(),
+            carry: kuna_regcarry::Tracker::default(),
         };
         st.file(0x1188, 0x4008, XrefKind::Read, "");
         let index = st.finish(BTreeMap::new(), false);
@@ -2353,6 +2772,8 @@ mod tests {
                 seeds: vec![0x3000, 0x1000, 0x3000, 0x2000],
             }),
             switches: Vec::new(),
+            refused: HashSet::new(),
+            carry: kuna_regcarry::Tracker::default(),
         };
         let index = st.finish(BTreeMap::new(), true);
         assert_eq!(index.function_containing(0x1001), Some(0x1000));
@@ -2426,6 +2847,18 @@ mod tests {
             assert!(sections.contains(r), "{r:x?} is not any section's span");
         }
         assert!(!in_range(&mapped, 0), "the ELF header read as mapped data");
+    }
+
+    /// GH #1376: `object` names no kind for `__DATA_CONST,__got`, and dyld maps
+    /// it like every other section of a loaded segment.
+    #[test]
+    fn every_section_of_a_macho_segment_is_mapped() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/gotcall_macho_arm64");
+        let data = std::fs::read(path).unwrap();
+        let file = object::File::parse(&*data).unwrap();
+        let got = file.section_by_name("__got").unwrap();
+        assert_eq!(got.kind(), SectionKind::Unknown, "object learned the section's kind");
+        assert!(in_range(&range_union(mapped_ranges(&file)), got.address()), "the GOT slot reads as unmapped");
     }
 
     /// `sort_dedup` collapses the `(from, to, kind)` triple: one row per site.

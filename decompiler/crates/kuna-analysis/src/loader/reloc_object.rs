@@ -223,6 +223,9 @@ pub struct RelocLayout {
     /// VMA plus each external call target.  Feeds `ObjectLoadImage::funcsyms`
     /// (demangle + dedup happen there, as on the linked path).
     pub funcsyms: Vec<(u64, Vec<u8>)>,
+    /// `(addr, size)` of each defined function symbol whose symbol table
+    /// states a size, the largest when two share an address.
+    pub funcsizes: Vec<(u64, u64)>,
     /// Non-fatal relocation diagnostics, aggregated with bounded samples. The
     /// caller prints one report for the load; analysis-side layout reuse stays
     /// silent.
@@ -477,6 +480,7 @@ pub fn layout_relocatable(file: &object::File, fmt: &dyn ObjectFormat) -> RelocL
 
     // --- Function symbols: defined (rebased) + extern call targets.
     let mut funcsyms: Vec<(u64, Vec<u8>)> = Vec::new();
+    let mut funcsizes: Vec<(u64, u64)> = Vec::new();
     let mut symbol_info: Vec<RelocSymbolInfo> = Vec::new();
     for sym in file.symbols() {
         if sym.kind() != SymbolKind::Text {
@@ -509,7 +513,12 @@ pub fn layout_relocatable(file: &object::File, fmt: &dyn ObjectFormat) -> RelocL
             undefined: false,
         });
         funcsyms.push((vma, name));
+        if sym.size() > 0 {
+            funcsizes.push((vma, sym.size()));
+        }
     }
+    funcsizes.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+    funcsizes.dedup_by_key(|s| s.0);
     // Extern functions: name each external *code target* at its synthetic slot
     // so `call ext` renders by name instead of a bare address. A code target is
     // an undefined symbol reached through a PLT-relative reloc (reliable even for
@@ -552,6 +561,7 @@ pub fn layout_relocatable(file: &object::File, fmt: &dyn ObjectFormat) -> RelocL
         segments,
         sections,
         funcsyms,
+        funcsizes,
         diagnostics,
         section_vma: vma_of,
         extern_addr: extern_of,
@@ -607,10 +617,15 @@ fn resolve_symbol(
                     thumb: None,
                 });
             }
-            let is_elf_common = sym.section() == SymbolSection::Common
-                && file.format() == object::BinaryFormat::Elf;
-            let a = if is_elf_common {
-                common_allocator.allocate(sym.size(), sym.address())?
+            let common_alignment = match (sym.section(), file.format()) {
+                (SymbolSection::Common, object::BinaryFormat::Elf) => Some(sym.address()),
+                // COFF records the size, but no separate alignment. Give its
+                // synthetic storage a conservative 16-byte alignment.
+                (SymbolSection::Common, object::BinaryFormat::Coff) => Some(16),
+                _ => None,
+            };
+            let a = if let Some(alignment) = common_alignment {
+                common_allocator.allocate(sym.size(), alignment)?
             } else {
                 let a = *extern_cursor;
                 *extern_cursor = extern_cursor.wrapping_add(16);

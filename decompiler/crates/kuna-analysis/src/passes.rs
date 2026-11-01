@@ -88,6 +88,10 @@ pub fn passes_for(compiler: Compiler, format: object::BinaryFormat) -> Vec<Box<d
         // `--option libcsigs on|off` via `engine.rs::analysis_pass_enabled`, so `off`
         // is byte-identical to the base table alone.
         Box::new(crate::protos::kuna_libcsigs::LibcSigsPass),
+        // S1 libgcc DI-mode contracts (`libgccsigs`): `long long __divdi3(long long,
+        // long long)` on SPARC32 BE ELF. Registered always; the COMMIT is gated by
+        // `--option libgccsigs on|off` (default off) via `analysis_pass_enabled`.
+        Box::new(crate::protos::kuna_libgcc::LibgccSigsPass),
         // S1 built-in Win32 API signatures (`win32sigs`): the Windows half of the
         // `.gdt` stand-in, which nothing in the tree carried. PE/COFF only, and
         // keyed by ENTRY ADDRESS rather than by name -- a PE import is TWO
@@ -394,7 +398,33 @@ pub fn passes_for(compiler: Compiler, format: object::BinaryFormat) -> Vec<Box<d
     // facts idempotently (a real `.symtab` name still wins, so only a *stripped*
     // Go binary's `sub_<addr>` functions take the recovered name).
     if compiler.is_golang() {
+        // (kuna `fatstr`) The Go arm of the string-record pass: the same
+        // (ptr, len) record shape rustc emits, with the slots widened to the
+        // Go data image (.data/.noptrdata). FIRST in the Go block so
+        // `gopclntab` keeps its appended-last contract. Committed under the
+        // same `fatstr` mode gate as the rustc arm.
+        passes.push(Box::new(crate::strings::kuna_strrecords::StrRecordPass::go()));
+        // (kuna `gonoreturn`) BEFORE `gopclntab`, preserving that pass's
+        // appended-last contract: apply the vendored Go no-return list to the
+        // pclntab's own function list, so a STRIPPED Go binary (no .symtab for
+        // `noreturn_known` to scan) still gets its runtime.panic*/throw/goexit
+        // facts. Go-only: a structural no-op on every other binary.
+        passes.push(Box::new(crate::pclntab::kuna_gonoreturn::GoNoReturnPass));
+        // (kuna `gotypes`) The runtime-type harvest — BEFORE `gopclntab`,
+        // preserving that pass's appended-last contract. Env-bridged
+        // (`KUNA_GOTYPES`): the shells are interned at load, so the gate is
+        // read in the pass itself, like `dwarfstructs`.
+        passes.push(Box::new(crate::gotypes::GoTypesPass));
         passes.push(Box::new(crate::pclntab::GoPclntabPass));
+    }
+    // (kuna `fatstr`) Rust-only: length-bounded string facts from static
+    // `(ptr, len)` records (`strings::kuna_strrecords`), the analysis-side half
+    // of the fatstr option. Registered ONLY for `Compiler::Rustc`, so every
+    // non-Rust binary's pass set is byte-identical to before; committed under
+    // the `fatstr` mode gate (`Architecture::fat_str`), so `--option fatstr
+    // off` drops the facts at the read-symbols boundary.
+    if compiler.is_rust() {
+        passes.push(Box::new(crate::strings::kuna_strrecords::StrRecordPass::rust()));
     }
 
     // S1 PE/Mach-O import-slot call binding (PeImportCallPass): paint
@@ -696,6 +726,19 @@ pub fn run_listing_consumers_replaying(
         return Vec::new();
     }
     let mut seeds = listing_seeds_for_language(&file, bytes, Some(arch.get_description()));
+    // (kuna `gowalkprune`) The fast inventory walk leaves out the functions a Go
+    // pclntab names, but only where the `gopclntab` pass ran and commits them:
+    // the pass set follows the load-time verdict, not a later `sourcelang` force.
+    // See `pclntab::function_entries`.
+    if arch.analysis_gowalkprune
+        && arch.analysis_fast_funcdisc
+        && !arch.analysis_listing
+        && arch.analysis_gopclntab
+        && arch.source_lang_detected == kuna_decomp::kuna_sourcelang::SourceLang::Go
+    {
+        let go = crate::pclntab::function_entries(&file);
+        seeds.retain(|seed| go.binary_search(seed).is_err());
+    }
     let bracket_evidence = std::cell::OnceCell::new();
     let bracket = |exec: &[(u64, u64)]| arch.analysis_aifbracket.then(|| {
         bracket_evidence.get_or_init(|| crate::aif::kuna_aifbracket::BracketEvidence::from_object(&file, exec))
@@ -1408,7 +1451,7 @@ pub fn run_default_analyses(
     // Source-language detection runs once, before pass selection, and shapes the
     // pass list (the kuna analog of `SourceLanguageAnalyzer` running early and
     // gating the language-specific analyzers).
-    let compiler = crate::sourcelang::detect_compiler(&file, bytes);
+    let compiler = crate::sourcelang::effective_compiler(&file, bytes);
     // Listing/xref tier (design §1.3): built once, before the pass loop, only
     // when `--option listing on` (default-off ⇒ `None` ⇒ no decode work, byte
     // -identical to today). Owned here so it outlives the pass loop, borrowed
@@ -1457,7 +1500,7 @@ pub fn run_default_analyses_per_pass(
     // below produces an already-rebased fact. `None` ⇒ the raw pre-link view.
     let view = crate::loader::kuna_relocrebase::rebased_view(&raw, bytes);
     let (file, bytes) = crate::loader::kuna_relocrebase::select(raw, bytes, &view);
-    let compiler = crate::sourcelang::detect_compiler(&file, bytes);
+    let compiler = crate::sourcelang::effective_compiler(&file, bytes);
     // Listing/xref tier (design §1.3): built once, before the pass loop, only
     // when `arch.analysis_listing` (i.e. `--option listing on`). Default-off ⇒
     // `.then(...)` is `None` ⇒ no decode work, `ctx.listing == None`, and the
@@ -1631,30 +1674,48 @@ mod tests {
         }
     }
 
-    /// All NON-Go compilers select the same pass set (Rust differs only in the
-    /// no-return pass's folded-in list, not the pass *ids*). Go additionally
-    /// carries the `gopclntab` pass (Go-only, appended last); every other compiler
-    /// is byte-identical to the Gcc base.
+    /// Compilers with no language pack select the same pass set. Go carries its
+    /// two Go-only passes (the next test), and Rust appends `fatstrrecords`
+    /// (the `&str`-record string pass) — exactly one pass, at the end, so the
+    /// base set is byte-identical underneath.
     #[test]
     fn non_go_compilers_have_same_pass_ids() {
         let base = ids(&passes_for(Compiler::Gcc, NON_PE));
-        for c in [Compiler::Rustc, Compiler::Clang, Compiler::Unknown] {
+        for c in [Compiler::Clang, Compiler::Swift, Compiler::Unknown] {
             assert_eq!(ids(&passes_for(c, NON_PE)), base, "{c:?} pass ids must match the base set");
+        }
+        let rust = ids(&passes_for(Compiler::Rustc, NON_PE));
+        assert_eq!(&rust[..base.len()], &base[..], "Rust set is the base set + extras");
+        assert_eq!(rust.last(), Some(&"fatstrrecords"), "Rust appends the record pass");
+        assert_eq!(rust.len(), base.len() + 1, "Rust adds exactly one pass");
+        // No compiler without a string-record arm carries the record pass
+        // (Go carries it too — the next test).
+        for c in [Compiler::Gcc, Compiler::Clang, Compiler::Swift, Compiler::Unknown] {
+            assert!(!ids(&passes_for(c, NON_PE)).contains(&"fatstrrecords"), "{c:?} must not carry fatstrrecords");
         }
     }
 
-    /// The Go pass set is exactly the base set plus the `gopclntab` pass appended
-    /// (the Go-only function-name recovery); no other compiler carries it.
+    /// The Go pass set is exactly the base set plus the four Go-arm passes:
+    /// `fatstrrecords` (the string-record pass's Go arm), then `gonoreturn`
+    /// (the pclntab no-return list), then `gotypes` (the runtime-type
+    /// harvest), then `gopclntab` (the function-name recovery, keeping its
+    /// appended-last contract); no other compiler carries the Go-only ones.
     #[test]
-    fn go_adds_only_gopclntab_pass() {
+    fn go_adds_only_the_four_go_passes() {
         let base = ids(&passes_for(Compiler::Gcc, NON_PE));
         let go = ids(&passes_for(Compiler::Go, NON_PE));
         assert_eq!(&go[..base.len()], &base[..], "Go set is the base set + extras");
-        assert_eq!(go.last(), Some(&"gopclntab"), "Go appends the gopclntab pass");
-        assert_eq!(go.len(), base.len() + 1, "Go adds exactly one pass");
-        // No non-Go compiler carries the gopclntab pass.
-        for c in [Compiler::Gcc, Compiler::Rustc, Compiler::Clang, Compiler::Unknown] {
-            assert!(!ids(&passes_for(c, NON_PE)).contains(&"gopclntab"), "{c:?} must not carry gopclntab");
+        assert_eq!(go.last(), Some(&"gopclntab"), "Go appends the gopclntab pass last");
+        assert_eq!(go.get(go.len() - 2), Some(&"gotypes"), "gotypes precedes gopclntab");
+        assert_eq!(go.get(go.len() - 3), Some(&"gonoreturn"), "gonoreturn precedes gotypes");
+        assert_eq!(go.get(go.len() - 4), Some(&"fatstrrecords"), "the record pass opens the Go block");
+        assert_eq!(go.len(), base.len() + 4, "Go adds exactly four passes");
+        // No non-Go compiler carries the Go-only passes.
+        for c in [Compiler::Gcc, Compiler::Rustc, Compiler::Clang, Compiler::Swift, Compiler::Unknown] {
+            let set = ids(&passes_for(c, NON_PE));
+            assert!(!set.contains(&"gopclntab"), "{c:?} must not carry gopclntab");
+            assert!(!set.contains(&"gonoreturn"), "{c:?} must not carry gonoreturn");
+            assert!(!set.contains(&"gotypes"), "{c:?} must not carry gotypes");
         }
     }
 

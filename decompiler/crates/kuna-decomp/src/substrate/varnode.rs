@@ -36,7 +36,7 @@ use kuna_base::address::{mach_extreme, Address, SeqNum};
 use kuna_base::error::{KunaError, KunaResult};
 use kuna_base::space::{spacetype, AddrSpace, AddrSpaceManager};
 use kuna_base::types::{int2, int4, uint2, uint4, uintb, uintm, Wrap};
-use slotmap::SlotMap;
+use crate::kuna_checkedarena::Arena;
 use smallvec::SmallVec;
 
 use crate::cover::{Cover, CoverContext};
@@ -520,11 +520,6 @@ pub struct Varnode {
     // Heritage fields
     /// The defining operation (C++ `PcodeOp *def`; `None` == null)
     def: Option<OpId>,
-    /// Cached `SeqNum` of the defining op (C++ reads it live via
-    /// `def->getSeqNum()`; the SeqNum is immutable for a given def, so the
-    /// comparator keys cache it here to stay self-contained without the
-    /// op arena — STUB(W3): set alongside `def`, kept in sync by the bank).
-    def_seqnum: Option<SeqNum>,
     /// High-level variable of which this is an instantiation (STUB(W7))
     high: Option<HighVariableId>,
     /// Datatype associated with this varnode (STUB(W6): minimal skeleton)
@@ -567,7 +562,6 @@ impl Varnode {
             addlflags: 0,
             loc: m,
             def: None,
-            def_seqnum: None,
             high: None,
             type_: dt,
             temp_type: None,
@@ -1025,6 +1019,7 @@ impl Varnode {
             == varnode_flags::insert
     }
     /// C++ `hasNoDescend`.
+    #[inline]
     pub fn has_no_descend(&self) -> bool {
         self.descend.is_empty()
     }
@@ -1301,7 +1296,6 @@ impl Varnode {
 
     fn set_free(&mut self) {
         self.set_def(None);
-        self.def_seqnum = None;
         self.clear_flags(
             varnode_flags::insert | varnode_flags::input | varnode_flags::indirect_creation,
         );
@@ -1583,7 +1577,7 @@ pub struct VarnodeBank {
     /// Number of varnodes created (C++ `create_index`)
     create_index: uint4,
     /// The varnode arena (ADR 0001): the bank owns the store
-    arena: SlotMap<VarnodeId, Varnode>,
+    arena: Arena<VarnodeId, Varnode>,
     /// Varnodes sorted by location then def (C++ `loc_tree`)
     loc_tree: BTreeMap<LocKey, VarnodeId>,
     /// Inputs and written Varnodes sorted by def then location (C++ `def_tree`).
@@ -1619,7 +1613,7 @@ impl VarnodeBank {
             uniqbase: uniq_start,
             uniqid: uniq_start,
             create_index: 0,
-            arena: SlotMap::with_key(),
+            arena: Arena::with_key(),
             loc_tree: BTreeMap::new(),
             def_tree: BTreeMap::new(),
             uniq_space,
@@ -1653,10 +1647,12 @@ impl VarnodeBank {
     }
 
     /// Borrow a Varnode by id.
+    #[inline(always)]
     pub fn get(&self, id: VarnodeId) -> Option<&Varnode> {
         self.arena.get(id)
     }
     /// Mutably borrow a Varnode by id.
+    #[inline(always)]
     pub fn get_mut(&mut self, id: VarnodeId) -> Option<&mut Varnode> {
         self.arena.get_mut(id)
     }
@@ -1770,8 +1766,8 @@ impl VarnodeBank {
             self.def_tree.remove(&DefKey::from(lk));
         }
         self.arena[vn].set_input_flag(); // Set the input flag
-        let seqnum = self.arena[vn].def_seqnum.as_ref().map(SeqKey::of).unwrap_or_default();
-        let lk = lk.with_class(flag_class_of(varnode_flags::input), seqnum);
+        // A free Varnode has no defining op, so its def sequence is the null one.
+        let lk = lk.with_class(flag_class_of(varnode_flags::input), SeqKey::default());
         self.xref(vn, lk, replace_reads)
     }
 
@@ -1800,7 +1796,6 @@ impl VarnodeBank {
         }
         self.arena[vn].set_def(Some(def.id)); // Change the varnode to be defined
         let seqnum = SeqKey::of(&def.seqnum);
-        self.arena[vn].def_seqnum = Some(def.seqnum);
         let lk = lk.with_class(flag_class_of(varnode_flags::written), seqnum);
         self.xref(vn, lk, replace_reads)
     }
@@ -1850,7 +1845,6 @@ impl VarnodeBank {
         vn.create_index = self.create_index;
         self.create_index = self.create_index.wadd(1);
         vn.set_def(Some(def.id));
-        vn.def_seqnum = Some(def.seqnum);
         let id = self.arena.insert(vn);
         self.xref(id, lk, replace_reads)
     }
@@ -2474,6 +2468,32 @@ mod tests {
         |_: &mut VarnodeBank, _: VarnodeId, _: VarnodeId| -> KunaResult<()> { Ok(()) }
     }
 
+    #[test]
+    fn accessors_keep_id_validity() {
+        let m = build_manager();
+        let mut bank = VarnodeBank::new(&m, 0).unwrap();
+        let addr = Address::new(space(&m, 2), 0x800);
+        let stale = bank.create(4, addr.clone(), dt(4));
+        bank.get_mut(stale).unwrap().set_consume(7);
+        assert_eq!(bank.get(stale).unwrap().get_consume(), 7);
+        bank.destroy(stale).unwrap();
+        assert!(bank.get(stale).is_none());
+        assert!(bank.get_mut(stale).is_none());
+
+        let live = bank.create(4, addr, dt(4));
+        assert_ne!(stale, live);
+        let null = <VarnodeId as slotmap::Key>::null();
+        for id in [stale, null] {
+            assert!(bank.get(id).is_none());
+            assert!(bank.get_mut(id).is_none());
+        }
+        assert!(bank.get(live).is_some());
+        assert!(bank.get_mut(live).is_some());
+        bank.clear();
+        assert!(bank.get(live).is_none());
+        assert!(bank.get_mut(live).is_none());
+    }
+
     // -- Reference comparators: a literal re-transcription of varnode.cc:34-79
     //    used to cross-check LocKey/DefKey::cmp exhaustively. `seq_a != seq_b`
     //    and `seq_a < seq_b` use SeqNum's own (uniq-only Eq, (pc,uniq) Ord),
@@ -2916,6 +2936,7 @@ mod tests {
         let m = build_manager();
         let mut bank = VarnodeBank::new(&m, 0).unwrap();
         let mut idc = 0;
+        let mut defs: BTreeMap<VarnodeId, SeqNum> = BTreeMap::new();
         for i in 0..48 {
             let addr = Address::new(space(&m, 2), (i % 6) * 16);
             let id = bank.create(1 << (i % 4), addr, dt(1 << (i % 4)));
@@ -2923,7 +2944,9 @@ mod tests {
                 bank.set_input(id, &mut no_replace()).unwrap();
             } else if i % 3 == 1 {
                 let def = def_info(&mut idc, Address::new(space(&m, 2), i * 4), i as uint4 + 1);
-                bank.set_def(id, def, &mut no_replace()).unwrap();
+                let seqnum = def.seqnum.clone();
+                let id = bank.set_def(id, def, &mut no_replace()).unwrap();
+                defs.insert(id, seqnum);
             }
         }
         for pass in 0..3 {
@@ -2935,7 +2958,7 @@ mod tests {
                         v.loc.clone(),
                         v.size,
                         v.flags,
-                        v.def_seqnum.clone().unwrap_or_default(),
+                        defs.get(&id).cloned().unwrap_or_default(),
                         v.create_index,
                     );
                     (key, id)
@@ -2984,6 +3007,7 @@ mod tests {
             let written: Vec<_> = bank.iter_def_flag(varnode_flags::written).take(3).collect();
             for id in written {
                 bank.make_free(id);
+                defs.remove(&id);
             }
             let free = bank.iter_def_flag(0).next().unwrap();
             bank.destroy(free).unwrap();

@@ -96,8 +96,9 @@ const RUN_RERUN_FAILURES: usize = 16;
 /// Test-only fault injection, comma-separated: `panic:<addr>` panics a worker
 /// as it starts the target at `<addr>`, `panic-once:<addr>` only the first time
 /// in a run, `stall:<addr>` wedges it there until the stall watchdog kills it,
-/// `spawn:<n>` refuses every worker spawn after the first `n`, `load-abort:<n>`
-/// aborts the first `n` worker loads of the run (`*` every one) the way a
+/// `stall-again:<addr>` only the second time in a run, `spawn:<n>` refuses
+/// every worker spawn after the first `n`, `load-abort:<n>` aborts the first
+/// `n` worker loads of the run (`*` every one) the way a
 /// refused allocation does, before the worker reaches its first chunk,
 /// `synth:serial` names synthesized structures by the one-worker serial path,
 /// `synth:force` renames no function and `synth:noinstall` makes a worker
@@ -218,6 +219,18 @@ pub(crate) struct PoolConfig<'a> {
     /// (kuna `armframes`) The parent's frame-recovery record, which a worker
     /// replays instead of searching the image again.
     pub(crate) arm_frames: Option<String>,
+    /// Told about the first decompile of every target as its chunk lands — the
+    /// `decompile-project --progress` feed.
+    pub(crate) watch: Option<&'a dyn PoolWatch>,
+}
+
+/// What a [`run_pool`] reports while it runs, before its results are merged.
+pub(crate) trait PoolWatch: Sync {
+    /// The workers the memory trim left the first pass.
+    fn workers(&self, n: usize);
+    /// A chunk's first-pass records.  A structure-naming pass that decompiles
+    /// some of them again later is not reported.
+    fn landed(&self, results: &[FuncResult]);
 }
 
 /// How many decode lanes `--jobs` asks the discovery walk for.
@@ -314,6 +327,7 @@ pub(crate) fn run_pool(
     let first = Phase {
         synth: if cfg.synth_base.is_some() { SynthWorker::Record } else { SynthWorker::Off },
         table: None,
+        watch: cfg.watch,
     };
     // Dispatch order is NOT output order: work is planned longest-first into
     // equal-work chunks, and every result is filed by its slot index, so the
@@ -362,6 +376,9 @@ fn run_planned(
 ) -> Result<PlannedRun, String> {
     let total = targets.len();
     let workers = jobs.min(plan.len());
+    if let Some(watch) = phase.watch {
+        watch.workers(workers);
+    }
     let banner = banner(&plan, workers);
     let source = PlannedChunks { plan, cursor: AtomicUsize::new(0) };
     let slots: Mutex<Vec<Option<FuncResult>>> = Mutex::new((0..total).map(|_| None).collect());
@@ -373,6 +390,9 @@ fn run_planned(
         &source,
         &PoolReport { tag: JOBS_TAG, banner, workers, finish_delivered: false },
         &|indices: &[usize], produced: Vec<FuncResult>| {
+            if let Some(watch) = phase.watch {
+                watch.landed(&produced);
+            }
             let mut slots = slots.lock().unwrap_or_else(|e| e.into_inner());
             for (&slot, r) in indices.iter().zip(produced) {
                 slots[slot] = Some(r);
@@ -393,6 +413,7 @@ fn run_planned(
 struct Phase<'t> {
     synth: SynthWorker,
     table: Option<&'t [u8]>,
+    watch: Option<&'t dyn PoolWatch>,
 }
 
 /// The `--stream` pool: the same workers over a caller-supplied dynamic
@@ -429,7 +450,7 @@ pub(crate) fn run_pool_streaming(
     let retries = run_pool_with(
         cfg,
         &session,
-        &Phase { synth: SynthWorker::Off, table: None },
+        &Phase { synth: SynthWorker::Off, table: None, watch: None },
         targets,
         source,
         &PoolReport { tag: STREAM_TAG, banner, workers, finish_delivered: true },
@@ -840,8 +861,10 @@ enum Ending {
     NotRun,
     /// The worker exited, or the stall watchdog killed it, first.  `started`:
     /// it had opened this chunk's result file, which it does after its load,
-    /// its spec and its rehydration, just before its first target.
-    Died { stalled: bool, started: bool },
+    /// its spec and its rehydration, just before its first target.  `running`:
+    /// the chunk position it last said it was starting, from a worker that
+    /// holds its records back ([`SynthWorker::Serial`]).
+    Died { stalled: bool, started: bool, running: Option<usize> },
 }
 
 impl Ending {
@@ -902,7 +925,10 @@ impl Reruns {
 ///
 /// Only a worker that died leaves anything to re-run.  Its records are a prefix
 /// of the chunk, so the first position without one is the function it was on
-/// (the suspect) and every later one never started.  The suspect goes first,
+/// (the suspect) and every later one never started.  A worker that holds its
+/// records back until its sweep has run delivers none, so the function it was
+/// on is the one it last said it was starting, and every other target is a
+/// bystander.  The suspect goes first,
 /// onto the fresh worker the thread spawns next, so a crash it repeats is its
 /// own; the bystanders follow in [`spread`] order.  A stalled suspect is not
 /// re-run: it already ran past four times the per-function budget, and a second
@@ -913,12 +939,13 @@ impl Reruns {
 /// workers load at once), and a load that fails every time is bounded by the
 /// re-run gate instead.
 fn retry_order(ending: Ending, delivered: &[bool]) -> Reruns {
-    let Ending::Died { stalled, started } = ending else { return Reruns::default() };
+    let Ending::Died { stalled, started, running } = ending else { return Reruns::default() };
     let missing: Vec<usize> = (0..delivered.len()).filter(|&p| !delivered[p]).collect();
-    let (suspect, rest) = match (started, missing.split_first()) {
-        (false, _) => (None, &missing[..]),
+    let on = running.filter(|&p| delivered.get(p) == Some(&false)).or_else(|| missing.first().copied());
+    let (suspect, rest): (Option<usize>, Vec<usize>) = match (started, on) {
+        (false, _) => (None, missing),
         (true, None) => return Reruns::default(),
-        (true, Some((&first, rest))) => ((!stalled).then_some(first), rest),
+        (true, Some(on)) => ((!stalled).then_some(on), missing.into_iter().filter(|&p| p != on).collect()),
     };
     Reruns { suspect, bystanders: spread(rest.len()).into_iter().map(|k| rest[k]).collect() }
 }
@@ -1181,7 +1208,9 @@ impl Worker {
         // exists is final: the worker creates it just before its first target.
         let file = std::fs::read(&out_path);
         let started = file.is_ok();
-        let produced = file.ok().and_then(|b| decode_results(&b)).unwrap_or_default();
+        let frames = file.ok().and_then(|b| decode_results(&b));
+        let running = frames.as_ref().and_then(|f| f.running);
+        let produced = frames.map(|f| f.results).unwrap_or_default();
         let _ = std::fs::remove_file(scratch.join(spec_name(idx)));
         let _ = std::fs::remove_file(&out_path);
         match outcome {
@@ -1192,12 +1221,12 @@ impl Worker {
             Wait::Stalled => (
                 produced,
                 format!("{STALLED} ({}s); the worker was killed", cfg.max_fn_seconds),
-                Ending::Died { stalled: true, started },
+                Ending::Died { stalled: true, started, running },
             ),
             Wait::Failed(why) => (
                 produced,
                 format!("{CHUNK_FAILED} ({why})"),
-                Ending::Died { stalled: false, started },
+                Ending::Died { stalled: false, started, running },
             ),
         }
     }
@@ -1603,6 +1632,9 @@ fn lost_result(t: &TargetSpec, reason: &str) -> FuncResult {
         code: None,
         error: Some(reason.to_string()),
         proto: None,
+        emitted_c_name: None,
+        call_declarations: Vec::new(),
+        callwide_prototypes: Vec::new(),
         variables: Vec::new(),
         types: Vec::new(),
         stack_objects: Vec::new(),
@@ -1763,6 +1795,7 @@ enum Fault {
     Panic,
     PanicOnce,
     Stall,
+    StallAgain,
 }
 
 impl Faults {
@@ -1813,6 +1846,7 @@ impl Faults {
                     "panic" => Fault::Panic,
                     "panic-once" => Fault::PanicOnce,
                     "stall" => Fault::Stall,
+                    "stall-again" => Fault::StallAgain,
                     _ => return None,
                 };
                 let addr = match arg.strip_prefix("0x").or_else(|| arg.strip_prefix("0X")) {
@@ -1830,28 +1864,29 @@ impl Faults {
         (faults, rejected)
     }
 
-    /// Worker side, as the target at `addr` starts.  `panic-once` remembers
-    /// firing with a marker file in the pool's scratch directory, which every
-    /// worker of the run shares.
+    /// Worker side, as the target at `addr` starts.  `panic-once` and
+    /// `stall-again` remember the first start with a marker file in the pool's
+    /// scratch directory, which every worker of the run shares.
     pub(crate) fn before_target(&self, scratch: &Path, addr: u64) {
+        let first = |kind: &str| {
+            let marker = scratch.join(format!("fault-{kind}-{addr:x}"));
+            std::fs::OpenOptions::new().write(true).create_new(true).open(marker).is_ok()
+        };
         for &(fault, at) in &self.at {
             if at.is_some_and(|at| at != addr) {
                 continue;
             }
-            match fault {
+            let stall = match fault {
                 Fault::Panic => panic!("{JOBS_FAULT_ENV}: injected panic at {addr:#x}"),
-                Fault::PanicOnce => {
-                    let marker = scratch.join(format!("fault-once-{addr:x}"));
-                    if std::fs::OpenOptions::new().write(true).create_new(true).open(marker).is_ok()
-                    {
-                        panic!("{JOBS_FAULT_ENV}: injected panic at {addr:#x}");
-                    }
-                }
-                Fault::Stall => {
-                    fault_line(format_args!("{JOBS_FAULT_ENV}: injected stall at {addr:#x}"));
-                    loop {
-                        std::thread::sleep(Duration::from_secs(3600));
-                    }
+                Fault::PanicOnce if first("once") => panic!("{JOBS_FAULT_ENV}: injected panic at {addr:#x}"),
+                Fault::PanicOnce => false,
+                Fault::Stall => true,
+                Fault::StallAgain => !first("again"),
+            };
+            if stall {
+                fault_line(format_args!("{JOBS_FAULT_ENV}: injected stall at {addr:#x}"));
+                loop {
+                    std::thread::sleep(Duration::from_secs(3600));
                 }
             }
         }
@@ -2031,6 +2066,12 @@ mod tests {
             code: Some("void main(void)\n{\n  \"q\\\\\" /* \u{1}é */\n}".into()),
             error: None,
             proto: Some("void main(void);".into()),
+            emitted_c_name: Some("main_linkage".into()),
+            call_declarations: vec!["int external_value(int value);".into()],
+            callwide_prototypes: vec![kuna_decomp::kuna_callwide::ExportPrototype {
+                name: "proved".into(), entry: 0x401020, signed: true,
+                inputs: vec![true, false], definition: false,
+            }],
             variables: vec![
                 VarInfo {
                     name: "param_1".into(),
@@ -2041,6 +2082,7 @@ mod tests {
                     arg_index: Some(0),
                     line_numbers: vec![3, 4],
                     addresses: vec![0x401004, 0x401008],
+                    split_piece: false,
                 },
                 VarInfo {
                     name: "local_18".into(),
@@ -2051,6 +2093,7 @@ mod tests {
                     arg_index: None,
                     line_numbers: Vec::new(),
                     addresses: Vec::new(),
+                    split_piece: false,
                 },
                 // (kuna `reglocals`) A local outside the frame: its `kind` is
                 // carried by `is_param` and `stack_offset` alone.
@@ -2063,6 +2106,7 @@ mod tests {
                     arg_index: None,
                     line_numbers: vec![5],
                     addresses: vec![0x40100c],
+                    split_piece: false,
                 },
             ],
             // (kuna `structdefs`) One recovered type definition, so the frame
@@ -2094,6 +2138,7 @@ mod tests {
                 direct: true,
                 aggregate: true,
                 elem: true,
+                integer: true,
             }],
             field_calls: vec![
                 kuna_decomp::kuna_calltargettype::FieldDecl {
@@ -2129,6 +2174,9 @@ mod tests {
             && a.code == b.code
             && a.error == b.error
             && a.proto == b.proto
+            && a.emitted_c_name == b.emitted_c_name
+            && a.call_declarations == b.call_declarations
+            && a.callwide_prototypes == b.callwide_prototypes
             && a.aliases == b.aliases
             && a.object_location == b.object_location
             && a.callee_hints == b.callee_hints
@@ -2153,6 +2201,7 @@ mod tests {
                     && x.arg_index == y.arg_index
                     && x.line_numbers == y.line_numbers
                     && x.addresses == y.addresses
+                    && x.split_piece == y.split_piece
             })
     }
 
@@ -2199,6 +2248,9 @@ mod tests {
             code: None,
             error: Some("budget exceeded".into()),
             proto: None,
+            emitted_c_name: None,
+            call_declarations: Vec::new(),
+            callwide_prototypes: Vec::new(),
             variables: Vec::new(),
             types: Vec::new(),
             stack_objects: Vec::new(),
@@ -2221,13 +2273,13 @@ mod tests {
         let first_end = RESULT_MAGIC.len() + 5
             + u32::from_le_bytes(full[RESULT_MAGIC.len() + 1..RESULT_MAGIC.len() + 5].try_into().unwrap()) as usize;
         for cut in RESULT_MAGIC.len()..first_end {
-            assert!(decode_results(&full[..cut]).unwrap().is_empty());
+            assert!(decode_results(&full[..cut]).unwrap().results.is_empty());
         }
         let mut malformed = full.clone();
         let marker = malformed.windows(3).position(|w| w == b"&v1").unwrap();
         malformed[marker] = 0xff;
-        assert!(decode_results(&malformed).unwrap().is_empty());
-        let decoded = decode_results(&full).unwrap();
+        assert!(decode_results(&malformed).unwrap().results.is_empty());
+        let decoded = decode_results(&full).unwrap().results;
         assert_eq!(decoded.len(), 2);
         assert!(same(&decoded[0], &a));
         assert!(same(&decoded[1], &b));
@@ -2240,7 +2292,7 @@ mod tests {
     }
 
     #[test]
-    fn result_encoding_matches_the_version_seven_wire_layout() {
+    fn result_encoding_matches_the_version_eleven_wire_layout() {
         let dir = ScratchDir::create().unwrap();
         let path = dir.path().join("wire.bin").to_string_lossy().into_owned();
         let result = FuncResult {
@@ -2251,6 +2303,9 @@ mod tests {
             code: None,
             error: Some("e".into()),
             proto: None,
+            emitted_c_name: None,
+            call_declarations: Vec::new(),
+            callwide_prototypes: Vec::new(),
             variables: Vec::new(),
             types: Vec::new(),
             stack_objects: Vec::new(),
@@ -2265,10 +2320,11 @@ mod tests {
             detail: None,
         };
         let expected = [
-            b"KUNAJOBRES07\x01\x48\0\0\0".as_slice(),
+            b"KUNAJOBRES11\x01\x51\0\0\0".as_slice(),
             b"\x10\0\0\0\0\0\0\0\x20\0\0\0\0\0\0\0",
             b"\xff\xff\xff\xff\xff\xff\xff\xff",
             b"\x01\0\0\0f\0\x01\x01\0\0\0e\0\0",
+            b"\0", // emitted C name
             b"\0\0\0\0", // aliases
             b"\0\0\0\0", // line mappings
             b"\0\0\0\0", // variables
@@ -2278,13 +2334,35 @@ mod tests {
             b"\0\0\0\0", // field calls
             b"\0\0\0\0", // callee hints
             b"\0\0", // synth and pointer arguments
+            b"\0\0\0\0", // call declarations
+            b"\0\0\0\0", // callwide prototypes
         ]
         .concat();
         ResultWriter::create(&path).unwrap().push(&result).unwrap();
         assert_eq!(std::fs::read(path).unwrap(), expected);
-        let decoded = decode_results(&expected).unwrap();
+        let decoded = decode_results(&expected).unwrap().results;
         assert_eq!(decoded.len(), 1);
         assert!(same(&decoded[0], &result));
+    }
+
+    #[test]
+    fn malformed_or_oversized_wide_contracts_do_not_cross_the_worker_boundary() {
+        let dir = ScratchDir::create().unwrap();
+        let path = dir.path().join("wide.bin").to_string_lossy().into_owned();
+        let mut record = sample_result();
+        record.callwide_prototypes[0].definition = true;
+        ResultWriter::create(&path).unwrap().push(&record).unwrap();
+        let full = std::fs::read(&path).unwrap();
+        let decoded = decode_results(&full).unwrap().results;
+        assert_eq!(decoded.len(), 1);
+        assert!(same(&decoded[0], &record));
+        let mut malformed = full;
+        let at = malformed.windows(6).position(|bytes| bytes == b"proved").unwrap();
+        malformed[at + 6 + 8] = 2;
+        assert!(decode_results(&malformed).unwrap().results.is_empty());
+        record.callwide_prototypes[0].inputs = vec![false; 33];
+        ResultWriter::create(&path).unwrap().push(&record).unwrap();
+        assert!(decode_results(&std::fs::read(&path).unwrap()).unwrap().results.is_empty());
     }
 
     /// The dynamic source is the only thing `--stream` changes about the pool:
@@ -2316,7 +2394,7 @@ mod tests {
         }
         let full = std::fs::read(&path).unwrap();
         for cut in [full.len() - 1, full.len() / 2, RESULT_MAGIC.len() + 3] {
-            let decoded = decode_results(&full[..cut]).unwrap();
+            let decoded = decode_results(&full[..cut]).unwrap().results;
             assert!(decoded.len() < 2, "a truncated tail must be dropped, not guessed");
             for r in &decoded {
                 assert!(same(r, &a));
@@ -2452,7 +2530,7 @@ mod tests {
     }
 
     fn died(stalled: bool, started: bool) -> Ending {
-        Ending::Died { stalled, started }
+        Ending::Died { stalled, started, running: None }
     }
 
     fn reruns(suspect: Option<usize>, bystanders: &[usize]) -> Reruns {
@@ -2499,6 +2577,51 @@ mod tests {
         assert!(died(false, true).started() && died(true, true).started());
         assert!(!Ending::NotRun.started());
         assert!(!died(false, false).started() && !died(true, false).started());
+    }
+
+    /// A worker that holds its records back until its sweep has run delivers
+    /// none of them, so the function it was on is the one its last begin frame
+    /// named, wherever that is in the chunk; the first target is only a
+    /// bystander. A streaming worker's begin frame, which names a function it
+    /// already delivered, changes nothing.
+    #[test]
+    fn a_held_chunk_blames_the_function_its_worker_said_it_was_on() {
+        let on = |stalled, running| Ending::Died { stalled, started: true, running: Some(running) };
+        let held = [false; 5];
+        assert_eq!(retry_order(on(true, 3), &held), reruns(None, &[0, 2, 1, 4]));
+        assert_eq!(retry_order(on(false, 3), &held), reruns(Some(3), &[0, 2, 1, 4]));
+        assert_eq!(retry_order(on(true, 0), &held), reruns(None, &[1, 3, 2, 4]));
+        let prefix = [true, true, false, false, false];
+        assert_eq!(retry_order(on(true, 1), &prefix), retry_order(died(true, true), &prefix));
+        assert_eq!(retry_order(on(false, 9), &prefix), retry_order(died(false, true), &prefix));
+        assert_eq!(
+            retry_order(Ending::Died { stalled: true, started: false, running: Some(3) }, &held),
+            retry_order(died(true, false), &held),
+        );
+    }
+
+    /// A begin frame names the function a worker is starting, and the last one
+    /// in the file is what a dead worker was on; it never becomes a record.
+    #[test]
+    fn begin_frames_name_the_running_function_and_are_not_records() {
+        let dir = ScratchDir::create().unwrap();
+        let path = dir.path().join("begin.bin").to_string_lossy().into_owned();
+        let a = sample_result();
+        {
+            let mut w = ResultWriter::create(&path).unwrap();
+            w.begin(0).unwrap();
+            w.begin(7).unwrap();
+            w.push(&a).unwrap();
+            w.begin(300_000).unwrap();
+        }
+        let full = std::fs::read(&path).unwrap();
+        let frames = decode_results(&full).unwrap();
+        assert_eq!(frames.results.len(), 1);
+        assert!(same(&frames.results[0], &a));
+        assert_eq!(frames.running, Some(300_000));
+        let frames = decode_results(&full[..full.len() - 1]).unwrap();
+        assert_eq!((frames.results.len(), frames.running), (1, Some(7)), "a torn frame is dropped");
+        assert_eq!(decode_results(RESULT_MAGIC).unwrap().running, None);
     }
 
     /// Bystanders are visited in bit-reversed order, so any prefix of the visit
@@ -2585,7 +2708,7 @@ mod tests {
         assert_eq!(none, Faults::default());
         assert_eq!(rejected, vec!["nonsense", "panic:", "stall:0xzz", "spawn:x", "boom:0x1"]);
         let (f, rejected) =
-            Faults::parse(" panic:0x40071d , panic-once:4196064,stall:*,spawn:2,panic:0X10");
+            Faults::parse(" panic:0x40071d , panic-once:4196064,stall:*,spawn:2,panic:0X10,stall-again:0x14ea");
         assert!(rejected.is_empty(), "{rejected:?}");
         assert_eq!(
             f.at,
@@ -2593,7 +2716,8 @@ mod tests {
                 (Fault::Panic, Some(0x40071d)),
                 (Fault::PanicOnce, Some(4196064)),
                 (Fault::Stall, None),
-                (Fault::Panic, Some(0x10))
+                (Fault::Panic, Some(0x10)),
+                (Fault::StallAgain, Some(0x14ea))
             ]
         );
         assert!(!f.refuses_spawn(1) && f.refuses_spawn(2) && f.refuses_spawn(9));
@@ -2655,6 +2779,9 @@ mod tests {
             code: None,
             error: Some(e.to_string()),
             proto: None,
+            emitted_c_name: None,
+            call_declarations: Vec::new(),
+            callwide_prototypes: Vec::new(),
             variables: Vec::new(),
             types: Vec::new(),
             stack_objects: Vec::new(),
@@ -2709,6 +2836,7 @@ mod tests {
             serial_callee_first: false,
             elem_objects: false,
             arm_frames: None,
+            watch: None,
         }
     }
 
