@@ -241,15 +241,18 @@ name = "kuna-analysis"
 version = "0.1.0"
 dependencies = [
  "cpp_demangle",
+ "flate2",
  "gimli",
  "kuna-base",
  "kuna-decomp",
  "kuna-num",
  "kuna-sleigh",
+ "memchr",
  "msvc-demangler",
  "object",
  "pdb",
  "rustc-demangle",
+ "smallvec",
  "undname",
 ]
 
@@ -269,6 +272,7 @@ dependencies = [
  "kuna-base",
  "kuna-console",
  "kuna-decomp",
+ "kuna-num",
  "kuna-slacomp",
  "kuna-sleigh",
  "object",
@@ -290,6 +294,7 @@ dependencies = [
  "object",
  "regex",
  "syn 2.0.117",
+ "unicode-ident",
 ]
 
 [[package]]
