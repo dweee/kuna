@@ -230,3 +230,103 @@ fn markup_lines_follow_the_trimmed_text() {
     let lines: Vec<usize> = single.associations.iter().map(|a| a.line_number).collect();
     assert_eq!(lines, vec![1, 3]);
 }
+
+fn budget_site() -> Option<String> {
+    super::FN_BUDGET_SITE.with(|s| s.borrow().clone())
+}
+
+#[test]
+fn budget_site_is_the_first_probe_to_see_the_expiry() {
+    let _drive = super::DeadlineScope::enter(Some(std::time::Instant::now()));
+    assert_eq!(budget_site(), None);
+    {
+        let _table = super::JumpTableScope::enter(0x401026);
+        assert!(super::deadline_passed_in("jump-table basic model"));
+        super::note_budget_site(|| "action jumptable".to_string());
+    }
+    super::note_budget_site(|| "heritage".to_string());
+    assert_eq!(budget_site().as_deref(), Some("jump-table basic model at 0x401026"));
+}
+
+#[test]
+fn budget_site_inside_table_recovery_names_the_table() {
+    let _drive = super::DeadlineScope::enter(Some(std::time::Instant::now()));
+    let _table = super::JumpTableScope::enter(0x1820e009b);
+    super::note_budget_site(|| "action oppool1".to_string());
+    assert_eq!(
+        budget_site().as_deref(),
+        Some("action oppool1 during jump-table recovery at 0x1820e009b")
+    );
+}
+
+#[test]
+fn each_drive_starts_with_no_budget_site_and_restores_the_outer_one() {
+    let _outer = super::DeadlineScope::enter(Some(std::time::Instant::now()));
+    super::note_budget_site(|| "heritage".to_string());
+    {
+        let _inner = super::DeadlineScope::enter(None);
+        assert_eq!(budget_site(), None);
+        assert!(!super::deadline_passed_in("region structuring"));
+        assert_eq!(budget_site(), None);
+    }
+    assert_eq!(budget_site().as_deref(), Some("heritage"));
+}
+
+fn fresh_merge() -> crate::merge::Merge {
+    crate::merge::Merge::new(crate::variable::HighIntersectTest::new(crate::cover::PcodeOpSet::new(
+        Box::new(Vec::new),
+        Box::new(|_, _| true),
+    )))
+}
+
+#[test]
+fn variable_merging_stops_once_a_probe_sees_the_budget_spent() {
+    let mut merge = fresh_merge();
+    let _drive = super::DeadlineScope::enter(Some(std::time::Instant::now()));
+    let stride = (0..1000).take_while(|_| merge.budget().is_ok()).count() + 1;
+    assert!(stride > 1 && stride <= 256, "first probe to ask the clock: {stride}");
+    assert!((0..10).all(|_| merge.budget().is_err()), "every step after it fails");
+    assert_eq!(budget_site().as_deref(), Some("variable merging"));
+    merge.clear();
+    let _unbudgeted = super::DeadlineScope::enter(None);
+    assert!((0..1000).all(|_| merge.budget().is_ok()));
+}
+
+#[test]
+fn a_budget_probe_stays_spent_for_its_drive_and_names_no_site() {
+    {
+        let _unbudgeted = super::DeadlineScope::enter(None);
+        assert!((0..1000).all(|_| !super::budget_probe()));
+    }
+    let _drive = super::DeadlineScope::enter(Some(std::time::Instant::now()));
+    let stride = (0..1000).take_while(|_| !super::budget_probe()).count() + 1;
+    assert!(stride <= 256, "first probe to ask the clock: {stride}");
+    assert!((0..10).all(|_| super::budget_probe()), "every probe after it answers spent");
+    assert_eq!(budget_site(), None);
+    {
+        let _inner = super::DeadlineScope::enter(None);
+        assert!((0..1000).all(|_| !super::budget_probe()), "a new drive starts unspent");
+    }
+    assert!(super::budget_probe(), "the outer drive is still spent");
+}
+
+#[test]
+fn region_identification_stops_at_the_budget_and_names_itself() {
+    use crate::p7_regions::kuna_regionid::KunaRegionIdentifier;
+    let build = || {
+        let mut ri = KunaRegionIdentifier::new();
+        let n: Vec<_> = (1..=4).map(|a| ri.add_synthetic_block(a)).collect();
+        ri.add_synthetic_edge(n[0], n[1]);
+        ri.add_synthetic_edge(n[1], n[2]);
+        ri.add_synthetic_edge(n[2], n[1]);
+        ri.add_synthetic_edge(n[2], n[3]);
+        ri
+    };
+    {
+        let _unbudgeted = super::DeadlineScope::enter(None);
+        assert!(build().compute().is_ok());
+    }
+    let _drive = super::DeadlineScope::enter(Some(std::time::Instant::now()));
+    assert!(build().compute().is_err());
+    assert_eq!(budget_site().as_deref(), Some("region identification"));
+}

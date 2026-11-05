@@ -1,14 +1,44 @@
 // Shared integration-test executable. Process-sensitive tests stay separate.
 mod common;
 
+#[path = "rust_empty_match.rs"]
+mod rust_empty_match;
+
+#[path = "function_pointer_namespaces.rs"]
+mod function_pointer_namespaces;
+
+#[path = "dwarf_namespaces.rs"]
+mod dwarf_namespaces;
+
+#[path = "dwarf_member_layout.rs"]
+mod dwarf_member_layout;
+
+#[path = "local_array_bits.rs"]
+mod local_array_bits;
+
+#[path = "array_record.rs"]
+mod array_record;
+
 #[path = "aif_lea_padding.rs"]
 mod aif_lea_padding;
 
 #[path = "ambiguous_selector_cli.rs"]
 mod ambiguous_selector_cli;
 
+#[path = "declared_bytes_cli.rs"]
+mod declared_bytes_cli;
+
 #[path = "argument_errors_cli.rs"]
 mod argument_errors_cli;
+
+#[path = "array_member_bits.rs"]
+mod array_member_bits;
+
+#[path = "mapped_array_bits.rs"]
+mod mapped_array_bits;
+
+#[path = "array_source_bits.rs"]
+mod array_source_bits;
 
 #[path = "conditional_register_lifetimes.rs"]
 mod conditional_register_lifetimes;
@@ -31,6 +61,9 @@ mod narrow_args;
 
 #[path = "narrow_ret.rs"]
 mod narrow_ret;
+
+#[path = "prefersplit_scope.rs"]
+mod prefersplit_scope;
 
 #[path = "arm_frame_retain.rs"]
 mod arm_frame_retain;
@@ -66,14 +99,23 @@ mod asserted_enum_layout;
 #[path = "baseline_cli.rs"]
 mod baseline_cli;
 
+#[path = "test_selection_cli.rs"]
+mod test_selection_cli;
+
 #[path = "broken_pipe.rs"]
 mod broken_pipe;
+
+#[path = "forloop_visible_read.rs"]
+mod forloop_visible_read;
 
 #[path = "buildstamp_cli.rs"]
 mod buildstamp_cli;
 
 #[path = "call_array_extent.rs"]
 mod call_array_extent;
+
+#[path = "call_wide.rs"]
+mod call_wide;
 
 #[path = "call_result_high_word_reads.rs"]
 mod call_result_high_word_reads;
@@ -112,6 +154,15 @@ mod crypto_cli;
 
 #[path = "ctypes_per_arch.rs"]
 mod ctypes_per_arch;
+
+#[path = "decompile_budget_cli.rs"]
+mod decompile_budget_cli;
+
+#[path = "dos_fpuemu_cli.rs"]
+mod dos_fpuemu_cli;
+
+#[path = "dos_mz_cli.rs"]
+mod dos_mz_cli;
 
 #[path = "decompile_cli.rs"]
 mod decompile_cli;
@@ -200,17 +251,29 @@ mod limits_cli;
 #[path = "local_name_batch.rs"]
 mod local_name_batch;
 
+#[path = "local_stack_views.rs"]
+mod local_stack_views;
+
 #[path = "library_names.rs"]
 mod library_names;
 
+#[path = "libgcc_divdi3.rs"]
+mod libgcc_divdi3;
+
 #[path = "rettriangle_round_trip.rs"]
 mod rettriangle_round_trip;
+
+#[path = "return_copy_clone.rs"]
+mod return_copy_clone;
 
 #[path = "stable_local_names.rs"]
 mod stable_local_names;
 
 #[path = "loop_cursor_initializer.rs"]
 mod loop_cursor_initializer;
+#[path = "macho_trie_names_cli.rs"]
+mod macho_trie_names_cli;
+
 #[path = "mapped_array_c.rs"]
 mod mapped_array_c;
 
@@ -222,6 +285,12 @@ mod mapped_flow_boundary;
 
 #[path = "mixed_tail_returns.rs"]
 mod mixed_tail_returns;
+
+#[path = "mips_stub_noreturn.rs"]
+mod mips_stub_noreturn;
+
+#[path = "macho_alias_names_cli.rs"]
+mod macho_alias_names_cli;
 
 #[path = "name_miss_cli.rs"]
 mod name_miss_cli;
@@ -259,8 +328,14 @@ mod partial_global_load_guard;
 #[path = "passthrough_own_return.rs"]
 mod passthrough_own_return;
 
+#[path = "pltlocal_cli.rs"]
+mod pltlocal_cli;
+
 #[path = "pointer_table_strings.rs"]
 mod pointer_table_strings;
+
+#[path = "ppc64_delayed_constant_switch.rs"]
+mod ppc64_delayed_constant_switch;
 
 #[path = "powerpc_isa_selection.rs"]
 mod powerpc_isa_selection;
@@ -270,6 +345,12 @@ mod push_immediate_ret_cli;
 
 #[path = "pushed_stack_bytes.rs"]
 mod pushed_stack_bytes;
+
+#[path = "read_fixups_cli.rs"]
+mod read_fixups_cli;
+
+#[path = "read_provenance_cli.rs"]
+mod read_provenance_cli;
 
 #[path = "recursive_records_cli.rs"]
 mod recursive_records_cli;
@@ -285,6 +366,9 @@ mod register_parameter_replay;
 
 #[path = "relocation_diagnostics.rs"]
 mod relocation_diagnostics;
+
+#[path = "relocrebase_be.rs"]
+mod relocrebase_be;
 
 #[path = "retcallchain_cli.rs"]
 mod retcallchain_cli;
@@ -330,6 +414,9 @@ mod stack_object_lifetimes;
 
 #[path = "stack_parameter_lifetimes.rs"]
 mod stack_parameter_lifetimes;
+
+#[path = "stack_home_aliases.rs"]
+mod stack_home_aliases;
 
 #[path = "stack_struct.rs"]
 mod stack_struct;
@@ -385,6 +472,9 @@ mod typed_vtable_cli;
 #[path = "unpack_cli.rs"]
 mod unpack_cli;
 
+#[path = "unpack_pklite_cli.rs"]
+mod unpack_pklite_cli;
+
 #[path = "unstructured_goto_cli.rs"]
 mod unstructured_goto_cli;
 
@@ -418,14 +508,29 @@ mod x64_syscall_memory;
 #[path = "xref_body_ownership.rs"]
 mod xref_body_ownership;
 
+#[path = "xrefs_address_pairs.rs"]
+mod xrefs_address_pairs;
+
 #[path = "xrefs_cli.rs"]
 mod xrefs_cli;
+
+#[path = "xrefs_data_refs_cli.rs"]
+mod xrefs_data_refs_cli;
+
+#[path = "xrefs_got_call.rs"]
+mod xrefs_got_call;
+
+#[path = "xrefs_low_page.rs"]
+mod xrefs_low_page;
 
 #[path = "xrefs_own_export_plt.rs"]
 mod xrefs_own_export_plt;
 
 #[path = "xrefs_switch_case_calls.rs"]
 mod xrefs_switch_case_calls;
+
+#[path = "xrefs_unflagged_cli.rs"]
+mod xrefs_unflagged_cli;
 
 #[path = "zero_extended_returns.rs"]
 mod zero_extended_returns;
@@ -455,6 +560,9 @@ mod global_aggregate_store;
 #[path = "multireg_call_inputs.rs"]
 mod multireg_call_inputs;
 
+#[path = "mips_got_nostub.rs"]
+mod mips_got_nostub;
+
 #[path = "narrow_register_inputs.rs"]
 mod narrow_register_inputs;
 #[path = "float_field_slices.rs"]
@@ -462,6 +570,7 @@ mod float_field_slices;
 
 #[path = "float_storage_truncation.rs"]
 mod float_storage_truncation;
+
 #[path = "dwarf_reference_arguments.rs"]
 mod dwarf_reference_arguments;
 
@@ -470,3 +579,206 @@ mod fortran_fatal_diagnostics;
 
 #[path = "dwarf_array_bounds.rs"]
 mod dwarf_array_bounds;
+
+#[path = "wide_right_shift.rs"]
+mod wide_right_shift;
+
+#[path = "float_subword_bits.rs"]
+mod float_subword_bits;
+
+#[path = "x87_custom_storage.rs"]
+mod x87_custom_storage;
+
+#[path = "dwarf_complex_values.rs"]
+mod dwarf_complex_values;
+#[path = "project_direct_globals.rs"]
+mod project_direct_globals;
+
+#[path = "x87_empty_return.rs"]
+mod x87_empty_return;
+
+#[path = "windows_stack_argument_alignment.rs"]
+mod windows_stack_argument_alignment;
+
+#[path = "imported_data_identifiers.rs"]
+mod imported_data_identifiers;
+#[path = "dwarf_linkage_calls.rs"]
+mod dwarf_linkage_calls;
+#[path = "project_named_globals.rs"]
+mod project_named_globals;
+#[path = "x87_register_payload.rs"]
+mod x87_register_payload;
+
+#[path = "x87_free_operands.rs"]
+mod x87_free_operands;
+
+#[path = "prototype_call_mechanisms.rs"]
+mod prototype_call_mechanisms;
+#[path = "qualified_storage_addresses.rs"]
+mod qualified_storage_addresses;
+#[path = "qualified_import_storage.rs"]
+mod qualified_import_storage;
+
+#[path = "readonly_leaf_stack.rs"]
+mod readonly_leaf_stack;
+
+#[path = "global_array_bit_transfers.rs"]
+mod global_array_bit_transfers;
+
+#[path = "project_assertion_status.rs"]
+mod project_assertion_status;
+
+#[path = "x87_integer_conversions_native.rs"]
+mod x87_integer_conversions_native;
+
+#[path = "float_pointer_storage.rs"]
+mod float_pointer_storage;
+
+#[path = "stack_union_components.rs"]
+mod stack_union_components;
+
+#[path = "dwarf_overlapping_locals.rs"]
+mod dwarf_overlapping_locals;
+
+#[path = "float_literal_width.rs"]
+mod float_literal_width;
+
+#[path = "project_call_declarations.rs"]
+mod project_call_declarations;
+
+#[path = "parameter_spill_reuse.rs"]
+mod parameter_spill_reuse;
+
+#[path = "declared_callee_pop.rs"]
+mod declared_callee_pop;
+
+#[path = "declared_data_range.rs"]
+mod declared_data_range;
+
+#[path = "declared_pointer_frame_alias.rs"]
+mod declared_pointer_frame_alias;
+#[path = "project_function_linkage.rs"]
+mod project_function_linkage;
+
+#[path = "aggregate_storage_cast.rs"]
+mod aggregate_storage_cast;
+
+#[path = "x87_native_returns.rs"]
+mod x87_native_returns;
+
+#[path = "x86_bound_checks.rs"]
+mod x86_bound_checks;
+
+#[path = "floating_stack_bytes.rs"]
+mod floating_stack_bytes;
+
+#[path = "aggregate_interior_address.rs"]
+mod aggregate_interior_address;
+
+#[path = "aggregate_scalar_bitcasts.rs"]
+mod aggregate_scalar_bitcasts;
+
+#[path = "float_integer_truncation.rs"]
+mod float_integer_truncation;
+
+#[path = "intermediate_float_rounding.rs"]
+mod intermediate_float_rounding;
+
+#[path = "pointer_slot_casts.rs"]
+mod pointer_slot_casts;
+
+#[path = "implied_word_casts.rs"]
+mod implied_word_casts;
+
+#[path = "indexed_descriptor_pointer.rs"]
+mod indexed_descriptor_pointer;
+
+#[path = "float_call_storage.rs"]
+mod float_call_storage;
+
+#[path = "locked_scalar_declarations.rs"]
+mod locked_scalar_declarations;
+
+#[path = "pointer_storage_literals.rs"]
+mod pointer_storage_literals;
+
+#[path = "anonymous_record_definitions.rs"]
+mod anonymous_record_definitions;
+
+#[path = "overlapping_stack_assertions.rs"]
+mod overlapping_stack_assertions;
+
+#[path = "named_member_bits.rs"]
+mod named_member_bits;
+
+#[path = "usepoint_pointer_constants.rs"]
+mod usepoint_pointer_constants;
+
+#[path = "pe_data_exports.rs"]
+mod pe_data_exports;
+
+#[path = "float_nan_quieting.rs"]
+mod float_nan_quieting;
+
+#[path = "storage_load_transfers.rs"]
+mod storage_load_transfers;
+
+#[path = "ppc32_imports.rs"]
+mod ppc32_imports;
+
+#[path = "ppc32_pic_calls.rs"]
+mod ppc32_pic_calls;
+
+#[path = "ppc32_pic_abi.rs"]
+mod ppc32_pic_abi;
+
+#[path = "compact_json.rs"]
+mod compact_json;
+
+#[path = "rust_probestack.rs"]
+mod rust_probestack;
+
+#[path = "highslice_guard.rs"]
+mod highslice_guard;
+
+#[path = "rust_null_pointer.rs"]
+mod rust_null_pointer;
+
+#[path = "joined_callback_return.rs"]
+mod joined_callback_return;
+
+#[path = "integer_field_extract.rs"]
+mod integer_field_extract;
+
+#[path = "go_store_value.rs"]
+mod go_store_value;
+
+#[path = "rust_integer_conversions.rs"]
+mod rust_integer_conversions;
+
+#[path = "rust_boolean_conversions.rs"]
+mod rust_boolean_conversions;
+
+#[path = "rust_boolean_expressions.rs"]
+mod rust_boolean_expressions;
+
+#[path = "scalar_call_results.rs"]
+mod scalar_call_results;
+
+#[path = "rust_store_value.rs"]
+mod rust_store_value;
+
+#[path = "rust_pointer_index.rs"]
+mod rust_pointer_index;
+
+#[path = "rust_array_index.rs"]
+mod rust_array_index;
+
+#[path = "rust_array_address.rs"]
+mod rust_array_address;
+
+#[path = "rust_array_decay.rs"]
+mod rust_array_decay;
+
+#[path = "rust_array_constant.rs"]
+mod rust_array_constant;
