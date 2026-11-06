@@ -43,12 +43,15 @@ pub(super) fn reject_unquotable(what: &str, path: &str) -> Result<(), String> {
 }
 
 /// Lower the parsed request using this attempt's resolved input and defaults.
+/// `defer_fast_funcdisc` appends `option fast_funcdisc off` after the caller's
+/// options, so it outranks a preset's `on` for this attempt only.
 pub(super) fn build_script_for_input(
     args: &DecompileArgs,
     binary: &str,
     by_address: bool,
     out_path: &Path,
     injected: &[(&'static str, &'static str)],
+    defer_fast_funcdisc: bool,
     regions_path: Option<&Path>,
 ) -> String {
     let DecompileArgs {
@@ -74,10 +77,13 @@ pub(super) fn build_script_for_input(
     if *raw_image {
         let language = bfd_target.expect("raw parser requires --target");
         let base = base.expect("raw parser requires --base");
+        let language = console_path(language);
         lines.push(format!("load raw {language} 0x{base:x} {target} {image}"));
     } else {
         match bfd_target {
-            Some(t) if !t.is_empty() => lines.push(format!("load file {t} {image}")),
+            Some(t) if !t.is_empty() => {
+                lines.push(format!("load file {} {image}", console_path(t)))
+            }
             _ => lines.push(format!("load file {image}")),
         }
     }
@@ -104,6 +110,9 @@ pub(super) fn build_script_for_input(
     }
     for (name, value) in options {
         lines.push(format!("option {name} {value}"));
+    }
+    if defer_fast_funcdisc {
+        lines.push("option fast_funcdisc off".into());
     }
     // (kuna `--assert`) IMAGE-scoped directives -- a read-only or volatile
     // memory range -- must precede `read symbols`: mapping a symbol folds the
@@ -146,6 +155,9 @@ pub(super) fn build_script_for_input(
     // and before the selection, so the function is loaded against them.
     for form in forms(crate::assertdecl::Slot::Program) {
         lines.push(form.line);
+    }
+    if options.iter().any(|(name, value)| name == "callwide" && value == "on") {
+        lines.push("callwide prepare".into());
     }
     lines.push(format!("load {verb} {selection}"));
     // FUNCTION-scoped directives need a loaded function and are consumed at flow
