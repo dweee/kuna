@@ -4,6 +4,13 @@
 //! `lib.rs` so public paths (`kuna_decomp::<module>`) are unchanged.
 
 pub mod heritage;
+mod kuna_leafmemory;
+pub(crate) mod kuna_globalcallranges;
+pub(crate) mod kuna_loadguardreads;
+pub(crate) mod kuna_persistcalls;
+pub(crate) mod kuna_deadcascade;
+pub(crate) mod kuna_prunedssa;
+pub(crate) mod kuna_renamereads;
 pub mod subflow;
 mod kuna_constantbytes;
 pub mod condexe;
@@ -23,6 +30,7 @@ pub mod kuna_globalstorekeep;
 pub mod kuna_globalorderkeep;
 pub mod kuna_globalcallstore;
 pub mod kuna_intfloatround;
+pub mod kuna_floatquiet;
 pub mod kuna_mulblob; // (kuna) keep a widened multiply operand a value, not an aggregate
 pub mod kuna_booleanmask;
 pub mod kuna_ovlesssimplify;
@@ -30,6 +38,7 @@ pub mod kuna_flagcompare;
 pub mod kuna_arraystride;
 pub mod kuna_condexeplace;
 pub mod kuna_compareform;
+pub mod kuna_segmentize;
 pub mod kuna_indirectanchor; // (kuna) an op inserted after a guard INDIRECT anchors to the op it speaks for
 pub mod kuna_inputtile;
 pub mod kuna_calloverlap;
@@ -45,10 +54,13 @@ pub(crate) mod kuna_stackbytecopy;
 pub(crate) mod kuna_spillstoreguard;
 pub mod kuna_tiedstorekeep;
 pub mod kuna_loopcounterstore;
+pub(crate) mod kuna_haltloopguard;
+pub mod kuna_pairrefine;
 pub mod kuna_splitstorekeep;
 pub mod kuna_pointeestorekeep;
 pub mod kuna_constspaceload;
 pub mod kuna_simdlane;
+pub mod kuna_x87truncate;
 pub mod kuna_cancelbytearithmetic;
 pub mod kuna_wideslice;
 pub mod kuna_devectorize;
@@ -62,3 +74,5 @@ pub(crate) mod kuna_globalarrayanchor;
 pub(crate) mod kuna_globalfieldstore;
 pub(crate) mod kuna_stackreadscope;
 pub(crate) mod kuna_inputrefinement;
+pub(crate) mod kuna_revisitrefine;
+pub(crate) mod kuna_wrapsplit;

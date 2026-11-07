@@ -39,6 +39,7 @@ pub mod kuna_callerreads;
 pub mod kuna_entrythumbflow;
 pub mod kuna_floatglobals;
 pub mod kuna_pdecode;
+pub mod kuna_mzsweep;
 pub mod kuna_rawdiscover;
 pub mod kuna_tailcallentry;
 pub mod kuna_thunkentry;
@@ -48,15 +49,19 @@ mod kuna_flowmode;
 mod kuna_armwalkmode;
 pub(crate) mod kuna_framemode;
 pub(crate) mod kuna_decodereuse;
+mod kuna_pcform;
 mod kuna_picbase;
 mod kuna_picpool;
 mod kuna_poolref;
+mod kuna_regcarry;
 mod kuna_ppclocalentry;
 mod kuna_switchtable;
 mod kuna_thumbswitch;
 mod kuna_a32switch;
+mod kuna_x86listingswitch;
 pub(crate) mod kuna_decodememo;
 mod kuna_unmappedentry;
+pub mod kuna_unflaggedcode;
 pub mod model;
 pub mod walk;
 // (kuna) The read-only cross-reference query behind `kuna xrefs` -- a consumer of
@@ -131,6 +136,11 @@ pub struct Listing {
     /// (kuna `armfuncmode`) The extents painted A32 from function-symbol
     /// evidence (see [`crate::loader::kuna_armfuncmode`]); empty otherwise.
     a32_extents: Vec<(u64, u64)>,
+    /// A resume must rebuild ordinary coverage after optional i386 expansion.
+    x86_switch_rebuild: bool,
+    /// The MIPS lazy-binding stub transfers the loader proved, `(site, end)`;
+    /// kept so a resumed walk ends them as the first walk did.
+    mips_transfers: Vec<(u64, u64)>,
 }
 
 impl Listing {
@@ -187,6 +197,8 @@ impl Listing {
             stack_callback_refs: Vec::new(),
             mode_runs: Vec::new(),
             a32_extents: Vec::new(),
+            x86_switch_rebuild: false,
+            mips_transfers: Vec::new(),
         }
     }
 
@@ -258,7 +270,7 @@ impl Listing {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn build_tracking_frames(
         file: &object::File,
-        _image: &ObjectLoadImage,
+        image: &ObjectLoadImage,
         arch: &Architecture,
         translate: &dyn Translate,
         seeds: &[u64],
@@ -269,8 +281,13 @@ impl Listing {
         frames: Option<&mut kuna_framemode::FrameModes>,
         memo: Option<&kuna_decodememo::DecodeMemo>,
     ) -> Listing {
+        let sites: std::collections::HashSet<u64> =
+            arch.loader_transfer_sites.iter().map(kuna_base::address::Address::get_offset).collect();
+        let mips_transfers = image.mips_linkage()
+            .map(|linkage| linkage.transfers.iter().copied().filter(|(site, _)| sites.contains(site)).collect())
+            .unwrap_or_default();
         Self::build_resuming(file, arch, translate, seeds, funcsym_seeds, seed_names, detail, plan,
-            frames, None, memo)
+            frames, None, memo, mips_transfers)
     }
 
     /// (kuna `addrtakenentry`) Continue this Listing's walk with `seeds`, the old
@@ -278,6 +295,8 @@ impl Listing {
     /// are kept and moved, not copied, so the walk decodes only what the new
     /// seeds reach; the result is the Listing a fresh build from `seeds` makes,
     /// because a decode at an address does not depend on who reached it first.
+    /// An optionally expanded i386 Listing rebuilds ordinary coverage first:
+    /// new seeds can invalidate the proof behind previously decoded cases.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn resume(
         self,
@@ -290,6 +309,16 @@ impl Listing {
         detail: ListingDetail,
         plan: &WalkPlan,
     ) -> Listing {
+        if self.x86_switch_rebuild
+            || (arch.analysis_x86listingswitch
+                && file.architecture() == object::Architecture::I386
+                && arch.archid.starts_with("x86:LE:32:"))
+        {
+            return Self::build_resuming(
+                file, arch, translate, seeds, funcsym_seeds, seed_names, detail, plan,
+                None, None, None, self.mips_transfers,
+            );
+        }
         let prior = walk::WalkState {
             insns: self.insns,
             refs: self.refs.into_edges(),
@@ -298,7 +327,7 @@ impl Listing {
             mode_runs: self.mode_runs,
         };
         Self::build_resuming(file, arch, translate, seeds, funcsym_seeds, seed_names, detail, plan,
-            None, Some(prior), None)
+            None, Some(prior), None, self.mips_transfers)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -314,6 +343,7 @@ impl Listing {
         frames: Option<&mut kuna_framemode::FrameModes>,
         resumed: Option<walk::WalkState>,
         memo: Option<&kuna_decodememo::DecodeMemo>,
+        mips_transfers: Vec<(u64, u64)>,
     ) -> Listing {
         debug_assert!(
             plan.built_from(arch),
@@ -346,6 +376,8 @@ impl Listing {
                     stack_callback_refs: Vec::new(),
                     mode_runs: Vec::new(),
                     a32_extents: Vec::new(),
+                    x86_switch_rebuild: false,
+                    mips_transfers: Vec::new(),
                 };
             }
         };
@@ -385,6 +417,11 @@ impl Listing {
         // not a function of its own. Empty on every other architecture and
         // whenever the option is off (see `kuna_ppclocalentry`).
         let local_entries = kuna_ppclocalentry::fold_map(arch, file, seeds);
+        let tail_transfers: BTreeMap<u64, u64> = if arch.stub_tail_call {
+            mips_transfers.iter().copied().collect()
+        } else {
+            BTreeMap::new()
+        };
         let want_stack_callbacks = arch.analysis_fast_funcdisc
             && matches!(file.architecture(), object::Architecture::I386 | object::Architecture::X86_64);
 
@@ -398,7 +435,12 @@ impl Listing {
                 )
             })
             .flatten();
-        let a32_tables = kuna_a32switch::A32Tables::new(file, arch);
+        let a32_pool = kuna_a32switch::applies(file, arch).then(|| kuna_poolref::PoolImage::new(file)).flatten();
+        let a32_tables = a32_pool.as_ref().map(|pool| kuna_a32switch::A32Tables::new(arch, pool));
+        let x86_tables = arch
+            .analysis_x86listingswitch
+            .then(|| kuna_x86listingswitch::X86Tables::new(file, arch))
+            .flatten();
         let st = walk::walk(
             translate,
             arch,
@@ -410,6 +452,7 @@ impl Listing {
             flow_mode.as_ref(),
             arm_walk.as_ref(),
             &local_entries,
+            &tail_transfers,
             detail,
             want_stack_callbacks,
             plan,
@@ -417,6 +460,7 @@ impl Listing {
             resumed,
             tables.as_ref(),
             a32_tables.as_ref(),
+            x86_tables.as_ref(),
             memo,
         );
 
@@ -436,6 +480,8 @@ impl Listing {
                 .collect(),
             mode_runs: st.mode_runs,
             a32_extents: painter.a32_extents().to_vec(),
+            x86_switch_rebuild: x86_tables.is_some(),
+            mips_transfers,
         }
     }
 
@@ -488,9 +534,11 @@ impl Listing {
             None,
             None,
             &BTreeMap::new(),
+            &BTreeMap::new(),
             detail,
             /* want_stack_callbacks = */ false,
             &WalkPlan::serial(),
+            None,
             None,
             None,
             None,
@@ -508,6 +556,8 @@ impl Listing {
             stack_callback_refs: Vec::new(),
             mode_runs: Vec::new(),
             a32_extents: Vec::new(),
+            x86_switch_rebuild: false,
+            mips_transfers: Vec::new(),
         }
     }
 
@@ -527,6 +577,8 @@ impl Listing {
             stack_callback_refs: Vec::new(),
             mode_runs: Vec::new(),
             a32_extents: Vec::new(),
+            x86_switch_rebuild: false,
+            mips_transfers: Vec::new(),
         }
     }
 
@@ -547,6 +599,8 @@ impl Listing {
             stack_callback_refs,
             mode_runs: Vec::new(),
             a32_extents: Vec::new(),
+            x86_switch_rebuild: false,
+            mips_transfers: Vec::new(),
         }
     }
 
@@ -876,6 +930,8 @@ mod tests {
             stack_callback_refs: Vec::new(),
             mode_runs: Vec::new(),
             a32_extents: Vec::new(),
+            x86_switch_rebuild: false,
+            mips_transfers: Vec::new(),
         };
         let addrs = |start, end| {
             listing
@@ -889,5 +945,63 @@ mod tests {
         assert_eq!(addrs(0x20, None), vec![0x20, u64::MAX]);
         assert!(addrs(0x20, Some(0x20)).is_empty());
         assert!(addrs(0x20, Some(0x10)).is_empty());
+    }
+
+    #[test]
+    fn x86_switch_resume_rebuilds_the_ordinary_partition_before_refusing_old_proofs() {
+        use kuna_sleigh::{globalcontext::ContextInternal, sleigh::Sleigh};
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let path = root.join("decompiler/crates/kuna-analysis/tests/fixtures/x86listingswitch_i386");
+        let path = path.to_str().unwrap();
+        let bytes = std::fs::read(path).unwrap();
+        let file = object::File::parse(&*bytes).unwrap();
+        let sla = std::fs::read(root.join("specs/Ghidra/Processors/x86/data/languages/x86.sla")).unwrap();
+        for detail in [ListingDetail::FULL, ListingDetail::PARTITION_ONLY] {
+            for disable in [false, true] {
+                let loader = ObjectLoadImage::from_bytes_silent(path, &bytes).unwrap();
+                let mut engine = Sleigh::new(Box::new(loader), Box::new(ContextInternal::new()));
+                engine.initialize_from_sla(&sla).unwrap();
+                engine.base().manager().truncate_space("ram", 4).unwrap();
+                engine.set_context_default("addrsize", 1);
+                engine.set_context_default("opsize", 1);
+                let mut loader = ObjectLoadImage::from_bytes_silent(path, &bytes).unwrap();
+                loader.attach_to_space(Rc::clone(
+                    engine.base().manager().get_default_code_space().unwrap(),
+                ));
+                engine.set_loader(Box::new(loader));
+                let mut arch = Architecture::new("x86:LE:32:default:gcc", engine);
+                arch.analysis_x86listingswitch = true;
+                let image = ObjectLoadImage::from_bytes_silent(path, &bytes).unwrap();
+                let mut seeds = vec![0x100000, 0x1004f0];
+                let expanded = Listing::build_with_meta(
+                    &file, &image, &arch, arch.translate(), &seeds, &seeds, &[], detail,
+                );
+                assert!(expanded.is_instruction_start(0x100440));
+                assert!(expanded.function_at(0x100510).is_some());
+                if disable {
+                    arch.analysis_x86listingswitch = false;
+                } else {
+                    seeds.push(0x10040d);
+                }
+                let resumed = expanded.resume(
+                    &file, &arch, arch.translate(), &seeds, &seeds, &[], detail, &WalkPlan::serial(),
+                );
+                let fresh = Listing::build_with_meta(
+                    &file, &image, &arch, arch.translate(), &seeds, &seeds, &[], detail,
+                );
+                for case in [0x100440, 0x100460, 0x1004b0, 0x1004d0] {
+                    assert!(!resumed.is_instruction_start(case));
+                }
+                assert!(resumed.function_at(0x100510).is_none());
+                let partition = |listing: &Listing| {
+                    listing.instructions()
+                        .map(|(&at, insn)| (at, insn.len, insn.fall_through, insn.flow, insn.flows.clone()))
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(partition(&resumed), partition(&fresh));
+                assert_eq!(resumed.funcs, fresh.funcs);
+                assert_eq!(resumed.refs, fresh.refs);
+            }
+        }
     }
 }
