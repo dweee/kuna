@@ -1,10 +1,11 @@
 name: Sync and test upstream
-on:
+'on':
   schedule:
-    - cron: '17 */6 * * *'
-  workflow_dispatch:
+  - cron: 17 */6 * * *
+  workflow_dispatch: null
   repository_dispatch:
-    types: [upstream-updated]
+    types:
+    - upstream-updated
 permissions: {}
 jobs:
   upstream:
@@ -14,15 +15,9 @@ jobs:
       actions: write
       checks: read
       statuses: write
-    uses: dweee/dave-fork-ci/.github/workflows/upstream-sync.yml@02d38fe80b2fecb41503a90943fd04000174b955
+    uses: dweee/dave-fork-ci/.github/workflows/upstream-sync.yml@753d456d912f24b95126107b953e1ddf15536e8b
     with:
       tool-repository: dweee/dave-fork-ci
-      tool-revision: 02d38fe80b2fecb41503a90943fd04000174b955
-      auto-merge: ${{ vars.FORK_CI_AUTO_MERGE == 'true' && vars.ATTIC_PUSH_ENABLED == 'true' }}
-      cache: ${{ vars.ATTIC_PUSH_ENABLED == 'true' }}
-      attic-endpoint: ${{ vars.ATTIC_ENDPOINT }}
-      attic-cache: ${{ vars.ATTIC_CACHE }}
-      attic-substituter: ${{ vars.ATTIC_SUBSTITUTER }}
-      attic-public-key: ${{ vars.ATTIC_PUBLIC_KEY }}
-    secrets:
-      ATTIC_TOKEN: ${{ secrets.ATTIC_TOKEN }}
+      tool-revision: 753d456d912f24b95126107b953e1ddf15536e8b
+      auto-merge: ${{ vars.FORK_CI_AUTO_MERGE == 'true' && (vars.NIKS3_PUSH_ENABLED || vars.ATTIC_PUSH_ENABLED) == 'true' }}
+      cache: ${{ (vars.NIKS3_PUSH_ENABLED || vars.ATTIC_PUSH_ENABLED) == 'true' }}
