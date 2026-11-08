@@ -50,6 +50,8 @@ pub(crate) struct PltSym {
     pub addr: u64,
     /// Imported function name (raw `.dynstr` bytes, `@VERSION` stripped).
     pub name: Vec<u8>,
+    /// The GOT slot the stub jumps through, when it was decoded from the stub.
+    pub slot: Option<u64>,
 }
 
 /// Resolve PLT-stub call targets to their imported function names.
@@ -76,6 +78,9 @@ pub(crate) fn resolve_plt_imports(file: &object::File, bytes: &[u8]) -> Vec<PltS
 /// intact — which is every image that ever reached this code before.
 fn resolve_from_sections(file: &object::File) -> Vec<PltSym> {
     let arch = file.architecture();
+    if arch == Architecture::PowerPc {
+        return super::kuna_ppc32_imports::resolve(file);
+    }
 
     // MIPS has no regular `.plt` code section and emits NO `R_MIPS_JUMP_SLOT`
     // relocations for its lazy imports: the stub→name correspondence is carried by
@@ -83,7 +88,7 @@ fn resolve_from_sections(file: &object::File) -> Vec<PltSym> {
     // by relocations.  It therefore runs its own resolver (`resolve_mips_imports`)
     // *before* the relocation-driven path below, which would otherwise early-return
     // on the empty `build_got_name_map`.  See [`resolve_mips_imports`].
-    if matches!(arch, Architecture::Mips | Architecture::Mips64) {
+    if super::kuna_mipsabi::is_mips(arch) {
         return resolve_mips_imports(file);
     }
 
@@ -205,13 +210,7 @@ fn resolve_from_sections(file: &object::File) -> Vec<PltSym> {
 /// this path cannot supply.
 fn resolve_from_dynamic_segment(file: &object::File, bytes: &[u8]) -> Vec<PltSym> {
     let arch = file.architecture();
-    if matches!(
-        arch,
-        Architecture::Mips
-            | Architecture::Mips64
-            | Architecture::PowerPc
-            | Architecture::PowerPc64
-    ) {
+    if super::kuna_mipsabi::is_mips(arch) || matches!(arch, Architecture::PowerPc | Architecture::PowerPc64) {
         return Vec::new();
     }
     let Some(imports) = super::elf_dynseg::dynamic_imports(bytes) else {
@@ -348,7 +347,7 @@ fn decode_x86_64_ifunc_stubs(
                 if !named.contains_key(&got) && named_got.insert(got) {
                     let stub =
                         vma + x86_stub_start(data, i, &[0xF3, 0x0F, 0x1E, 0xFA]) as u64;
-                    out.push(PltSym { addr: stub, name: format!("ifunc_{resolver:x}").into_bytes() });
+                    out.push(PltSym { addr: stub, name: format!("ifunc_{resolver:x}").into_bytes(), slot: None });
                 }
             }
             i += 6;
@@ -425,7 +424,7 @@ fn record(
 ) {
     if let Some(name) = map.get(&got) {
         if named_got.insert(got) {
-            out.push(PltSym { addr: stub, name: name.clone() });
+            out.push(PltSym { addr: stub, name: name.clone(), slot: Some(got) });
         }
     }
 }
@@ -774,10 +773,7 @@ fn decode_riscv(
 /// avoids relying on a `.TOC.` symbol being present.  If there is no `.got`
 /// section the binary has no TOC-relative imports and we resolve nothing.
 ///
-/// PPC32 (`Architecture::PowerPc`, big-endian) uses a different secure-PLT stub
-/// shape that this routine does not model, so it no-ops there — left as a hook
-/// (`decode_ppc_text` reads words honoring endianness, so a future PPC32 arm can
-/// slot in here).
+/// PPC32 uses the separate relocation-validated `kuna_ppc32_imports` resolver.
 fn decode_ppc_text(
     file: &object::File,
     arch: Architecture,
@@ -978,7 +974,7 @@ fn resolve_mips_imports(file: &object::File) -> Vec<PltSym> {
         // import's `refAddr`); this is the indirect call target the decompiler
         // resolves after $gp recovery.  Skip a 0 slot (unresolvable).
         if ext.stub_addr != 0 {
-            out.push(PltSym { addr: ext.stub_addr, name: ext.name });
+            out.push(PltSym { addr: ext.stub_addr, name: ext.name, slot: None });
         }
     }
     out
@@ -988,16 +984,19 @@ fn resolve_mips_imports(file: &object::File) -> Vec<PltSym> {
 /// marked **constant** so the engine folds the `lw $t9, off($gp)` indirect-call
 /// load to the stub address (the analog of `setConstant` on the GOT pointer
 /// entries in Ghidra's `MIPS_ElfExtension.fixupGot`).  Empty off-MIPS or when the
-/// `DT_MIPS_*` tags are absent.  One slot per external dynamic symbol (FUNC or
-/// not — a constant GOT pointer is harmless for non-FUNC slots and matches
-/// Ghidra, which `setConstant`s every external GOT entry).
+/// `DT_MIPS_*` tags are absent.  One slot per undefined function import that has
+/// a lazy stub. A slot holding 0 belongs to an import with no stub (its address
+/// is taken, or it is a weak reference); the dynamic linker writes the import's
+/// address there at load time, so the 0 is not its value and the slot stays
+/// variable.
 pub(crate) fn mips_got_const_ranges(file: &object::File) -> Vec<(u64, u64)> {
-    if !matches!(file.architecture(), Architecture::Mips | Architecture::Mips64) {
+    if !super::kuna_mipsabi::is_mips(file.architecture()) {
         return Vec::new();
     }
     let ptr = if file.is_64() { 8u64 } else { 4u64 };
     mips_external_got_entries(file)
         .into_iter()
+        .filter(|e| e.stub_addr != 0)
         .map(|e| (e.slot_addr, e.slot_addr.wrapping_add(ptr - 1)))
         .collect()
 }
@@ -1005,6 +1004,7 @@ pub(crate) fn mips_got_const_ranges(file: &object::File) -> Vec<(u64, u64)> {
 /// One external-symbol GOT entry on MIPS: the dynsym name, the GOT slot address,
 /// and the slot's static contents (the `.MIPS.stubs` stub address it points at).
 struct MipsExtGot {
+    symbol_index: u64,
     name: Vec<u8>,
     slot_addr: u64,
     stub_addr: u64,
@@ -1051,10 +1051,11 @@ fn mips_external_got_entries(file: &object::File) -> Vec<MipsExtGot> {
             Ok(n) if !n.is_empty() => strip_version(n),
             _ => continue,
         };
-        let got_index = local_gotno + (idx as u64 - gotsym);
-        let slot_addr = got_base.wrapping_add(got_index * ptr as u64);
+        let Some(slot_addr) = local_gotno.checked_add(idx as u64 - gotsym)
+            .and_then(|index| index.checked_mul(ptr as u64))
+            .and_then(|offset| got_base.checked_add(offset)) else { continue };
         let stub_addr = read_word_at_vma(file, slot_addr, ptr, le).unwrap_or(0);
-        out.push(MipsExtGot { name, slot_addr, stub_addr });
+        out.push(MipsExtGot { name, slot_addr, stub_addr, symbol_index: idx as u64 });
     }
 
     out
@@ -1441,4 +1442,9 @@ mod tests {
         got.sort();
         assert_eq!(got, vec![(entry(1), b"printf".to_vec()), (entry(2), b"puts".to_vec())]);
     }
+}
+
+/// Dynamic-symbol identities for validating lazy-binding stub instructions.
+pub(super) fn mips_stub_identities(file: &object::File<'_>) -> Vec<(u64, u64)> {
+    mips_external_got_entries(file).into_iter().map(|entry| (entry.stub_addr, entry.symbol_index)).collect()
 }
