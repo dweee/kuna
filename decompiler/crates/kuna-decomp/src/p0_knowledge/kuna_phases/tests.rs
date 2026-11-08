@@ -32,19 +32,19 @@ fn subphase_count_is_48() {
 }
 
 #[test]
-fn surface_count_is_120() {
-    assert_eq!(kuna_num_surfaces(), 120);
-    assert_eq!(SURFACE_TABLE.len(), 120);
+fn surface_count_is_121() {
+    assert_eq!(kuna_num_surfaces(), 121);
+    assert_eq!(SURFACE_TABLE.len(), 121);
 }
 
 #[test]
-fn settable_count_is_318() {
-    assert_eq!(kuna_num_settables(), 318);
-    assert_eq!(SETTABLE_TABLE.len(), 318);
+fn settable_count_is_388() {
+    assert_eq!(kuna_num_settables(), 388);
+    assert_eq!(SETTABLE_TABLE.len(), 388);
 }
 
 #[test]
-fn tier_counts_are_115_core_123_transform_80_analysis() {
+fn tier_counts_are_135_core_155_transform_98_analysis() {
     let mut core = 0;
     let mut transform = 0;
     let mut analysis = 0;
@@ -56,7 +56,7 @@ fn tier_counts_are_115_core_123_transform_80_analysis() {
             other => panic!("invalid tier {other:?} on {}", s.option),
         }
     }
-    assert_eq!((core, transform, analysis), (115, 123, 80));
+    assert_eq!((core, transform, analysis), (135, 155, 98));
 }
 
 #[test]
@@ -246,7 +246,7 @@ fn option_values_set_validates_against_values() {
 }
 
 #[test]
-fn option_values_live_value_present_for_110() {
+fn option_values_live_value_present_for_186() {
     let ov = OptionValues::default();
     // 28 options have a codegen live reader (realtypes + dedupvardecls join the
     // field-backed group; switchguardbound is field-backed via switch_guard_bound;
@@ -274,6 +274,36 @@ fn option_values_live_value_present_for_110() {
         // no codegen live reader (read console-side via kuna_live_value), same as
         // `libproto` above. Default-ON (DIV-65).
         "libcsigs",
+        // (kuna) Discriminant-value naming -- a load-time env bridge
+        // (`KUNA_VARIANTNAMES`, the dwarfstructs/dwarfvariants pattern) whose
+        // live state is read console-side via `kuna_live_value`, so it has no
+        // codegen live reader.
+        "variantnames",
+        // (kuna) The source-language override — a loadtime env bridge
+        // (`KUNA_SOURCELANG`, the rexthunk/relocobjects pattern) whose live
+        // state is read console-side via `kuna_live_value` (it reports the
+        // option, `auto` by default, not the detected fact), so it has no
+        // codegen live reader.
+        "sourcelang",
+        // (kuna) Swift demangling - a loadtime env bridge (`KUNA_SWIFTDEMANGLE`,
+        // the rexthunk pattern); live state read console-side.
+        "swiftdemangle",
+        // (kuna) golang cspec selection - a loadtime env bridge (`KUNA_GOABI`,
+        // the rexthunk/sourcelang pattern) whose live state is read
+        // console-side via `kuna_live_value` (auto|off token), so it has no
+        // codegen live reader.
+        "goabi",
+        // (kuna) The goroutine-register naming — a load-time env bridge
+        // (`KUNA_GOREG`, the goabi seam), read console-side via kuna_live_value.
+        "goreg",
+        // (kuna) The Go pclntab no-return pass gate - an analysis-pass gate
+        // with no codegen live reader (read console-side via kuna_live_value),
+        // same as `gopclntab`. Default-ON (Go-only pass).
+        "gonoreturn",
+        // (kuna) The length-carried literal rule — three-valued, read
+        // console-side via `kuna_live_value` (its token), no codegen live
+        // reader.
+        "fatstr",
         // (kuna) The named libc/POSIX aggregate types — a load-time analysis gate
         // read through the `KUNA_LIBCTYPES` env bridge (the named shells are
         // interned while the prototype pass builds its signatures, upstream of
@@ -288,6 +318,9 @@ fn option_values_live_value_present_for_110() {
         // with no codegen live reader (read console-side via kuna_live_value),
         // same as `libcsigs` above. Default-ON (DIV-141).
         "win32sigs",
+        // (kuna) The libgcc `__divdi3` contract -- an analysis-pass gate read
+        // console-side via kuna_live_value, like `libcsigs`. Default-off.
+        "libgccsigs",
         "strings",
         // (kuna) The 2-byte (UTF-16LE) width of the string-literal pass — an
         // analysis-pass gate read at the commit boundary (console-side via
@@ -348,6 +381,10 @@ fn option_values_live_value_present_for_110() {
         // gate read console-side via kuna_live_value, like the gates around it.
         // Default-ON, raw-container only.
         "rawdiscover",
+        // (kuna #1288) The MS-DOS evidence for rawdiscover's call sweep -- an
+        // analysis-tier gate read console-side via kuna_live_value. Default-ON,
+        // MZ loads only.
+        "mzsweep",
         "noreturn_disc",
         // (kuna, GH-312) The positive-evidence-only tally for `noreturn_disc` -- a
         // sub-rule gate with no codegen live reader (read console-side via
@@ -398,6 +435,7 @@ fn option_values_live_value_present_for_110() {
         // an analysis-tier gate with no codegen live reader, like `unmappedentry`
         // above. Default-ON.
         "thumbswitch",
+        "x86listingswitch",
         // (kuna) Register-chain jump-table reach in the reference walk -- an
         // analysis-tier gate with no codegen live reader, like `thumbswitch`
         // above. Default-ON.
@@ -414,6 +452,10 @@ fn option_values_live_value_present_for_110() {
         // with no codegen live reader (read console-side via kuna_live_value), like
         // `unmappedentry` above. Default-ON.
         "ppclocalentry",
+        // (kuna, GH-1289) Go pclntab functions out of the fast inventory walk --
+        // an analysis-tier gate with no codegen live reader (read console-side via
+        // kuna_live_value), like `ppclocalentry` above. Default-ON.
+        "gowalkprune",
         // (kuna, GH-780) ARM flow-proven decode-mode paints -- an analysis-tier
         // gate read console-side via kuna_live_value, like `ppclocalentry` above.
         // Default-ON.
@@ -455,6 +497,9 @@ fn option_values_live_value_present_for_110() {
         // `tailcallentry` above. Default-off, ARM-only.
         "poolentry",
         "gopclntab",
+        // (kuna) The Go runtime-type harvest - a loadtime env bridge
+        // (KUNA_GOTYPES, the dwarfstructs pattern); no codegen live reader.
+        "gotypes",
         // (kuna) Mach-O Objective-C metadata recovery — an analysis-pass gate with
         // no codegen live reader (read console-side via kuna_live_value), like the
         // gates around it. Default-off, Mach-O-only.
@@ -466,9 +511,13 @@ fn option_values_live_value_present_for_110() {
         // (kuna) loader-tier gate, no codegen live reader (read console-side via
         // kuna_live_value), same as the analysis-pass gates above.
         "i386_pie_plt",
+        "ppc32picimports",
         // (kuna) x86-64 IFUNC PLT-stub naming: a load-time gate read via the
         // `kuna_ifuncfpret` env var (no codegen live reader), like `i386_pie_plt`.
         "ifuncfpret",
+        // (kuna) PowerPC APU-note language selection: a load-time gate read via
+        // the `kuna_ppcapu` env var, like `ifuncfpret`.
+        "ppcapu",
         // (kuna) Relocatable-object analysis rebase (GH-289): a load-time gate read
         // via the `kuna_relocrebase` env var (the analyzer tier runs inside `load
         // file`), like `i386_pie_plt`. Default-ON (DIV-79).
@@ -498,6 +547,8 @@ fn option_values_live_value_present_for_110() {
         // analysis COMMIT boundary (console-side via kuna_live_value), like the
         // analysis-pass gates above. Default-on.
         "cppproto",
+        "godwarfsig",
+        "gopairreturns",
         // (kuna) Demangled C++ signature application — an analysis-tier gate read
         // at the analysis COMMIT boundary (console-side via kuna_live_value), like
         // `cppproto` above. Three-valued, default `proven`.
@@ -528,6 +579,10 @@ fn option_values_live_value_present_for_110() {
         // kuna_live_value like the analysis-pass gates above, so it has no
         // codegen live_value. Default-on.
         "picbase",
+        // (kuna `lazyfuncs`) The deferred entry commit -- read console-side at
+        // `read symbols` (the commit either creates a Function per entry or parks
+        // the starts), so it has no codegen live reader. Default-off.
+        "lazyfuncs",
     ];
     let mut with_live = 0;
     for i in 0..kuna_num_settables() {
@@ -542,6 +597,7 @@ fn option_values_live_value_present_for_110() {
                     matches!(
                         st.option,
                         "outline"
+                            | "outlang"
                             | "loweredswitch"
                             | "regionstructure"
                             | "regionlooprefine"
@@ -579,6 +635,7 @@ fn option_values_live_value_present_for_110() {
                             | "returndup"
                             | "orchain"
                             | "rettriangle"
+                            | "clonephiorder"
                             | "earlyreturn"
                             | "switchreturn"
                             | "loopbreak_recovery"
@@ -596,6 +653,22 @@ fn option_values_live_value_present_for_110() {
                             // the same reason `pebnames` is here. Its live value
                             // is `Architecture::ptr_from_use`.
                             | "ptrfromuse"
+                            // (kuna) `readonlycalls` takes `off|on|<n>`, a guard
+                            // count; its live value is `Architecture::readonly_calls`.
+                            | "readonlycalls"
+                            // (kuna) `persistcalls` takes `off|on|<n>`, a guard
+                            // count; its live value is `Architecture::persist_calls`.
+                            | "persistcalls"
+                            // (kuna) `deadcascade` takes `off|on|<n>`, a pass
+                            // count; its live value is `Architecture::dead_cascade`.
+                            | "deadcascade"
+                            // (kuna) `retsplitlimit` takes `off|<n>`, an op count;
+                            // its live value is `Architecture::ret_split_limit`.
+                            | "retsplitlimit"
+                            // (kuna) `narrowargs` takes `off|on|callers`; its
+                            // live value is the pair `Architecture::narrow_args`
+                            // and `Architecture::narrow_args_callers`.
+                            | "narrowargs"
                             // (kuna) `structsynth` takes a MODE (`off|param|nest`),
                             // for the same reason.  Its live value is
                             // `Architecture::struct_synth`.
@@ -642,10 +715,18 @@ fn option_values_live_value_present_for_110() {
                             // same reason.  Its live value is
                             // `Architecture::syscall_regs`.
                             | "syscallregs"
+                            // (kuna) `callmechanisms` takes a MODE
+                            // (`off|auto|on`) over an enum field, for the
+                            // same reason.  Its live value is
+                            // `Architecture::call_mechanism_mode`.
+                            | "callmechanisms"
                             // (kuna) `bejoin` takes a MODE (`off|evidence|on`)
                             // over an enum field, for the same reason.  Its live
                             // value is `Architecture::be_join`.
                             | "bejoin"
+                            // (kuna) `bejoinpass` likewise (`off|whole|high`);
+                            // its live value is `Architecture::be_join_pass`.
+                            | "bejoinpass"
                             | "arraycoverwidth"
                             | "bytearrayc"
                             | "emptystrconst"
@@ -693,6 +774,21 @@ fn option_values_live_value_present_for_110() {
                             | "guardarm"
                             | "loopcondhoist"
                             | "rustabi"
+                            // (kuna) `gomorestack` takes a MODE
+                            // (`off|auto|always`) over a u8 field, the
+                            // rustabi shape; its live value is
+                            // `Architecture::go_morestack`.
+                            | "gomorestack"
+                            | "rustprobestack"
+                            // (kuna) `gobool` takes the same MODE shape; its
+                            // live value is `Architecture::go_bool`.
+                            | "gobool"
+                            // (kuna) `fpuemu` takes the same MODE shape; its
+                            // live value is `Architecture::fpu_emu`.
+                            | "fpuemu"
+                            // (kuna) `gowritebarrier`: the same MODE shape;
+                            // its live value is `Architecture::go_write_barrier`.
+                            | "gowritebarrier"
                             // (kuna) `impliedrefs`/`termdup` take an INTEGER
                             // (`2|3|4|<n>`), which the codegen live reader (a
                             // bool `live_true`/`live_false` pair) cannot
@@ -839,7 +935,34 @@ fn option_values_live_value_present_for_110() {
     // 144 -> 145: +1 for `callerptr` (live_field = caller_ptr).
     // 145 -> 146: +1 for `regnarrow` (live_field = narrow_locals).
     // 146 -> 147: +1 for `narrowret` (live_field = narrow_ret).
-    assert_eq!(with_live, 147);
+    // 147 -> 146: `narrowargs` takes `off|on|callers` and has no live_field.
+    // 146 -> 147: +1 for `slotreport` (live_field = slot_report).
+    // 147 -> 148: +1 for `callmechanisms` (live_field = call_mechanism_effects).
+    // 148 -> 149: +1 for `slotsplit` (live_field = slot_split).
+    // 151 -> 152: +1 for `regsigned` (live_field = narrow_signed).
+    // 152 -> 153: +1 for `callwide` (live_field = call_wide).
+    // 153 -> 154: +1 for `pairrefine` (live_field = pair_refine).
+    // 154 -> 156: +2 for `readonlycalls` and `prunedssa` (readonly_calls, pruned_ssa).
+    // 156 -> 157: +1 for `segmentize` (live_field = segmentize).
+    // 157 -> 158: +1 for `loadguardreads` (load_guard_reads).
+    // 158 -> 157: `readonlycalls` takes `off|on|<n>` and has no live_field.
+    // 157 -> 158: +1 for `deadwaves` (pool_dead_waves).
+    // 158 -> 159: +1 for `earlyrestart` (early_restart).
+    // 159 -> 160: +1 for `pltlocal` (plt_local_calls).
+    // 160 -> 161: +1 for `haltloopguard` (halt_loop_guard).
+    // 161 -> 162: +1 for `truncptrflow` (trunc_ptr_flow).
+    // 168 -> 169: +1 for `switchrunon` (switch_run_on).
+    // 175 -> 176: +1 for `highsliceguard` (highslice_guard).
+    // 176 -> 177: +1 for `mipsunaligned` (mips_unaligned).
+    // 177 -> 178: +1 for `gottailcall` (got_tail_call).
+    // 179 -> 180: +1 for `copywaves` (pool_copy_waves).
+    // 180 -> 182: +2 for `stubtailcall` (stub_tail_call) and `gotimportproto` (got_import_proto).
+    // 182 -> 183: +1 for `aggregatefields` (aggregate_fields).
+    // 179 -> 180: +1 for `exclusivecallret` (exclusive_call_ret).
+    // 179 -> 178: `callmechanisms` takes `off|auto|on` and has no live_field.
+    // 179 -> 182: +1 for `copywaves` (pool_copy_waves), +2 for `armpltslot` and `armcondskip` (analysis_armpltslot, analysis_armcondskip).
+    // 179 -> 181: +1 for `copywaves` (pool_copy_waves), +1 for `armderef` (analysis_armderef).
+    assert_eq!(with_live, 186);
 }
 
 #[test]
@@ -1037,7 +1160,44 @@ fn emit_catalog_json_static_form_brackets_and_commas() {
     // +1 for `bytearrayc`; its P9 row sits mid-table.
     // +2 for `wideslice` and `devectorize`.
     // +1 for `addrtakenentry`; its P1 row sits mid-table beside `thunkentry`.
-    assert_eq!(json.matches("},\n").count(), 317);
+    // +1 for `lazyfuncs`; its P1 row sits beside `addrtakenentry`.
+    // +1 for `pairrefine`; its P3 row sits beside `splitstorekeep`.
+    // +1 for `sourcelang`; its P1 row sits beside `gopclntab`.
+    // +1 for `fatstr`; its P5 row sits beside `sourcelang`.
+    // +1 for `gomorestack`; its P2 row sits beside `sourcelang`.
+    // +1 for `gonoreturn`; its P1 row sits beside `sourcelang`.
+    // +1 for `variantnames`; its P5 row sits beside `dwarfvariants`.
+    // +1 for `goabi`; its P1 row sits beside `sourcelang`.
+    // +1 for `gowritebarrier`; its P2 row sits beside `gomorestack`.
+        // +1 for `goreg`; its P1 row sits beside `goabi`.
+    // +1 for `gobool`; its P4 row sits beside `sourcelang`.
+    // +1 for `swiftdemangle`; its P1 row sits beside `sourcelang`.
+    // +2 for `readonlycalls` and `prunedssa`; their P3 rows sit at the end.
+    // +1 for `segmentize`; its P3 row sits beside `x64syscall`.
+    // +1 for `gowalkprune`; its P1 row sits beside `gonoreturn`.
+    // +1 for `loadguardreads`; its P3 row sits after `prunedssa`.
+    // +1 for `mzsweep`; its P1 row sits beside `rawdiscover`.
+    // +1 for `fpuemu`; its P2 row sits beside `decodehalt`.
+    // +1 for `retsplitlimit`; its P8 row sits after `retsplitglobal`.
+    // +1 for `deadwaves`; its P3 row sits after `jtsharepartial`.
+    // +1 for `earlyrestart`; its P3 row sits after `deadwaves`.
+    // +1 for `pltlocal`; its P4 row sits after `passthrough`.
+    // +1 for `haltloopguard`; its P3 row sits after `earlyrestart`.
+    // +1 for `truncptrflow`; its P3 row sits after `haltloopguard`.
+    // +1 for `clonephiorder`; its P8 row sits after `rettriangle`.
+    // +1 for `switchrunon`; its P2 row sits after `switchsharedcase`.
+    // +1 for `bejoinpass`; its P4 row sits after `bejoin`.
+    // +1 for `persistcalls`; its P3 row sits after `readonlycalls`.
+    // +1 for `copywaves`; its P3 row sits after `deadwaves`.
+    // +1 for `deadcascade`; its P3 row sits after `copywaves`.
+    // +2 for `stubtailcall` (after `mappedflowboundary`) and `gotimportproto` (after `pltlocal`).
+    // +1 for `aggregatefields`; its P5 row sits after `fieldtype`.
+    // +1 for `ppcapu`; its P1 row sits after `ifuncfpret`.
+    // +1 for `exclusivecallret`; its P4 row sits after `exclusivearguse`.
+    // +1 for `copywaves`, its P3 row after `deadwaves`; +1 for `deadcascade`, its P3 row after `copywaves`;
+    // +2 for `armpltslot` and `armcondskip`, their P1 rows beside `armwalkmode`.
+    // +1 for `armderef`, its P1 row after `armwalkmode`.
+    assert_eq!(json.matches("},\n").count(), 387);
 }
 
 #[test]

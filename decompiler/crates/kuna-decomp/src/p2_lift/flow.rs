@@ -332,6 +332,9 @@ pub trait FlowEnvironment {
         Ok(None)
     }
 
+    /// A PC-capture transfer to an interior the loader assigned to this function.
+    fn is_ppc_pc_capture(&self, _fd: &Funcdata, _op: OpId) -> bool { false }
+
     /// (kuna) GH-8817: is `op` a V850 `jmp [reg]` CALLIND to reclassify as
     /// BRANCHIND? (C++ `kunaIsV850IndirectJmp`).
     ///
@@ -439,6 +442,14 @@ pub trait FlowEnvironment {
     /// (`queryCall`'s `copyFlowEffects` postpone), so only the name is needed
     /// here.  The default returns no name (no symbol table in the W3 shell).
     fn query_call(&self, _entry: &Address) -> Option<String> {
+        None
+    }
+
+    /// (kuna `pltlocal`) The function the PLT stub at a direct-call `entry` is
+    /// bound to by the image's own relocations, which the call spec is built at.
+    /// The default shell has no loader and reports `None`. See
+    /// [`crate::p4_calls::kuna_pltlocal`].
+    fn query_call_definition(&self, _entry: &Address) -> Option<Address> {
         None
     }
 
@@ -637,6 +648,8 @@ pub struct FlowInfo<'a, E: FlowEnvironment> {
     /// Does the function have registered flow override instructions
     /// (C++ `flowoverride_present`).
     flowoverride_present: bool,
+    /// Whether `stubtailcall` applies to this run.
+    loader_transfers_present: bool,
     /// Exact instruction addresses where a `BRANCH` override applied during
     /// this flow follow.
     applied_branch_overrides: std::collections::BTreeSet<Address>,
@@ -725,6 +738,7 @@ impl<'a, E: FlowEnvironment> FlowInfo<'a, E> {
         // env-routed `has_flow_override` is the W2-era boundary default (always false)
         // and is OR'd in only for back-compat with envs that still carry it.
         let flowoverride_present = data.get_override().has_flow_override() || env.has_flow_override();
+        let loader_transfers_present = crate::kuna_stubtailcall::active(data.get_arch());
         FlowInfo {
             data,
             env,
@@ -745,6 +759,7 @@ impl<'a, E: FlowEnvironment> FlowInfo<'a, E> {
             minaddr: entry.clone(),
             maxaddr: entry,
             flowoverride_present,
+            loader_transfers_present,
             applied_branch_overrides: std::collections::BTreeSet::new(),
             flags: 0,
             qlst_count: 0,
@@ -1295,6 +1310,25 @@ impl<'a, E: FlowEnvironment> FlowInfo<'a, E> {
         Ok(())
     }
 
+    /// Follow a CALL whose return continuation is not code as a BRANCH to `dest`.
+    fn follow_call_as_branch(
+        &mut self,
+        curop: OpId,
+        dest: &Address,
+        maxtime: uintm,
+        cursor: &mut Option<OpId>,
+        startbasic: &mut bool,
+    ) -> KunaResult<()> {
+        self.data.op_set_opcode_code(curop, OpCode::CPUI_BRANCH);
+        self.new_address(curop, dest)?;
+        if self.data.obank().get(curop).expect("call-transfer: stale call op").get_time() >= maxtime {
+            self.delete_remaining_ops(*cursor)?;
+            *cursor = None;
+        }
+        *startbasic = true;
+        Ok(())
+    }
+
     /// Analyze control-flow within p-code for a single instruction (C++
     /// `xrefControlFlow`, `flow.cc:266`).
     ///
@@ -1434,7 +1468,9 @@ impl<'a, E: FlowEnvironment> FlowInfo<'a, E> {
                     let destaddr = self.branch_in0_addr(curop);
                     let popret = !destaddr.is_constant()
                         && self.env.pops_return_address(&destaddr);
-                    if !destaddr.is_constant()
+                    if self.env.is_ppc_pc_capture(&self.data, curop) {
+                        self.follow_call_as_branch(curop, &destaddr, maxtime, &mut cursor, startbasic)?;
+                    } else if !destaddr.is_constant()
                         && (popret || self.env.is_return_discarding_trampoline(&destaddr))
                     {
                         // (kuna calltrampoline / callpopret) The callee throws
@@ -1449,7 +1485,6 @@ impl<'a, E: FlowEnvironment> FlowInfo<'a, E> {
                         // which claims it (the fragment is a known function
                         // entry precisely because it is a CALL target) and ends
                         // the caller at a synthetic tail call.
-                        self.data.op_set_opcode_code(curop, OpCode::CPUI_BRANCH);
                         let site = self
                             .data
                             .obank()
@@ -1467,12 +1502,7 @@ following this call as a branch"
                             ),
                             &site,
                         );
-                        self.new_address(curop, &destaddr)?;
-                        if self.data.obank().get(curop).expect("xref").get_time() >= maxtime {
-                            self.delete_remaining_ops(cursor)?;
-                            cursor = None;
-                        }
-                        *startbasic = true;
+                        self.follow_call_as_branch(curop, &destaddr, maxtime, &mut cursor, startbasic)?;
                     } else if self.setup_call_specs(curop)? {
                         // The C++ `--oiter` backs up to the op *after* the call —
                         // the noreturn halt `checkForFlowModification` just inserted
@@ -1763,10 +1793,15 @@ following this call as a branch"
         let marker: Option<OpId> = if emptyflag { None } else { self.dead_tail() };
 
         // (the per-function Override lives on the Funcdata; `localoverride`).
-        let flowoverride: uint4 = if self.flowoverride_present {
+        let explicit: uint4 = if self.flowoverride_present {
             self.data.get_override().get_flow_override(curaddr)
         } else {
             crate::overrides::flow_type::NONE
+        };
+        let flowoverride = if self.loader_transfers_present {
+            crate::kuna_stubtailcall::flow_override(self.data.get_arch(), curaddr, explicit)
+        } else {
+            explicit
         };
 
         let mode = self.arm_context.then(|| self.env.arm_decode_mode(curaddr)).flatten();
@@ -2578,10 +2613,8 @@ truncating the fall-through here"
     /// caller binds it to the real [`Architecture`]'s action root).  For each
     /// recovered table, `newAddress` re-fills as much flow as possible.
     ///
-    /// STUB(W4): `checkContainedCall` / `checkMultistageJumptables` (the PIC /
-    /// multistage outer loop) need the override table + FuncCallSpecs; the single
-    /// recovery pass over the current `tablelist` is the load-bearing part for the
-    /// corpus and runs fully.
+    /// STUB(W4): `checkContainedCall` (the PIC outer loop) needs FuncCallSpecs;
+    /// `checkMultistageJumptables` re-queues a table a multistage hint marks.
     ///
     /// The outer `do/while` drains `injectlist` on every round (`flow.cc:819`), so a
     /// registered `<callotherfixup>` is applied to table-discovered flow exactly as it
@@ -2611,15 +2644,34 @@ truncating the fall-through here"
                     }
                 }
             }
-            // STUB(W4): checkContainedCall + checkMultistageJumptables (outer
-            // do/while) — the multistage/inline restart that could re-populate
-            // tablelist is the W4 override table; the single pass suffices for the
-            // corpus switches.
+            // STUB(W4): checkContainedCall (PIC constructions) is not ported.
+            self.check_multistage_jumptables()?;
             if self.has_inject() {
                 self.inject_pcode()?;
             }
             if self.tablelist.is_empty() {
                 break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Queue each jump-table that a multistage hint asks to recover again,
+    /// now that flow has filled in more of the function (C++
+    /// `FlowInfo::checkMultistageJumptables`, `flow.cc:1393`).
+    fn check_multistage_jumptables(&mut self) -> KunaResult<()> {
+        for i in 0..self.data.num_jump_tables() {
+            let mut jt = std::mem::replace(
+                self.data.get_jump_table_mut(i),
+                crate::jumptable::JumpTable::new(Address::default()),
+            );
+            let res = jt.check_for_multistage(&self.data);
+            let indop = jt.get_indirect_op();
+            *self.data.get_jump_table_mut(i) = jt;
+            if res? {
+                if let Some(op) = indop {
+                    self.tablelist.push(op);
+                }
             }
         }
         Ok(())
@@ -2755,7 +2807,10 @@ truncating the fall-through here"
             let haltop = self.artificial_halt(&addr, pcodeop_flags::noreturn)?;
             self.data.op_dead_insert_after(haltop, op);
             if !is_inline {
-                self.data.warning("Subroutine does not return", &addr);
+                let text = if self.data.ppc32_pic_calls.contains_key(&addr.get_offset()) {
+                    crate::kuna_ppc32piccalls::WARNING
+                } else { "Subroutine does not return" };
+                self.data.warning(text, &addr);
             }
             return Ok(true);
         }
@@ -2862,7 +2917,17 @@ truncating the fall-through here"
     /// \e fspec annotation in0 + register the printed name.
     fn build_call_specs(&mut self, op: OpId, entry: Address, indirect: bool) -> KunaResult<()> {
         use crate::fspec::FuncCallSpecs;
-        let mut fc = FuncCallSpecs::new(op, entry.clone());
+        if crate::kuna_ppc32piccalls::bind(&mut self.data, op, &entry, indirect)? {
+            return Ok(());
+        }
+        let callee = (!indirect && !entry.is_invalid())
+            .then(|| self.env.query_call_definition(&entry))
+            .flatten()
+            .unwrap_or_else(|| entry.clone());
+        let mut fc = FuncCallSpecs::new(op, callee.clone());
+        if callee != entry {
+            fc.set_plt_stub(entry.clone());
+        }
         // C++ `data.getOverride().applyPrototype(data, *res)` (flow.cc:706 direct /
         // flow.cc:732 indirect, BEFORE `queryCall`): an `override prototype <addr>
         // <decl>` keyed by the call op's address copies its parsed prototype onto
@@ -2890,7 +2955,7 @@ truncating the fall-through here"
         // postponed to ActionDefaultParams).
         if !indirect && !entry.is_invalid() {
             if let Some(name) = self.env.query_call(&entry) {
-                let _ = fc.set_funcdata(entry.clone(), &name);
+                let _ = fc.set_funcdata(callee.clone(), &name);
             }
             // C++ queryCall: fspecs.copyFlowEffects(otherfunc->getFuncProto()) —
             // copies the IS_INLINE / NO_RETURN flow effects from the callee proto.
@@ -2936,11 +3001,16 @@ truncating the fall-through here"
             // datatest renders the cloned body, not a modeled call).  So we
             // restrict the pre-seat to NON-inline calls, exactly mirroring which
             // calls the C++ ActionDefaultParams copy arm actually reaches.
-            if !is_inline_call && !fc.proto().has_model() {
+            // (kuna `armfloatreturn`) A declared AEABI helper is laid out under
+            // the core-register model by ActionDefaultParams instead.
+            let helper = crate::kuna_armfloatreturn::declared_helper_model(self.data.get_arch(), fc.get_name()).is_some();
+            if !is_inline_call && !fc.proto().has_model() && !helper {
                 let callee_proto = if entry.is_invalid() {
                     None
                 } else {
-                    self.data.get_arch().query_callee_proto(&entry)
+                    let arch = self.data.get_arch();
+                    arch.query_callee_proto(&entry)
+                        .or_else(|| (callee != entry).then(|| arch.query_callee_proto(&callee)).flatten())
                 };
                 if let Some(callee_proto) = callee_proto {
                     fc.proto_mut().copy(&callee_proto);
@@ -3042,7 +3112,9 @@ truncating the fall-through here"
     /// into \b this function via [`inline_ez_clone`](Self::inline_ez_clone) (a
     /// straight-line leaf, the \e easy model) or
     /// [`inline_clone`](Self::inline_clone) (the \e hard model, preserving
-    /// addresses and replacing RETURN with a BRANCH).
+    /// addresses and replacing RETURN with a BRANCH). The callee's fspec
+    /// handles pass to \b this function, whose cloned varnodes still name them
+    /// once `inlinefd` is dropped.
     ///
     /// Returns 0 for the easy model, 1 for the hard model, -1 if inlining was not
     /// successful (`callop` is the site of the injection).
@@ -3157,6 +3229,7 @@ truncating the fall-through here"
         self.data.obank_mut().set_uniq_id(inline_uniq);
         // Move the (now spent) callee data back out.
         *inlinefd = inlineflow.data;
+        self.data.kuna_fspec_handles.append(&mut inlinefd.kuna_fspec_handles);
         Ok(res)
     }
 
@@ -3567,13 +3640,21 @@ truncating the fall-through here"
         // `None` and rebuilt per table when `option jtsharepartial` is off.
         let mut shared_partial: Option<Funcdata> = None;
         for op in table_ops {
-            let mode = self.data.recover_jump_table_flow(
-                op,
-                record,
-                &visited_snapshot,
-                run_pipeline,
-                &mut shared_partial,
-            );
+            let at = self.data.obank().get(op).map_or(0, |o| o.get_addr().get_offset());
+            let _scope = crate::decompile_drive::JumpTableScope::enter(at);
+            let mode = if crate::decompile_drive::deadline_passed_in("jump-table recovery") {
+                Ok(None)
+            } else {
+                let mode = self.data.recover_jump_table_flow(
+                    op,
+                    record,
+                    &visited_snapshot,
+                    run_pipeline,
+                    &mut shared_partial,
+                );
+                crate::decompile_drive::deadline_passed_in("jump-table recovery");
+                mode
+            };
             match mode {
                 Ok(Some(jt_idx)) => {
                     let tail = (!for_inline).then(|| self.tail_call_table_dest(op, jt_idx));
@@ -3803,6 +3884,11 @@ impl<E: FlowEnvironment> PcodeEmit for FlowEmit<'_, '_, E> {
         if self.error.is_some() {
             return;
         }
+        // A proved PIC tail transfer is a call only in this entry's second flow.
+        let opc = if opc == OpCode::CPUI_BRANCHIND
+            && self.fd.ppc32_pic_calls.get(&addr.get_offset()).is_some_and(|b| b.tail) {
+            OpCode::CPUI_CALLIND
+        } else { opc };
         // Convert template data into a real PcodeOp (C++ PcodeEmitFd::dump).
         let isize = vars.len() as int4;
         let op = if let Some(out) = outvar {
@@ -3857,6 +3943,7 @@ impl<E: FlowEnvironment> PcodeEmit for FlowEmit<'_, '_, E> {
             }
             i += 1;
         }
+        crate::kuna_localstackviews::record_native(self.fd, op);
         self.emitted.push(op);
     }
 }
