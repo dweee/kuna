@@ -36,7 +36,9 @@ session changes only the options that second mode names. Discover them with
 
 The boundary comparisons are exact: a 500 KiB file is `reliable`, and a 2 MiB
 file is `fast`. “Standard mode” in the size policy means the existing
-`reliable` preset. The native CLI reads filesystem metadata; the browser/WASI
+`reliable` preset. The native CLI reads filesystem metadata; for a dyld shared
+cache it uses the summed file size of the selected image's segments instead,
+because the main cache file says nothing about the image. The browser/WASI
 front-end classifies the uploaded virtual file's byte length through the same
 Rust function. An explicit concrete `--mode` bypasses size selection, and a
 later explicit `--option` still overrides the selected preset.
@@ -106,13 +108,18 @@ build failure. The options it enables:
   the call states, so the call compiles as C),
   `libcnames` (a local takes the name of the library call it meets:
   `fd = open(a0,0);`, `n = read(fd,v1,0x200);`),
+  `armfloatreturn` and `armfloatargs` (an ARM hard-float function returns its
+  double whole in `d0` and takes its float and double parameters in their
+  `s` and `d` registers on both sides of a call; inert unless the ELF states
+  the VFP procedure-call standard, so soft-float and softfp images print
+  byte-identically),
   `cortexmpriv` (DIV-99 - fold the Cortex-M `isCurrentModePrivileged()` guard;
   ARM-Cortex-M-gated by construction, so it is a measured no-op everywhere else)
 - **analysis tier**: `listing` (the master gate that enables the
   Listing-consuming passes — `fid`, `aif`, the discovered-no-return family),
   `fast_funcdisc`, `eh_frame_full`, `funcstart_patterns`, `addrtable`,
   `operand_refs`, `widestrings32` (4-byte `wchar_t`/`char32_t` literals),
-  `fid`, `rtti`, `itaniumrtti`, `aif`, `aifstrict`, `objc`, `pdb`,
+  `fid`, `rtti`, `itaniumrtti`, `aif`, `aifstrict`, `objc`, `cfstrings`, `pdb`,
   `macho-arm64e`
 - **analysis tier, ARM entry discovery** (DIV-93): `cortexmvectors`, `ptrentry`,
   `tailcallentry`, `poolentry` — the four-step sequence that takes stripped ARM
@@ -121,7 +128,7 @@ build failure. The options it enables:
   also need `listing`, which this preset supplies; off ARM they are measured
   no-ops (identical entry sets on 90 x86-64 twins and 12 i386 PE images).
 
-`returndup` (DIV-54) and `pdb` (DIV-129) became shipped defaults and are
+`returndup` (DIV-54), `pdb` (DIV-129) and `cfstrings` became shipped defaults and are
 deliberately kept on the list: the preset **owns** the option, so an earlier
 `--option returndup off` on the same command line is re-enabled by
 `--mode aggressive`, and the preset's contract ("every recovery pass on") does not
@@ -130,10 +137,15 @@ silently change if a default drifts back.
 ### The deliberate exclusions
 
 Most off-by-default options are safe to blanket-enable: the format-specific ones
-are inert off their target (`rtti` = PE, `objc`/`macho-arm64e` = Mach-O,
+are inert off their target (`rtti` = PE, `objc`/`cfstrings`/`macho-arm64e` = Mach-O,
 `sparcstructret` = the SPARC `unimp`-trap idiom, which cannot occur off SPARC,
 and since DIV-93 the four ARM entry passes, which are inert off ARM). These are
 not, and the invariant test's `EXCLUDED_ON_PURPOSE` list is the authority:
+
+- **`x86listingswitch`** — bounded i386 table coverage can expose tail jumps
+  into independent functions before AIF discovers their entries. The measured
+  Wine corpus lost seven real starts; keep this discovery tradeoff explicit
+  with `--option x86listingswitch on` in every mode.
 
 - **`v850indirectbranch`** — its predicate (`kuna_is_v850_indirect_jmp`,
   `p2_lift/kuna_v850indbranch.rs`) matches **any** register-indirect `CALLIND`,
@@ -170,17 +182,33 @@ not, and the invariant test's `EXCLUDED_ON_PURPOSE` list is the authority:
   the grow call on the strength of its argument shape; the callee body is never
   read. That trust is the operator's call to make about a binary, not a default.
 
-- **`bejoin`** — its default, `evidence`, joins a big-endian or AVR
-  two-register value high word first only on proof the value is that wide, in
-  every mode. `on` joins it that way whenever its low word looks returned on
+- **`bejoin`** — its default, `callers`, joins a big-endian or AVR
+  two-register value high word first only on proof the value is that wide (its
+  own instructions, or a caller that reads the second register after the
+  call), in every mode. `on` joins it that way whenever its low word looks returned on
   purpose: the rule reads the instructions, not a type, and an `int` that works
   over the high half of a 64-bit temporary compiles to the same registers as the
   `long long`, so with it on that correct `int` prints as a wrong `long long`
   (GH-904). In the preset it would be the default output under 500 KiB.
 
-All six therefore stay manual per-run opt-ins (`--option v850indirectbranch on`,
+- **`regsigned`** — it declares a register local whose every value is a sign
+  extension at the narrow width it is extended from (`short v` instead of
+  `int v` with a cast on every load). On decbench type_match it gained a few
+  perfect functions on ARM firmware and none on x86-64, and a narrowed value
+  that a wider reader takes back gains a cast (`(long)(int)v` on AArch64), so
+  the preset would make a near-neutral judgment call the default output under
+  500 KiB.
+
+- **`libgccsigs`** — the SPARC32 `long long __divdi3(long long, long long)`
+  contract fixes a caller that stores only the quotient's low word, but a caller
+  that returns arithmetic on the quotient (`a / b + 1`, `-(a / b)`,
+  `f ? a / b : c`) then keeps only the high word or returns nothing, where the
+  default returns every word.
+
+These therefore stay manual per-run opt-ins (`--option v850indirectbranch on`,
 `--option dwarf_lines on`, `--option formatstring full`, `--option ifuncfpret on`,
-`--option msvcstrappend on`, `--option bejoin on`)
+`--option msvcstrappend on`, `--option bejoin on`, `--option regsigned on`,
+`--option libgccsigs on`)
 even under `--mode aggressive`; a named `--option` still wins over the preset by
 last-write precedence. For `formatstring` only the `full` loop above is excluded:
 its `static` default reads the same format constants out of the image at load, so
@@ -284,10 +312,11 @@ pointer-table target, with real C bodies in both cases.
 
 Explicit `--addr` commands already have their target set, so the file
 front-ends suppress preset-provided `fast_funcdisc` work for those commands.
-Name selection keeps discovery enabled because a generated `sub_<addr>` name
-does not exist until discovery registers it. Address-selected callers can opt
-back in explicitly with `--option fast_funcdisc on`; an explicit option always
-wins.
+Text-surface `kuna decompile <name>` suppresses it on its first attempt as
+well and restores it only when the name misses; a generated placeholder name
+(`sub_<addr>`) keeps discovery enabled, because that entry may exist only
+because discovery registered it. Callers can opt back in explicitly with
+`--option fast_funcdisc on`; an explicit option always wins.
 
 An explicit option selectively restores analysis while keeping the rest of the
 preset:

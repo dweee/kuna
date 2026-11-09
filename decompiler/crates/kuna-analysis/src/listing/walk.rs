@@ -23,12 +23,13 @@ use kuna_decomp::architecture::Architecture;
 use kuna_sleigh::translate::Translate;
 
 use super::context::ContextPainter;
-use super::model::{DiscoveredFunction, FlowKind, Insn, InsnLite, Mnemonic, Reference, RefKind};
+use super::model::{DiscoveredFunction, FlowKind, FlowType, Insn, InsnLite, Mnemonic, Reference, RefKind};
 use super::ListingDetail;
 use super::kuna_insnstore::InstructionStore;
 
 /// The accumulating maps the walk fills. Lifted into [`super::Listing`] by
 /// [`super::Listing::build`].
+#[derive(Clone)]
 pub(super) struct WalkState {
     /// Instruction model, keyed by VMA.
     pub insns: InstructionStore,
@@ -230,6 +231,9 @@ pub(super) struct StepCtx<'a> {
     pub exec_ranges: &'a [(u64, u64)],
     /// The PPC64 ELFv2 local-entry fold, keyed by local entry VMA.
     pub local_entries: &'a BTreeMap<u64, u64>,
+    /// `stubtailcall`: loader-proven lazy-binding resolver calls, keyed by site,
+    /// with the stub end their delay slot reaches.
+    pub tail_transfers: &'a BTreeMap<u64, u64>,
     /// The option bits the loop consults.
     pub policy: WalkPolicy,
     /// What the build captures beyond the partition.
@@ -288,10 +292,18 @@ where
     }
 
     // An undecodable or zero-length decode stops this path (mark gap).
-    let Some((decoded, c)) = super::kuna_decodememo::decode(ctx, vma, &mut |text| insns.intern_mnemonic(text))
+    let Some((decoded, mut c)) = super::kuna_decodememo::decode(ctx, vma, &mut |text| insns.intern_mnemonic(text))
     else {
         return false;
     };
+    if ctx.tail_transfers.get(&vma) == Some(&vma.wrapping_add(u64::from(decoded.len))) {
+        c.flow = FlowType {
+            kind: FlowKind::ComputedJump, is_jump: true, is_computed: true, is_indirect: true,
+            ..Default::default()
+        };
+        c.fall_through = None;
+        c.flows.clear();
+    }
 
     let fall_through = vma.wrapping_add(u64::from(decoded.len));
     let stack_values: Vec<u64> = if ctx.policy.stack_callbacks {
@@ -373,12 +385,12 @@ where
             refs.file(vma, target, RefKind::Code);
         }
     }
-    let skip = vma.wrapping_add(u64::from(decoded.len));
-    if let Some(tables) = ctx.a32_tables
-        .filter(|_| c.flow.is_computed && c.flow.is_jump && c.flows.iter().all(|&t| t == skip))
-    {
+    let skip = c.predicated_skip(vma, decoded.len);
+    if let Some(tables) = ctx.a32_tables.filter(|_| {
+        c.flow.is_computed && c.flow.is_jump && !c.flow.is_call && c.flows.iter().all(|&t| Some(t) == skip)
+    }) {
         let decoded = |at: u64| insns.decoded(at);
-        for target in tables.targets(ctx.translate, ctx.code_space, ctx.exec_ranges, &decoded, vma) {
+        for target in tables.targets(ctx.translate, ctx.code_space, ctx.exec_ranges, &decoded, vma).cases {
             out.insn(target);
             refs.file(vma, target, RefKind::Code);
         }
@@ -446,6 +458,7 @@ pub(super) fn walk(
     flow_mode: Option<&super::kuna_flowmode::FlowMode>,
     arm_walk: Option<&super::kuna_armwalkmode::ArmWalkMode>,
     local_entries: &BTreeMap<u64, u64>,
+    tail_transfers: &BTreeMap<u64, u64>,
     detail: ListingDetail,
     want_stack_callbacks: bool,
     plan: &super::kuna_pdecode::WalkPlan,
@@ -453,6 +466,7 @@ pub(super) fn walk(
     resumed: Option<WalkState>,
     tables: Option<&super::kuna_thumbswitch::HalfwordTables<'_>>,
     a32_tables: Option<&super::kuna_a32switch::A32Tables<'_>>,
+    x86_tables: Option<&super::kuna_x86listingswitch::X86Tables<'_>>,
     memo: Option<&super::kuna_decodememo::DecodeMemo>,
 ) -> WalkState {
     // Paint the decode-mode context (ARM TMode / MIPS ISA_MODE) into the engine's
@@ -469,14 +483,58 @@ pub(super) fn walk(
 
     let policy = WalkPolicy::from_arch(arch, want_stack_callbacks);
     let ctx = StepCtx {
-        translate, code_space, exec_ranges, local_entries, policy, detail, tables, a32_tables, memo,
+        translate, code_space, exec_ranges, local_entries, tail_transfers, policy, detail, tables,
+        a32_tables, memo,
     };
 
-    let mut st = walk_plain(&ctx, arch, seeds, seed_funcs, painter, plan, frames, arm_walk, resumed);
+    let st = walk_plain(&ctx, arch, seeds, seed_funcs, painter, plan, frames, arm_walk, resumed);
+    let mut st = match x86_tables {
+        Some(tables) => super::kuna_x86listingswitch::reconcile(tables, &ctx, st),
+        None => st,
+    };
     if let Some(mode) = flow_mode {
         st.mode_runs.extend(super::kuna_flowmode::disagreeing_runs(&ctx, arch, mode));
     }
     st
+}
+
+/// Extend an isolated i386 candidate from instruction roots without claiming
+/// the roots as functions. CALL targets retain the ordinary claim rule.
+pub(super) fn extend_x86(
+    ctx: &StepCtx<'_>,
+    state: &mut WalkState,
+    edges: &BTreeMap<u64, Vec<u64>>,
+    mut within_budget: impl FnMut(&WalkState) -> bool,
+) -> bool {
+    let mut refs = RefCollector { want: ctx.detail.refs, edges: std::mem::take(&mut state.refs) };
+    let mut callbacks = CallbackEvidence::default();
+    for (&target, &source) in &state.stack_callback_refs {
+        callbacks.file(source, target);
+    }
+    let mut pending = Vec::new();
+    for (&from, targets) in edges {
+        for &target in targets {
+            pending.push(target);
+            refs.file(from, target, RefKind::Code);
+        }
+    }
+    let mut called = Vec::new();
+    let mut checked_at = state.insns.len();
+    loop {
+        let Some(at) = pending.pop().or_else(|| called.pop()) else { break };
+        let mut work = Worklists { insns: pending, funcs: &mut called };
+        step(ctx, at, &mut state.insns, &mut state.funcs, &mut refs, &mut callbacks, &mut work);
+        pending = work.insns;
+        if state.insns.len().saturating_sub(checked_at) >= 256 {
+            if !within_budget(state) {
+                return false;
+            }
+            checked_at = state.insns.len();
+        }
+    }
+    state.refs = refs.into_edges();
+    state.stack_callback_refs = callbacks.into_refs();
+    within_budget(state)
 }
 
 /// The serial or parallel walk, as [`walk`] runs it.
@@ -492,7 +550,7 @@ fn walk_plain(
     arm_walk: Option<&super::kuna_armwalkmode::ArmWalkMode>,
     resumed: Option<WalkState>,
 ) -> WalkState {
-    let StepCtx { translate, code_space, exec_ranges, local_entries, policy, detail, .. } = *ctx;
+    let StepCtx { translate, code_space, exec_ranges, local_entries, tail_transfers, policy, detail, .. } = *ctx;
     if plan.lanes() > 1 && frames.is_none() && arm_walk.is_none() && resumed.is_none() {
         let inputs = super::kuna_pdecode::ParallelInputs {
             arch,
@@ -503,6 +561,7 @@ fn walk_plain(
             seed_funcs,
             painter,
             local_entries,
+            tail_transfers,
             policy,
             detail,
         };

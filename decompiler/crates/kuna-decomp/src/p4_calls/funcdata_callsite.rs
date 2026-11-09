@@ -101,6 +101,9 @@ pub fn check_input_trial_use(idx: int4, data: &mut Funcdata, aliascheck: &mut Al
     let format_arguments = crate::p4_calls::kuna_varargformat::arguments(data, data.get_call_specs(idx));
     let num_trials = data.get_call_specs_mut(idx).get_active_input().get_num_trials();
     for i in 0..num_trials {
+        if crate::decompile_drive::deadline_passed_in("action activeparam") {
+            return;
+        }
         if data.get_call_specs(idx).active_input().get_trial(i).is_checked() {
             if !data.get_call_specs(idx).active_input().get_trial(i).is_active() {
                 crate::p4_calls::kuna_varargformat::activate_trial(data, idx, i, &format_arguments);
@@ -204,6 +207,31 @@ pub fn check_input_trial_use(idx: int4, data: &mut Funcdata, aliascheck: &mut Al
             crate::p4_calls::kuna_passthrough::claimed_range(data, t.get_address(), t.get_size())
         } {
             data.get_call_specs_mut(idx).get_active_input().get_trial_mut(i).mark_inactive();
+        } else if {
+            let t = data.get_call_specs(idx).active_input().get_trial(i);
+            crate::p4_calls::kuna_swiftcall::stale_self(data, idx, slot, t.get_address(), t.get_size())
+        } {
+            data.get_call_specs_mut(idx).get_active_input().get_trial_mut(i).mark_no_use();
+        } else if let Some(dispatch) = {
+            let t = data.get_call_specs(idx).active_input().get_trial(i);
+            crate::p4_calls::kuna_swiftcall::indirect_self(data, idx, slot, t.get_address(), t.get_size())
+        } {
+            let trial = data.get_call_specs_mut(idx).get_active_input().get_trial_mut(i);
+            if dispatch {
+                trial.set_ancestor_realistic();
+                trial.set_ancestor_solid();
+                trial.mark_active();
+            } else {
+                trial.mark_no_use();
+            }
+        } else if {
+            let t = data.get_call_specs(idx).active_input().get_trial(i);
+            crate::p4_calls::kuna_swiftcall::passes_own_self(data, idx, slot, t.get_address(), t.get_size())
+        } {
+            let trial = data.get_call_specs_mut(idx).get_active_input().get_trial_mut(i);
+            trial.set_ancestor_realistic();
+            trial.set_ancestor_solid();
+            trial.mark_active();
         } else if {
             // (kuna) `calleedeadarg`: the callee's OWN body can settle a register
             // trial the caller's data flow cannot.  A register the callee
@@ -457,10 +485,26 @@ pub fn build_input_from_trials(
     // (kuna) `calleearityfwd` / `calleearitylive`: capture the retry candidate
     // while the trials and the CALL's pre-rewrite inputs are both still there.
     let read_arg = crate::p4_calls::kuna_calleereadarg::capture(fc, data);
+    // (kuna `swiftcall`) A call passing only a Swift `self` is, for the
+    // callee-body rule, one that recovered nothing.
+    let only_self = newparam.len() == 2 && {
+        let t = (0..fc.active_input().get_num_trials())
+            .map(|i| fc.active_input().get_trial(i))
+            .find(|t| t.is_used());
+        t.is_some_and(|t| crate::p4_calls::kuna_swiftcall::is_self_storage(data, t.get_address(), t.get_size()))
+    };
     let pending = if newparam.len() < 2 {
         PendingCallFixup {
             rescue: crate::p4_calls::kuna_calleearityfwd::capture_empty_call(fc, data),
             extend: None,
+            body: crate::p4_calls::kuna_calleearitybody::capture_lone_call(fc, data),
+            pass_through,
+            read_arg,
+        }
+    } else if only_self {
+        PendingCallFixup {
+            rescue: None,
+            extend: crate::p4_calls::kuna_calleearitylive::capture_partial_call(fc, data),
             body: crate::p4_calls::kuna_calleearitybody::capture_lone_call(fc, data),
             pass_through,
             read_arg,
@@ -604,6 +648,7 @@ pub fn build_output_from_trials(
         // that render as locals the function never assigns.
         let entry = fc.get_entry_address().clone();
         let order = crate::kuna_bejoin::call_join_order(data, fc.get_active_output(), Some(&entry));
+        let order = crate::p4_calls::kuna_bejoinpass::call_order(data, fc.get_active_output(), trialvn, order);
         if crate::kuna_rustabi::build_call_output_pair(
             op,
             data,

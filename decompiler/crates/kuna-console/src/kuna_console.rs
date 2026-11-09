@@ -156,14 +156,26 @@ fn engine_unavailable(entry: &str) -> IfaceError {
 pub fn kuna_live_value(conf: &Architecture, option: &str) -> Option<Cow<'static, str>> {
     // C++ returns "" for an unknown option (suppressing the current field).
     let on_off = |b: bool| if b { "on" } else { "off" };
-    // (kuna `symbolnamebound`) The one VALUED live reader whose value is not a
-    // fixed token, so it owns its string; every other arm borrows and the
-    // emitted catalog bytes are unchanged.
+    // (kuna `dyldimage`, `symbolnamebound`) The valued live readers whose value
+    // is not a fixed token own their string; every other arm borrows.
+    if option == "dyldimage" {
+        return Some(
+            std::env::var(kuna_decomp::kuna_dyldcache::DYLDIMAGE_ENV)
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .map_or(Cow::Borrowed("none"), Cow::Owned),
+        );
+    }
     if option == "symbolnamebound" {
         return Some(match conf.analysis_symbolnamebound {
             None => Cow::Borrowed("off"),
             Some(n) => Cow::Owned(n.to_string()),
         });
+    }
+    if option == "kernelcache" {
+        // The loader reads the env bridge, which the `option` command also sets.
+        let choice = kuna_decomp::kuna_kernelcache::KernelcacheChoice::from_env();
+        return Some(Cow::Owned(choice.as_str().to_string()));
     }
     Some(Cow::Borrowed(match option {
         "bytearrayc" => on_off(conf.print().options.bytearray_c),
@@ -219,16 +231,37 @@ pub fn kuna_live_value(conf: &Architecture, option: &str) -> Option<Cow<'static,
         "narrowext" => conf.narrow_ext.as_str(),
         // (kuna `syscallregs`) Three-valued, so it reports its own token.
         "syscallregs" => conf.syscall_regs.as_str(),
+        // (kuna `callmechanisms`) Three-valued, so it reports its own token.
+        "callmechanisms" => conf.call_mechanism_mode.as_str(),
         "retpushedhalf" => on_off(conf.ret_pushed_half),
         "inputparamgap" => on_off(conf.input_param_gap),
         // (kuna `rustabi`) Three-valued, so it reports its own token.
         "rustabi" => kuna_decomp::kuna_rustabi::RustAbiMode::from_u8(conf.rust_abi).as_str(),
+        // (kuna `fatstr`) Three-valued, so it reports its own token.
+        "fatstr" => kuna_decomp::kuna_fatstr::FatStrMode::from_u8(conf.fat_str).as_str(),
+        // (kuna `gobool`) Three-valued, so it reports its own token.
+        "gobool" => kuna_decomp::kuna_gobool::GoBoolMode::from_u8(conf.go_bool).as_str(),
+        // (kuna `fpuemu`) Three-valued, so it reports its own token.
+        "fpuemu" => kuna_decomp::kuna_fpuemu::FpuEmuMode::from_u8(conf.fpu_emu).as_str(),
+        "rustprobestack" => conf.rust_probestack.as_str(),
+        // (kuna `gomorestack`) Three-valued, so it reports its own token.
+        "gomorestack" => kuna_decomp::kuna_gomorestack::GoMorestackMode::from_u8(conf.go_morestack).as_str(),
+        // (kuna `gowritebarrier`) Three-valued, so it reports its own token.
+        "gowritebarrier" => kuna_decomp::kuna_gowritebarrier::GoWriteBarrierMode::from_u8(conf.go_write_barrier).as_str(),
+        // (kuna `sourcelang`) Reports the OPTION state, not the detected fact:
+        // `auto` until a run forces a language.
+        "sourcelang" => match conf.source_lang_forced {
+            Some(lang) => lang.as_str(),
+            None => "auto",
+        },
         // (kuna `bejoin`) Three-valued, so it reports its own token.
         "bejoin" => conf.be_join.as_str(),
+        "bejoinpass" => conf.be_join_pass.as_str(),
         "condexeplace" => on_off(conf.condexe_block_placement),
         "sparcstructret" => on_off(conf.sparc_struct_return),
         "arraystride" => on_off(conf.recover_array_stride),
         "stackalias" => on_off(conf.stack_alias_deadstore),
+        "localstackviews" => on_off(conf.local_stack_views),
         "stackviews" => on_off(conf.stack_views),
         "dynamichashmax" => on_off(conf.dynamic_hash_maxdup_high),
         "stackprobeloop" => on_off(conf.model_stack_probe_loop),
@@ -239,10 +272,11 @@ pub fn kuna_live_value(conf: &Architecture, option: &str) -> Option<Cow<'static,
         "switchsharedcase" => on_off(conf.switch_shared_case),
         "realtypes" => on_off(conf.realtypes),
         "litpoolconst" => on_off(conf.litpoolconst),
-        // (kuna `calloverlap`) Three-valued, so it reports its own token.
+        // (kuna `calloverlap`) Report the selected overlap policy.
         "calloverlap" => match conf.call_overlap {
-            0 => "off",
-            1 => "in",
+            kuna_decomp::kuna_calloverlap::LEVEL_OFF => "off",
+            kuna_decomp::kuna_calloverlap::LEVEL_AUTO => "auto",
+            kuna_decomp::kuna_calloverlap::LEVEL_IN => "in",
             _ => "full",
         },
         "entryretdispatch" => on_off(conf.entry_ret_dispatch),
@@ -253,8 +287,11 @@ pub fn kuna_live_value(conf: &Architecture, option: &str) -> Option<Cow<'static,
         // with no program loaded these never reach (kuna_live_value's caller passes
         // None), so the no-program catalog byte-compat fixture is untouched.
         "noreturn_known" => on_off(conf.analysis_noreturn_known),
+        "godwarfsig" => on_off(conf.analysis_godwarfsig),
+        "gopairreturns" => on_off(conf.analysis_gopairreturns),
         "libproto" => on_off(conf.analysis_libproto),
         "libcsigs" => on_off(conf.analysis_libcsigs),
+        "libgccsigs" => on_off(conf.analysis_libgccsigs),
         // (kuna `libctypes`) Valued `off|opaque|glibc`, so the live token is the
         // value, not an on/off word.
         "libctypes" => match (conf.analysis_libctypes, conf.analysis_libctypes_glibc) {
@@ -267,16 +304,30 @@ pub fn kuna_live_value(conf: &Architecture, option: &str) -> Option<Cow<'static,
         "widestrings32" => on_off(conf.analysis_widestrings32),
         "entry_disc" => on_off(conf.analysis_entry_disc),
         "eh_frame_full" => on_off(conf.analysis_eh_frame_full),
+        "unwindstarts" => on_off(conf.analysis_unwindstarts),
         "arm_markers" => on_off(conf.analysis_arm_markers),
         "mips_gp" => on_off(conf.analysis_mips_gp),
+        "ppc32picimports" => conf.analysis_ppc32picimports.as_str(),
         "i386_pie_plt" => on_off(conf.analysis_i386_pie_plt),
         "ifuncfpret" => on_off(conf.analysis_ifuncfpret),
+        "ppcapu" => on_off(conf.analysis_ppcapu),
         "relocrebase" => on_off(conf.analysis_relocrebase),
         "dynrelocs" => on_off(conf.analysis_dynrelocs),
         "pdatachained" => on_off(conf.analysis_pdatachained),
         "rexthunk" => on_off(conf.analysis_rexthunk),
+        // (kuna `goabi`) Two-valued but spelled auto|off, so it reports its token.
+        "goreg" => on_off(conf.go_reg),
+        "goabi" => {
+            if conf.analysis_goabi {
+                "auto"
+            } else {
+                "off"
+            }
+        }
         "peordinal" => on_off(conf.analysis_peordinal),
         "symbolnamerepair" => on_off(conf.analysis_symbolnamerepair),
+        "swiftdemangle" => on_off(conf.analysis_swiftdemangle),
+        "dyldcrossrefs" => on_off(kuna_decomp::kuna_dyldcache::dyldcrossrefs_enabled()),
         // (kuna `symbolnamechars`) Three-valued, so it reports its own token.
         "symbolnamechars" => conf.analysis_symbolnamechars.as_str(),
         "msvcfpconst" => on_off(conf.analysis_msvcfpconst),
@@ -288,6 +339,7 @@ pub fn kuna_live_value(conf: &Architecture, option: &str) -> Option<Cow<'static,
         "typedepth" => on_off(conf.analysis_typedepth),
         "dwarfstructs" => on_off(conf.analysis_dwarfstructs),
         "dwarfvariants" => on_off(conf.analysis_dwarfvariants),
+        "variantnames" => on_off(conf.analysis_variantnames),
         // (kuna `cppsig`) Three-valued, so it reports its own token rather than
         // on/off.
         "cppsig" => conf.analysis_cppsig.as_str(),
@@ -299,10 +351,12 @@ pub fn kuna_live_value(conf: &Architecture, option: &str) -> Option<Cow<'static,
             else if conf.analysis_armframes_full { "on" } else { "inventory" },
         "unmappedentry" => on_off(conf.analysis_unmappedentry),
         "thumbswitch" => on_off(conf.analysis_thumbswitch),
+        "x86listingswitch" => on_off(conf.analysis_x86listingswitch),
         "switchreach" => on_off(conf.analysis_switchreach),
         "thunkentry" => on_off(conf.analysis_thunkentry),
         "addrtakenentry" => on_off(conf.analysis_addrtakenentry),
         "ppclocalentry" => on_off(conf.analysis_ppclocalentry),
+        "gowalkprune" => on_off(conf.analysis_gowalkprune),
         // (kuna `flowmode`) Valued `on|aftercall|off`, so it reports its own token.
         "flowmode" => match (conf.analysis_flowmode, conf.analysis_flowmode_aftercall) {
             (false, _) => "off",
@@ -317,7 +371,10 @@ pub fn kuna_live_value(conf: &Architecture, option: &str) -> Option<Cow<'static,
         "elfmain" => on_off(conf.analysis_elfmain),
         "fast_funcdisc" => on_off(conf.analysis_fast_funcdisc),
         "rawdiscover" => on_off(conf.analysis_rawdiscover),
+        "mzsweep" => on_off(conf.analysis_mzsweep),
         "gopclntab" => on_off(conf.analysis_gopclntab),
+        "gotypes" => on_off(conf.analysis_gotypes),
+        "gonoreturn" => on_off(conf.analysis_gonoreturn),
         "aifbracket" => on_off(conf.analysis_aifbracket),
         "aifnoppad" => on_off(conf.analysis_aifnoppad),
         "aifpoolslide" => on_off(conf.analysis_aifpoolslide),
@@ -848,6 +905,7 @@ impl IfaceCommandAction for IfcKunaAssert {
                     .arch_mut()
                     .set_kuna_option(name, &tokens[0])
                     .map_err(|e| IfaceError::execution(e.explain().to_string()))?;
+                conf.callwide_changed();
                 let mut out = msg;
                 out.push('\n');
                 out.push_str(&applied_line);
@@ -1051,6 +1109,7 @@ impl IfaceCommandAction for IfcKunaMode {
             .arch_mut()
             .apply_mode(&name)
             .map_err(|e| IfaceError::execution(e.explain().to_string()))?;
+        prog.callwide_changed();
         status.out(&format!("{res}\n"));
         Ok(())
     }
@@ -1150,6 +1209,7 @@ impl IfaceCommandAction for IfcKunaRegionTree {
     fn execute(&self, status: &mut IfaceStatus, _s: &mut CommandStream) -> IfaceResult<()> {
         let os = {
             let dcp = dcp_mut(status)?;
+            dcp.follow_stopped_flow();
             let fd = match dcp.fd.as_ref() {
                 Some(fd) => fd,
                 None => return Err(IfaceError::execution("No function selected")),
@@ -1183,6 +1243,7 @@ impl IfaceCommandAction for IfcKunaRegionBlocks {
     fn execute(&self, status: &mut IfaceStatus, _s: &mut CommandStream) -> IfaceResult<()> {
         let os = {
             let dcp = dcp_mut(status)?;
+            dcp.follow_stopped_flow();
             let fd = match dcp.fd.as_ref() {
                 Some(fd) => fd,
                 None => return Err(IfaceError::execution("No function selected")),
@@ -1240,6 +1301,7 @@ impl IfaceCommandAction for IfcKunaRegionWalk {
     fn execute(&self, status: &mut IfaceStatus, _s: &mut CommandStream) -> IfaceResult<()> {
         let os = {
             let dcp = dcp_mut(status)?;
+            dcp.follow_stopped_flow();
             let fd = match dcp.fd.as_ref() {
                 Some(fd) => fd,
                 None => return Err(IfaceError::execution("No function selected")),
@@ -1273,6 +1335,21 @@ impl IfaceCommandAction for IfcKunaRegionWalk {
 
 /// (kuna) `functions`: print the canonical executable function inventory.
 pub struct IfcKunaFunctions;
+
+pub struct IfcCallwidePrepare;
+
+impl IfaceCommandAction for IfcCallwidePrepare {
+    fn execute(&self, status: &mut IfaceStatus, _s: &mut CommandStream) -> IfaceResult<()> {
+        let prog = dcp_mut(status)?.conf.as_mut()
+            .ok_or_else(|| IfaceError::execution("No load image present"))?;
+        if !prog.arch().call_wide { return Ok(()); }
+        prog.commit_pending_analysis().map_err(|error| IfaceError::execution(error.explain().to_string()))?;
+        crate::kuna_callwide::prepare(prog);
+        Ok(())
+    }
+
+    fn module(&self) -> String { DECOMPILE_MODULE.to_string() }
+}
 
 impl IfaceCommandAction for IfcKunaFunctions {
     fn execute(&self, status: &mut IfaceStatus, _s: &mut CommandStream) -> IfaceResult<()> {
@@ -1391,9 +1468,13 @@ impl IfaceCommandAction for IfcKunaFunctionBounds {
         let name = prog
             .declare_function(addr, name.as_deref(), size)
             .map_err(|e| IfaceError::execution(e.explain().to_string()))?;
+        let unmapped = prog.declaration_note(start);
         status.out(&format!(
             "Declared {name} at {display_start:#x} spanning {size} bytes\n"
         ));
+        if let Some(sentence) = unmapped {
+            status.out(&crate::kuna_declaredbytes::transcript_line(&sentence));
+        }
         Ok(())
     }
 
@@ -1551,6 +1632,7 @@ pub fn register_kuna_commands(status: &mut IfaceStatus) {
     status.register_com(Box::new(IfcKunaMode), &["mode"]);
     status.register_com(Box::new(IfcKunaQuality), &["quality"]);
     status.register_com(Box::new(IfcKunaFunctions), &["functions"]);
+    status.register_com(Box::new(IfcCallwidePrepare), &["callwide", "prepare"]);
     status.register_com(Box::new(IfcKunaRegionTree), &["region", "tree"]);
     status.register_com(Box::new(IfcKunaRegionBlocks), &["region", "blocks"]);
     status.register_com(Box::new(IfcKunaRegionWalk), &["region", "walk"]);
