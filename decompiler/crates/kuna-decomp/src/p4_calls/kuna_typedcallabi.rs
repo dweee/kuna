@@ -36,11 +36,15 @@ use std::rc::Rc;
 const SOFT_FLOAT_MODEL: &str = "__stdcall_softfp";
 
 /// Whether the image passes floating-point arguments, doubles included, in
-/// floating-point registers: x86 and AArch64 always do; elsewhere only the
-/// convention the container states decides.
+/// floating-point registers: x86 and AArch64 always do; Octeon's selected
+/// compiler model is authoritative, including explicit target overrides;
+/// elsewhere the container's stated convention decides.
 pub fn image_evidence(arch: &Architecture) -> Option<bool> {
     if x86_or_aarch64(arch) {
         return Some(true);
+    }
+    if let Some(hard) = crate::kuna_octeonid::hard_float(&arch.archid) {
+        return Some(hard);
     }
     arch.translate()
         .loader_rc()
@@ -121,9 +125,10 @@ pub fn without_fpu(arch: &Architecture) -> bool {
 /// model lists only `s0`..`s7` among its outputs, so a hard-float function
 /// returning a `double` it computed from a declared `double` is recovered as the
 /// `unsigned int` low half of `d0`; a soft-float or `softfp` image passes it in
-/// `r0:r1`, and its callers hold that as a 64-bit integer.
+/// `r0:r1`, and its callers hold that as a 64-bit integer. A hard-float ARM
+/// image under `armfloatreturn` returns it whole in `d0`.
 pub fn returns_doubles_whole(arch: &Architecture) -> bool {
-    x86_or_aarch64(arch)
+    x86_or_aarch64(arch) || crate::kuna_armfloatreturn::applies(arch)
 }
 
 /// Does `pieces` declare a `float` or `double` parameter or return value?
