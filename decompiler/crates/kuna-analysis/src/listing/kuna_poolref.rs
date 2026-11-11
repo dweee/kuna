@@ -119,6 +119,17 @@ impl<'a> PoolImage<'a> {
         self.ptr
     }
 
+    /// Whether a complete read stays inside the declared read-only file range.
+    pub(super) fn contains_bytes(&self, vma: u64, width: u64) -> bool {
+        let Some(end) = vma.checked_add(width) else { return false };
+        let Some(i) = self.ro.partition_point(|&(lo, _, _)| lo <= vma).checked_sub(1) else {
+            return false;
+        };
+        let (lo, hi, data) = self.ro[i];
+        width != 0 && vma < hi && end <= hi
+            && end.checked_sub(lo).is_some_and(|offset| offset <= data.len() as u64)
+    }
+
     /// The signed 32-bit word at `vma`, when `vma` is 4-byte aligned and lies in
     /// a read-only section — the entry width of a delta-encoded jump table
     /// ([`super::kuna_switchtable`]), which is 32 bits on every target that
@@ -160,7 +171,7 @@ impl<'a> PoolImage<'a> {
     }
 
     /// The `width` bytes of read-only image content at `vma`.
-    fn bytes_at(&self, vma: u64, width: u32) -> Option<&'a [u8]> {
+    pub(super) fn bytes_at(&self, vma: u64, width: u32) -> Option<&'a [u8]> {
         let i = self.ro.partition_point(|&(lo, _, _)| lo <= vma).checked_sub(1)?;
         let (lo, hi, data) = self.ro[i];
         if vma >= hi {

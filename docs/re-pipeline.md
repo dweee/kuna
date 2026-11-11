@@ -232,9 +232,9 @@ Getting the track wrong is the most likely way to waste a builder session.
 | The gap is | a missing or broken capability | kuna's emitted C is wrong | it is too slow |
 | Lives in | `kuna-cli`, `kuna-console`, `kuna-analysis` | `kuna-decomp/src/pN_*/kuna_<slug>.rs` | either |
 | Changes emitted C | **no** | **yes** | must not |
-| `phases.toml` option | **not required** — the rule is "anything that *can change emitted C* ships behind a named option", and a new subcommand cannot | **required**, plus all 8 ritual steps | only if output moves |
+| `phases.toml` option | **not required** — the rule is "a judgement call ships behind a named option", and a new subcommand is not one | **required for a judgement call** (plus all 8 ritual steps); **forbidden for a strict correctness fix**, which ships always-on with a one-pass stage test (`docs/agents.md` → *Adding features*) | only if output moves |
 | Counters | none | `kuna_phases/tests.rs` (2 asserts + the tier tuple + the count-encoding *test names*), `catalog_bytecompat.rs` (3 asserts + the `phase_catalog.json` fixture), `tests/stages/kuna-catalog.xml`, `kuna-base/src/xml.rs` | none |
-| Tests | cargo tests + the promoted acceptance probe. **A `tests/stages/` case would be wrong** — that README scopes the corpus to stage-model issues | two-pass `tests/stages/gh{angr,dec}-<slug>.xml` | timing probe with a stated noise floor |
+| Tests | cargo tests + the promoted acceptance probe. **A `tests/stages/` case would be wrong** — that README scopes the corpus to stage-model issues | `tests/stages/gh{angr,dec}-<slug>.xml`: two-pass when option-gated, one pass when always-on | timing probe with a stated noise floor |
 | Speed bar | before/after on the touched path | `scripts.pipeline.timeit`, ≤5% | **3σ and ≥20%** — `returncopysplit` measured a −20%/−12% noise floor on byte-identical output |
 
 Track `quality` follows `docs/improvement-pipeline.md` §3–4 and
@@ -274,6 +274,14 @@ Three silent-merge shapes this repo has actually produced are guarded mechanical
 |---|---|---|
 | **silent identical-edit** | both branches made the same `85 → 86` edit, git merged cleanly, the answer was 87 | re-derive every counter from a fresh capture on the rebased tree |
 | **silent keep-both** | a stale `data_footer: 375` against 381 real keys; a duplicated row in a README | diff every keep-both against `origin/main`: nothing removed, nothing added twice |
+
+The one permitted stage-baseline key replacement is `KUNA-CATALOG #15`'s
+registry-count label when options are added. Both labels must match their
+tree's registry and captured catalog counts; the corresponding live XML
+assertion must count those rows plus the same six valid individual queries.
+Its pattern and exact bounds are checked explicitly. Other removed keys,
+duplicate keys and stale footers still reject the merge, and the live catalog
+must still pass the separate counter rederivation guard.
 
 **Never re-pin `docs/baseline.json`** — `mergecheck` hard-rejects it.
 

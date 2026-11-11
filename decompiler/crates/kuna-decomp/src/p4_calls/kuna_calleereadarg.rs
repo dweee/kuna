@@ -1,5 +1,5 @@
-//! (kuna) `calleereadarg` — keep a call argument the caller also tests when the
-//! callee's own body reads it.
+//! (kuna) Keep a call argument the caller also tests when the callee's own body
+//! reads it.
 //!
 //! # The symptom
 //!
@@ -61,6 +61,16 @@
 //!   through it the function's own recovery takes every saved register as a
 //!   parameter.
 //!
+//! Where the walk cannot finish, the callee's `protoorder` statement answers
+//! instead with what its first heritage saw it read, for the registers it
+//! states as parameters; beside a complete walk, the statement adds the
+//! registers the callee hands on to a declared parameter or a callee that takes
+//! them ([`crate::kuna_entryreads`]). A function calling itself reads its own.
+//! A list that only that statement extends passes no earlier call's leftover
+//! result: gcc -O2 keeps a value in `rdx` across a call it knows leaves `rdx`
+//! alone, and the register then reads as the call's clobber, an uninitialised
+//! local.
+//!
 //! Floating-point registers are left alone: a callee that only moves its
 //! `double` (`lua_pushnumber` stores `xmm0`) is recovered with an integer
 //! parameter, and handing it the caller's `floor()` result reads that result as
@@ -89,7 +99,6 @@
 use std::collections::HashSet;
 
 use kuna_base::address::Address;
-use kuna_base::error::KunaResult;
 use kuna_base::types::int4;
 use kuna_num::opcodes::OpCode;
 
@@ -97,25 +106,7 @@ use crate::context::{OpId, VarnodeId};
 use crate::dtype::type_class;
 use crate::fspec::FuncCallSpecs;
 use crate::funcdata::Funcdata;
-use crate::p0_knowledge::options::on_or_off;
 use crate::p4_calls::kuna_calleedeadarg::CalleeEntryDead;
-
-/// (kuna) Keep a refused argument the callee's body reads:
-/// `calleereadarg on|off`.
-pub struct OptionCalleeReadArg;
-
-impl OptionCalleeReadArg {
-    /// The option name.
-    pub const NAME: &'static str = "calleereadarg";
-
-    /// Resolve the flag and its confirmation message; the caller writes it into
-    /// `Architecture::callee_read_arg`.
-    pub fn apply(&self, p1: &str) -> KunaResult<(bool, String)> {
-        let val = on_or_off(p1)?;
-        let prop = if val { "on" } else { "off" };
-        Ok((val, format!("Callee-read argument reinstatement turned {prop}")))
-    }
-}
 
 /// How many entries in a row may stand between the list and the register the
 /// callee reads (upstream `fillinMap`'s `maxchain`).
@@ -163,18 +154,17 @@ fn is_register(addr: &Address) -> bool {
 
 /// Does the callee summary `live` show `[addr, addr+size)` consumed as an
 /// argument: its low byte read on entry, with `last`, the final register of its
-/// storage class, left unread? With `pads`, a register the callee only pushes
-/// for its next call, with nothing reading the slot back, is not read.
+/// storage class, left unread? A register the callee only pushes for its next
+/// call, with nothing reading the slot back, is not read.
 pub(crate) fn reads_as_argument(
     live: &CalleeEntryDead,
     addr: &Address,
     size: int4,
     last: Option<&(Address, int4)>,
     stores: bool,
-    pads: bool,
 ) -> bool {
     let Some((last_addr, last_size)) = last else { return false };
-    live.reads_low_byte(addr, size, stores, pads) && !live.proves_read(last_addr, *last_size)
+    live.reads_low_byte(addr, size, stores, true) && !live.proves_read(last_addr, *last_size)
 }
 
 /// Record the calls this rule must leave alone, before heritage folds the
@@ -189,9 +179,6 @@ pub(crate) fn reads_as_argument(
 /// Called at the end of `ActionFuncLink`, next to `passthrough`'s own record,
 /// which that option skips in a function that is variadic itself.
 pub fn record_variadic_setups(data: &mut Funcdata) {
-    if !data.get_arch().callee_read_arg {
-        return;
-    }
     let variadic = crate::p4_calls::kuna_passthrough::tests_the_vararg_count(data);
     let ops: Vec<OpId> = (0..data.num_calls())
         .filter(|&i| variadic || crate::p4_calls::kuna_passthrough::set_up_as_variadic(data, i))
@@ -205,16 +192,12 @@ pub fn record_variadic_setups(data: &mut Funcdata) {
 ///
 /// Called from `build_input_from_trials` while the trials and the CALL's
 /// pre-rewrite inputs are both intact. `None` whenever the rule cannot apply:
-/// option off, locked or variadic prototype, a call the caller set up as
+/// locked or variadic prototype, a call the caller set up as
 /// variadic or made from a function that is or may be variadic, not a live
 /// direct CALL to a known entry, no body summary, or no refused register the
 /// callee reads.
 pub fn capture(fc: &FuncCallSpecs, data: &Funcdata) -> Option<PendingReadArg> {
-    if !data.get_arch().callee_read_arg
-        || fc.is_input_locked()
-        || fc.is_dotdotdot()
-        || !fc.proto().has_model()
-    {
+    if fc.is_input_locked() || fc.is_dotdotdot() || !fc.proto().has_model() {
         return None;
     }
     let op = fc.get_op();
@@ -226,7 +209,16 @@ pub fn capture(fc: &FuncCallSpecs, data: &Funcdata) -> Option<PendingReadArg> {
     if entry.is_invalid() {
         return None;
     }
-    let live = data.kuna_callee_entry_dead(entry)?;
+    let live = data.kuna_callee_entry_dead(entry).filter(|f| f.is_complete());
+    let seen = if live.is_none() { crate::kuna_entryreads::callee_reads(data, entry) } else { None };
+    let passes = crate::kuna_entryreads::callee_passes(data, entry);
+    let stated = |a: &Address| {
+        *entry == *data.get_address()
+            || data.kuna_protoorder_types(entry).is_some_and(|s| s.inputs.iter().any(|(x, _, _)| x == a))
+    };
+    if live.is_none() && seen.is_none() {
+        return None;
+    }
     let regs: Vec<_> = fc
         .proto()
         .model()
@@ -257,9 +249,9 @@ pub fn capture(fc: &FuncCallSpecs, data: &Funcdata) -> Option<PendingReadArg> {
                 e.get_size(),
             )
     });
-    let pads = data.get_arch().push_pad_read;
     let active = fc.active_input();
     let mut any = false;
+    let mut fresh = false;
     let mut row: Vec<Option<Slot>> = Vec::new();
     for e in &regs {
         let found = (0..active.get_num_trials()).find(|&i| {
@@ -272,7 +264,14 @@ pub fn capture(fc: &FuncCallSpecs, data: &Funcdata) -> Option<PendingReadArg> {
         };
         let t = active.get_trial(i);
         let (addr, size) = (t.get_address().clone(), t.get_size());
-        let callee_reads = live.reads_low_byte(&addr, size, stores, pads);
+        let callee_reads = match (live, &seen) {
+            (Some(f), _) => {
+                f.reads_low_byte(&addr, size, stores, true)
+                    || (stated(&addr) && crate::kuna_entryreads::overlaps(&passes, &addr, size))
+            }
+            (None, Some(r)) => stated(&addr) && crate::kuna_entryreads::overlaps(r, &addr, size),
+            _ => false,
+        };
         let vn = if t.is_definitely_not_used() || t.is_unref() || t.get_slot() < 1 {
             None
         } else {
@@ -282,12 +281,38 @@ pub fn capture(fc: &FuncCallSpecs, data: &Funcdata) -> Option<PendingReadArg> {
                 })
             })
         };
-        let width = if callee_reads { live.live_input_width(&addr, size).unwrap_or(size) } else { size };
+        let width = match (callee_reads, live, &seen) {
+            (true, Some(f), _) => f.live_input_width(&addr, size).unwrap_or(size),
+            (true, None, Some(r)) => r.iter().find(|(a, _)| *a == addr).map_or(size, |(_, w)| (*w).min(size)),
+            _ => size,
+        };
         let refused =
             !t.is_used() && !t.is_active() && (t.has_ancestor_realistic() || t.has_ancestor_solid());
-        let reads = refused && vn.is_some() && reads_as_argument(live, &addr, size, last.as_ref(), stores, pads);
+        let as_argument = match (live, &seen) {
+            (Some(f), _) => {
+                reads_as_argument(f, &addr, size, last.as_ref(), stores)
+                    || (stated(&addr)
+                        && crate::kuna_entryreads::overlaps(&passes, &addr, size)
+                        && last.as_ref().is_some_and(|(a, s)| !f.proves_read(a, *s)))
+            }
+            (None, Some(r)) => {
+                callee_reads && last.as_ref().is_some_and(|(a, s)| !crate::kuna_entryreads::overlaps(r, a, *s))
+            }
+            _ => false,
+        };
+        let reads = refused && vn.is_some() && as_argument;
         any |= reads;
+        fresh |= reads && !live.is_some_and(|f| reads_as_argument(f, &addr, size, last.as_ref(), stores));
         row.push(Some(Slot { index: i, addr, size, width, vn, reads }));
+    }
+    if fresh {
+        for s in row.iter_mut().flatten() {
+            if s.vn.is_some_and(|v| crate::p4_calls::kuna_calleedeadarg::is_leftover_call_result(data, v, 0)) {
+                s.vn = None;
+                s.reads = false;
+            }
+        }
+        any = row.iter().flatten().any(|s| s.reads);
     }
     let order = (0..active.get_num_trials())
         .map(|i| (active.get_trial(i).get_address().clone(), i))

@@ -177,25 +177,36 @@ export function stackOperand(ops) {
 
 /**
  * Operands as HTML: code addresses become `a.xt[data-goto]` links (annotated
- * with the function they start), and a frame-relative memory operand becomes
- * `span.so[data-slot]` carrying its entry-relative stack offset when
- * `ctx.slotOf(reg, disp, insn)` can place it.
+ * with the function they start), an address `ctx.dataAt(hex)` places in data
+ * becomes an `a.xt.xd` link (annotated with the name it gives, if any), and a
+ * frame-relative memory operand becomes `span.so[data-slot]` carrying its
+ * entry-relative stack offset when `ctx.slotOf(reg, disp, insn)` can place it.
  */
 export function linkOperands(insn, ctx = {}) {
   const ops = insn.operands || '';
   const linkable = isBranch(insn.mnemonic) || isCall(insn.mnemonic) || /^(LEA|ADR|ADRP)$/i.test(insn.mnemonic);
   const easy = ctx.spelling !== 'exact' && !(insn.mnemonic || '').startsWith('.');
   const spell = (text) => escapeHtml(easy ? easyOperands(text) : text);
+  const dataOf = (pre, lit) => {
+    if (!ctx.dataAt || (insn.mnemonic || '').startsWith('.') || /-\s*$/.test(pre)) return null;
+    return ctx.dataAt('0x' + BigInt(lit).toString(16));
+  };
+  const hasData = !!ctx.dataAt && [...ops.matchAll(/[^]*?\b(0x[0-9a-f]+)\b/gi)].some((m) => dataOf(m[0].slice(0, -m[1].length), m[1]) != null);
   const piece = (text) => {
-    if (!linkable) return spell(text);
+    if (!linkable && !hasData) return spell(text);
     return text.replace(/[^]*?\b(0x[0-9a-f]+)\b|[^]+/gi, (chunk, lit) => {
       if (!lit) return spell(chunk);
       const pre = chunk.slice(0, chunk.length - lit.length);
       const hex = '0x' + BigInt(lit).toString(16);
-      const fn = ctx.fnByAddr?.get(hex);
-      if (!fn && !ctx.insnIndex?.has(hex)) return spell(chunk);
-      const label = fn && ctx.nameOf ? ` <span class="d2muted">&lt;${escapeHtml(ctx.nameOf(fn))}&gt;</span>` : '';
-      return `${spell(pre)}<a class="xt" data-goto="${hex}">${escapeHtml(lit)}</a>${label}`;
+      const fn = linkable ? ctx.fnByAddr?.get(hex) : null;
+      if (fn || (linkable && ctx.insnIndex?.has(hex))) {
+        const label = fn && ctx.nameOf ? ` <span class="d2muted">&lt;${escapeHtml(ctx.nameOf(fn))}&gt;</span>` : '';
+        return `${spell(pre)}<a class="xt" data-goto="${hex}">${escapeHtml(lit)}</a>${label}`;
+      }
+      const data = dataOf(pre, lit);
+      if (data == null) return spell(chunk);
+      const label = data ? ` <span class="d2muted">&lt;${escapeHtml(data)}&gt;</span>` : '';
+      return `${spell(pre)}<a class="xt xd" data-goto="${hex}">${escapeHtml(lit)}</a>${label}`;
     });
   };
   const so = stackOperand(ops);
@@ -286,11 +297,22 @@ function flowOf(instructions) {
   });
 }
 
-/** The basic blocks of a listing: `[{start, end, succ}]` (`end` exclusive, `succ` block indices). */
+/**
+ * The basic blocks of a listing: `[{start, end, succ}]` (`end` exclusive, `succ` block indices).
+ * An instruction falls through to the row at its end address: the next row, except where
+ * `--follow` listed two overlapping readings of the same bytes.
+ */
 function basicBlocks(instructions, flows) {
+  const insnIndex = new Map(instructions.map((insn, i) => [insn.address_hex, i]));
+  const next = instructions.map((insn, i) => {
+    if (insn.size === undefined) return i + 1;
+    const j = insnIndex.get('0x' + (BigInt(insn.address_hex) + BigInt(insn.size)).toString(16));
+    return j === undefined ? i + 1 : j;
+  });
   const leader = new Set([0]);
   flows.forEach((f, i) => {
     if (f.kind && f.kind !== 'call' && f.kind !== 'callind') leader.add(i + 1);
+    if (next[i] !== i + 1) leader.add(i + 1).add(next[i]);
     for (const j of f.targets) if (f.kind !== 'call') leader.add(j);
   });
   const starts = [...leader].filter((i) => i < instructions.length).sort((a, b) => a - b);
@@ -300,7 +322,7 @@ function basicBlocks(instructions, flows) {
     const f = flows[end - 1];
     const succ = [];
     if (f.kind === 'jump' || f.kind === 'cjump') for (const j of f.targets) succ.push(blockAt.get(j));
-    if (f.kind !== 'jump' && f.kind !== 'return' && f.kind !== 'jumpind' && end < instructions.length) succ.push(b + 1);
+    if (f.kind !== 'jump' && f.kind !== 'return' && f.kind !== 'jumpind' && next[end - 1] < instructions.length) succ.push(blockAt.get(next[end - 1]));
     return { start, end, succ: succ.filter((x) => x !== undefined), last: f.kind };
   });
 }
