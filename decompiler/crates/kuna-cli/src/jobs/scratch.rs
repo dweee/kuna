@@ -331,6 +331,7 @@ mod tests {
         let owner = pending.persist(dir.join("owner.lock")).unwrap();
         sweep_stale_scratch(base.path());
         assert!(dir.is_dir());
+        owner.unlock().unwrap();
         drop(owner);
         sweep_stale_scratch(base.path());
         assert!(!dir.exists());
