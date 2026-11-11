@@ -1,9 +1,9 @@
 { lib, stdenv, rustPlatform, python3 }:
 
 let
-  # Upstream VERSION is only the major; its minor counts Git commits.
+  # Upstream VERSION is the major; release tags determine the minor.
   # Keep the complete upstream version with each reviewed source promotion.
-  version = "1.910";
+  version = "1.995";
 in
 rustPlatform.buildRustPackage {
   pname = "kuna";

@@ -493,8 +493,7 @@ fn switch_targets(
         &ctx.image.exec,
         &super::kuna_switchtable::Reach {
             max_entries,
-            preserved: if ctx.arch.analysis_switchreach { &ctx.preserved } else { &[] },
-            far: ctx.arch.analysis_switchreach,
+            preserved: &ctx.preserved,
         },
     )
     .cases
@@ -674,7 +673,7 @@ fn entry_state(ctx: &Ctx<'_>, entry: u64) -> State {
             state.set_reg(loc.offset, loc.size, Some(Val::Const(val)));
         }
     };
-    let tracked = ctx.arch.with_context_db_mut(|db| db.get_tracked_set(&at).clone());
+    let tracked = ctx.arch.with_context_db(|db| db.get_tracked_set(&at).clone());
     for t in &tracked {
         seed(&t.loc, t.val);
     }

@@ -173,6 +173,8 @@ pub mod param_entry_flags {
     pub const OVERLAPPING: uint4 = 0x400;
     /// Entry is first in its storage class.
     pub const FIRST_STORAGE: uint4 = 0x800;
+    /// (kuna) Slots keep the entry's alignment, not the data type's (`stackalign="false"`).
+    pub const IGNORE_TYPE_ALIGN: uint4 = 0x1000;
 }
 
 /// Characterization of how a memory range relates to a [`ParamEntry`] (C++
@@ -199,6 +201,8 @@ pub enum Containment {
 /// is non-null when this entry is a logical variable built from joined pieces.
 #[derive(Debug, Clone)]
 pub struct ParamEntry {
+    /// A declared extension beyond the logical parameter slot.
+    pub(crate) register_extension: Option<crate::p4_calls::kuna_registerslots::Extension>,
     /// Boolean properties of the parameter (C++ `flags`).
     flags: uint4,
     /// Data-type storage class that this entry must match (C++ `type`).
@@ -230,6 +234,7 @@ impl ParamEntry {
     /// in by `decode`.
     pub fn new(grp: int4) -> ParamEntry {
         ParamEntry {
+            register_extension: None,
             flags: 0,
             type_: type_class::TYPECLASS_GENERAL,
             group_set: vec![grp],
@@ -664,6 +669,7 @@ impl ParamEntry {
                 return Ok(res);
             }
         } else {
+            let type_align = super::kuna_stackparamalign::effective_alignment(self.flags, type_align, self.alignment);
             if type_align > self.alignment {
                 let tmp = (*slotnum * self.alignment) % type_align;
                 if tmp != 0 {
@@ -2485,6 +2491,9 @@ impl ParamListStandard {
     /// Get the type of extension and containing parameter for the given storage
     /// (C++ `assumedExtension`).
     pub fn assumed_extension(&self, addr: &Address, size: int4, res: &mut VarnodeData) -> OpCode {
+        if let Some(opcode) = super::kuna_registerslots::assumed(&self.entry, addr, size, res) {
+            return opcode;
+        }
         for e in self.entry.iter() {
             if e.get_min_size() > size {
                 continue;
@@ -2679,7 +2688,7 @@ impl ParamListStandard {
             }
             param.addr = cur_entry.get_addr_by_slot(
                 &mut status[grp as usize],
-                tp.get_align_size(),
+                crate::kuna_floatregister::storage_size(cur_entry, tp, manager),
                 tp.get_alignment(),
                 manager,
             )?;
@@ -2756,6 +2765,9 @@ impl ParamListStandard {
         manager: &AddrSpaceManager,
     ) -> KunaResult<()> {
         let mut status = vec![0i32; self.numgroup as usize];
+        if !proto.input_storage.is_empty() {
+            return super::kuna_inputstorage::assign(self, proto, typefactory, res, manager, &mut status);
+        }
         if res.len() == 2 {
             // Hidden parameters defined by the output list.
             let is_hidden = (res[1].flags & parameter_pieces_flags::HIDDENRETPARM) != 0;
@@ -3828,9 +3840,9 @@ pub struct PrototypePieces {
     /// input-side twin of [`Self::output_storage`] and it exists for the same
     /// reason: these pieces describe *types*, and storage is re-derived from the
     /// model, so a caller that states "this callee takes its first argument in
-    /// ECX" has nowhere else to put that fact.  `set_pieces` re-applies each
-    /// `(slot, storage)` after the model-driven `update_all_types`.  Empty is the
-    /// normal (model-derived) case.
+    /// ECX" has nowhere else to put that fact. Input assignment reserves each
+    /// stated range before assigning the remaining model-derived arguments.
+    /// Empty is the normal (entirely model-derived) case.
     pub input_storage: Vec<(int4, ParameterPieces)>,
     /// (kuna `libcnames`) The library's own names for this prototype's
     /// parameters and result, when the prototype came from a built-in library
@@ -3912,10 +3924,6 @@ pub struct ProtoModel {
     localrange: RangeList,
     /// Memory range(s) of space-based parameters (C++ `paramrange`).
     paramrange: RangeList,
-    /// (kuna `protoranges`) `defaultLocalRange`, kept beside a spec's own.
-    default_localrange: RangeList,
-    /// (kuna `protoranges`) `defaultParamRange`, kept beside a spec's own.
-    default_paramrange: RangeList,
     /// `true` if stack parameters have low->high address ordering (C++
     /// `stackgrowsnegative`).
     stackgrowsnegative: bool,
@@ -3985,8 +3993,6 @@ impl ProtoModel {
             inject_upon_return: -1,
             localrange: RangeList::new(),
             paramrange: RangeList::new(),
-            default_localrange: RangeList::new(),
-            default_paramrange: RangeList::new(),
             stackgrowsnegative: true, // Normal stack parameter ordering
             has_this: false,
             is_construct: false,
@@ -3996,8 +4002,6 @@ impl ProtoModel {
         };
         res.default_local_range(manager);
         res.default_param_range(manager);
-        res.default_localrange = res.localrange.clone();
-        res.default_paramrange = res.paramrange.clone();
         res
     }
 
@@ -4061,24 +4065,6 @@ impl ProtoModel {
     /// Get the range of (possible) stack parameters (C++ `getParamRange`).
     pub fn get_param_range(&self) -> &RangeList {
         &self.paramrange
-    }
-    /// The local range `protoranges` selects: the spec's when `spec`, else the
-    /// default.
-    pub fn local_range(&self, spec: bool) -> &RangeList {
-        if spec {
-            &self.localrange
-        } else {
-            &self.default_localrange
-        }
-    }
-    /// The parameter range `protoranges` selects: the spec's when `spec`, else
-    /// the default.
-    pub fn param_range(&self, spec: bool) -> &RangeList {
-        if spec {
-            &self.paramrange
-        } else {
-            &self.default_paramrange
-        }
     }
     /// Replace the default local range with the decoded one (C++ `decode`'s
     /// `localrange` arm).
@@ -4618,8 +4604,6 @@ impl ProtoModel {
             self.likelytrash = model.likelytrash.clone();
             self.localrange = model.localrange.clone();
             self.paramrange = model.paramrange.clone();
-            self.default_localrange = model.default_localrange.clone();
-            self.default_paramrange = model.default_paramrange.clone();
         } else {
             self.input.as_mut().unwrap().fold_in(model.input())?;
             // We assume here that the output models are the same, but we don't check
@@ -4643,14 +4627,6 @@ impl ProtoModel {
             }
             for r in model.paramrange.iter() {
                 self.paramrange
-                    .insert_range(Rc::clone(r.get_space()), r.get_first(), r.get_last());
-            }
-            for r in model.default_localrange.iter() {
-                self.default_localrange
-                    .insert_range(Rc::clone(r.get_space()), r.get_first(), r.get_last());
-            }
-            for r in model.default_paramrange.iter() {
-                self.default_paramrange
                     .insert_range(Rc::clone(r.get_space()), r.get_first(), r.get_last());
             }
         }
@@ -5911,7 +5887,8 @@ impl FuncProto {
         if model.is_some() {
             self.set_model(model);
         }
-        self.update_all_types(pieces, typefactory, manager)?;
+        let assignment = super::kuna_customreturn::input_assignment(pieces, typefactory)?;
+        self.update_all_types(&assignment, typefactory, manager)?;
         let custom_storage = pieces
             .input_storage
             .iter()
@@ -5928,31 +5905,10 @@ impl FuncProto {
         if let Some(custom_out) = pieces.output_storage.as_ref() {
             self.store_mut().set_output(custom_out);
         }
-        // (kuna) The same override on the input side, for the slots a caller
-        // named explicitly (`map param <func>::<i> <storage> <decl>`).  Only a
-        // slot the model actually assigned is replaced, so a stale index cannot
-        // punch a hole into the parameter list.
         if custom_storage {
-            self.store_mut().clear_all_inputs();
             self.flags |= func_proto_flags::CUSTOM_STORAGE;
         } else {
             self.flags &= !func_proto_flags::CUSTOM_STORAGE;
-        }
-        let assigned = if custom_storage {
-            int4::MAX
-        } else {
-            self.store().get_num_inputs()
-        };
-        for (slot, custom_in) in pieces.input_storage.iter() {
-            if *slot < 0 || *slot >= assigned {
-                continue;
-            }
-            let name = pieces
-                .innames
-                .get(*slot as usize)
-                .map(String::as_str)
-                .unwrap_or("");
-            self.store_mut().set_input(*slot, name, custom_in);
         }
         self.set_input_lock(true);
         self.set_output_lock(true);
@@ -6493,14 +6449,6 @@ impl FuncProto {
     pub fn get_param_range(&self) -> &RangeList {
         self.model().get_param_range()
     }
-    /// The local range `protoranges` selects (see [`ProtoModel::local_range`]).
-    pub fn local_range(&self, spec: bool) -> &RangeList {
-        self.model().local_range(spec)
-    }
-    /// The parameter range `protoranges` selects (see [`ProtoModel::param_range`]).
-    pub fn param_range(&self, spec: bool) -> &RangeList {
-        self.model().param_range(spec)
-    }
     /// Return true if the stack grows toward smaller addresses (C++
     /// `isStackGrowsNegative`).
     pub fn is_stack_grows_negative(&self) -> bool {
@@ -6855,6 +6803,9 @@ pub struct FuncCallSpecs {
     /// into this tail call.  Its value is the callee's own address, so input
     /// recovery never takes it as an argument.
     jump_target_storage: Option<(Address, int4)>,
+    /// (kuna `pltlocal`) The PLT stub a call through it was built past, at the
+    /// definition the stub is bound to. See [`crate::p4_calls::kuna_pltlocal`].
+    plt_stub: Option<Address>,
 }
 
 impl FuncCallSpecs {
@@ -6890,6 +6841,7 @@ impl FuncCallSpecs {
             zext_trimmed: Vec::new(),        // (kuna) truncarg
             format_arity: None,              // (kuna) formatstring
             jump_target_storage: None,       // (kuna) tailcalljump
+            plt_stub: None,                  // (kuna) pltlocal
         }
     }
 
@@ -6921,6 +6873,7 @@ impl FuncCallSpecs {
         res.proto.copy(&self.proto); // Copy the FuncProto portion
         res.format_arity = self.format_arity;
         res.jump_target_storage = self.jump_target_storage.clone();
+        res.plt_stub = self.plt_stub.clone();
         res
     }
 
@@ -7267,6 +7220,16 @@ impl FuncCallSpecs {
         self.format_arity = arity;
     }
 
+    /// (kuna `pltlocal`) The PLT stub this call was built past, if any.
+    pub fn plt_stub(&self) -> Option<&Address> {
+        self.plt_stub.as_ref()
+    }
+
+    /// (kuna `pltlocal`) Record the PLT stub this call was built past.
+    pub fn set_plt_stub(&mut self, stub: Address) {
+        self.plt_stub = Some(stub);
+    }
+
     /// (kuna `tailcalljump`) Record the register that carried this tail call's
     /// computed target.  See [`Self::carries_jump_target`].
     pub fn set_jump_target_storage(&mut self, storage: (Address, int4)) {
@@ -7405,6 +7368,14 @@ impl FuncCallSpecs {
         newinput: &mut Vec<Option<VarnodeId>>,
         newoutput: &mut Vec<VarnodeId>,
     ) -> KunaResult<bool> {
+        if super::kuna_joincalloutput::needs_reflow(data, self, restricted_proto) {
+            return Ok(false);
+        }
+        if data.get_arch().call_mechanism_effects
+            && crate::kuna_callmechanisms::requires_reflow(&self.proto, restricted_proto)
+        {
+            return Ok(false);
+        }
         if !self.proto.has_model() {
             self.proto.copy(restricted_proto);
             return Ok(true);
