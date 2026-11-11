@@ -24,7 +24,7 @@ is not needed for day-to-day work.
 | `specs/Ghidra/Processors/` | Vendored SLEIGH specs. `.sla` files are built artifacts (gitignored), produced by `slacomp`. |
 | `scripts/` + `tools/pipeline/` | Python helpers (`decompile.py` library shim, `paths.py`, `pipeline/`, `decbench/`) + driver for the improvement pipeline (`docs/improvement-pipeline.md`) and the decbench campaign (`docs/decbench-loop.md`). |
 | `scripts/repipe/` + `tools/repipe/` | The RE-friction loop (`docs/re-pipeline.md`): Codex Sol-low testers reverse-engineer crackmes with kuna and record where it fails them; Codex Sol-high-or-above builders close those gaps and self-merge. Durable backlog in `docs/re-needs/`; promoted regression probes in `tests/cli/`. |
-| `integrations/` | Front-ends embedding the engine: `ghidra/` (kuna as stock Ghidra's decompiler core), `web/` (the project site + in-browser decompiler at `kuna.noelo.org`). |
+| `integrations/` | Front-ends embedding the engine: `ghidra/` (kuna as stock Ghidra's decompiler core), `web/` (the project site at `kuna.noelo.org` + the in-browser decompiler at `decompile.run`). |
 
 ## Build & test
 
@@ -106,14 +106,31 @@ phases are **settable assertions/options** (`--option NAME VALUE`, discovered vi
 
 ## Adding features (the enforced rules)
 
-- **Anything that can change emitted C ships behind a named option** — a `settableTable`
-  row in `decompiler/crates/kuna-decomp/phases.toml` (every field populated, including
-  `tier` + `symptoms`) plus a handler in `src/p0_knowledge/kuna_option_dispatch.rs`; `kuna catalog
-  --check` must stay green. Options can take values, not just on/off. New logic goes in a
-  `kuna_<slug>.rs` module inside its owning phase folder (canonical template:
-  `p2_lift/kuna_loweredswitch.rs`). This is for *features* — behavior that is a judgment
-  call, not universally better; a strict bug fix that only corrects wrong output needs no
-  flag (when in doubt, gate it).
+- **A judgement call ships behind a named option; a fix does not.** An option is a
+  `settableTable` row in `decompiler/crates/kuna-decomp/phases.toml` (every field populated,
+  including `tier` + `symptoms`) plus a handler in `src/p0_knowledge/kuna_option_dispatch.rs`;
+  `kuna catalog --check` must stay green. Options can take values, not just on/off. New logic
+  goes in a `kuna_<slug>.rs` module inside its owning phase folder (canonical template:
+  `p2_lift/kuna_loweredswitch.rs`). An option exists only where the outcome is questionable:
+  a faithfulness-vs-readability choice, a speculative or destructive recovery, a speed trade,
+  a heuristic scanner. A **strict correctness fix** — one whose `off` value would only
+  reproduce output that is false about the program — ships with **no flag**, always on, and
+  its stage test pins the fixed output in one pass. The agent reading `kuna catalog` pays
+  for every row, so do not gate "when in doubt"; decide.
+- **A refinement extends the option it refines.** A guard, a widening or a second case of an
+  existing feature becomes part of that feature (unconditional when the parent is on) or a
+  new *value* of the parent's option, never a sibling flag (`calleearity` once had five).
+- **A target-gated feature defaults on and says so.** Anything that applies only to one
+  architecture, OS, container format or source language (PE RTTI, Mach-O ObjC, ARM literal
+  pools, Go/Rust ABI) is enabled automatically on that target, is inert everywhere else, and
+  its `phases.toml` row names the target in its first sentence. "Needs evidence" is answered
+  by the on-target sweep plus an off-target byte-identical sweep, not by shipping it off.
+- **The catalog default is the product default.** If the `auto` mode would turn an option on
+  for every binary of every size, that is the catalog default; the vendored datatest corpus
+  pins the upstream spelling per test (`<com>option NAME off</com>`), as `returndup` and
+  `truthycond` do. Presets (`docs/modes.md`) exist for size and risk trade-offs, not to hide
+  a better default. The decisions behind these rules, option by option:
+  `docs/option-surface-study.md`.
 - **Adding an option also bumps hard-coded catalog counts** — the count tests in
   `kuna_phases/tests.rs`, the `tests/catalog_bytecompat.rs` fixture, and the
   `tests/stages/kuna-catalog.xml` count assertions. Grep for the current total, or
@@ -180,11 +197,12 @@ phases are **settable assertions/options** (`--option NAME VALUE`, discovered vi
 | `docs/re-pipeline.md` | The RE-friction loop: agents solve crackmes with kuna, record where it fails them, and close those gaps. The second, self-merging lane. |
 | `docs/decbench-loop.md` | The decbench benchmark / improvement campaign. |
 | `docs/modes.md` | `--mode auto\|reliable\|aggressive\|fast` option presets and size thresholds. |
+| `docs/multilang.md` | The multi-language (Rust/Go/Swift) source-support architecture and roadmap: the `sourcelang` plane, idiom engine, type facets, per-language packs. |
 | `docs/observatory.md` | The local codebase observatory (`make observatory`): generated architecture/churn/coverage/walkthrough pages + their JSON contracts. |
 | `docs/missing-ghidra-analyses.md` | The `kuna-analysis` tier: the analyzer gap vs Ghidra, pass contract, commit gating. |
 | `docs/ghidra-integration.md` | kuna as Ghidra's decompiler core (architecture + wire protocol). |
 | `docs/web-integration.md` | The WASM/browser front-end and the project site. |
 | `docs/devcontainer.md` | The reproducible build container + cross-arch fixture builds. |
 | `docs/nightly.md` | The nightly CI: full gates plus a decbench sample (score and speed changes night to night). |
-| `docs/release.md` | The MAJOR.MINOR version scheme (`VERSION` file + commit count, `make version`) and the binary release CI. |
+| `docs/release.md` | The MAJOR.MINOR version scheme (`VERSION` file + release count, `make version`) and the binary release CI. |
 | `docs/history.md` | **Rarely needed.** The far past: milestone timeline, the C++→Rust port + its verification, a frozen index for old `DIV-N` citations, vendored-tree provenance (`GHIDRA_REV`) + sync procedure. |

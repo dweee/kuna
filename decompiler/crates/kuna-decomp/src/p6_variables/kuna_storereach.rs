@@ -50,8 +50,7 @@
 //! integers or unknowns (a bounded reach may also lie wholly in a float
 //! local), or splits or reads as an integer a float local a guarded piece lies
 //! in: the drive then analyzes a freshly built copy of the function without
-//! the guard (`withdraw_spoiled_guard`), which prints what `stackstoreguard
-//! off` prints.
+//! the guard (`withdraw_spoiled_guard`), which prints the unguarded analysis.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
@@ -97,7 +96,7 @@ impl<T: Clone> Walk<T> {
         }
         let n = self.steps.get().wrapping_add(1);
         self.steps.set(n);
-        if self.expired.get() || (n % 256 == 0 && crate::infra::decompile_drive::deadline_passed()) {
+        if self.expired.get() || (n % 256 == 0 && crate::infra::decompile_drive::deadline_passed_in("store reachability")) {
             self.expired.set(true);
             return gave_up;
         }
