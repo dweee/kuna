@@ -46,13 +46,13 @@ fn build_manager() -> AddrSpaceManager {
 }
 
 fn build_fd() -> Funcdata {
-    build_fd_with_cancel_byte_arithmetic(false)
+    build_fd_with(|_| {})
 }
 
-fn build_fd_with_cancel_byte_arithmetic(gate: bool) -> Funcdata {
+fn build_fd_with(configure: impl FnOnce(&mut ArchContext)) -> Funcdata {
     let manage = build_manager();
     let mut ctx = ArchContext::new(manage);
-    ctx.cancel_byte_arithmetic = gate;
+    configure(&mut ctx);
     let glb = Rc::new(ctx);
     let ram = Rc::clone(glb.manage().get_space_by_name("ram").unwrap());
     let addr = Address::new(ram, 0x1000);
@@ -355,8 +355,8 @@ fn build_divrem_subpiece(fd: &mut Funcdata, opcode: OpCode) -> (OpId, OpId, Varn
     (subpiece, divrem, out)
 }
 
-fn divrem_commute_fingerprint(gate: bool, opcode: OpCode) -> (int4, OpCode, bool, Vec<OpCode>) {
-    let mut fd = build_fd_with_cancel_byte_arithmetic(gate);
+fn divrem_commute_fingerprint(opcode: OpCode) -> (int4, OpCode, bool, Vec<OpCode>) {
+    let mut fd = build_fd();
     let (subpiece, divrem, out) = build_divrem_subpiece(&mut fd, opcode);
     let changed = RuleSubCommute::new().apply_op(subpiece, &mut fd);
     let op = fd.obank().get(divrem).unwrap();
@@ -374,7 +374,7 @@ fn divrem_commute_fingerprint(gate: bool, opcode: OpCode) -> (int4, OpCode, bool
 fn cancelbytearithmetic_folds_all_shift_and_operand_permutations() {
     for amount in 1..8 {
         for permutation in 0..8 {
-            let mut fd = build_fd_with_cancel_byte_arithmetic(true);
+            let mut fd = build_fd();
             let fixture =
                 build_byte_cancellation(&mut fd, Some(amount), 0, 0, 1, None, permutation);
             assert_eq!(RuleSubCommute::new().apply_op(fixture.subpiece, &mut fd), 1);
@@ -390,17 +390,6 @@ fn cancelbytearithmetic_folds_all_shift_and_operand_permutations() {
 }
 
 #[test]
-fn cancelbytearithmetic_off_restores_the_upstream_decline() {
-    let mut fd = build_fd_with_cancel_byte_arithmetic(false);
-    let fixture = build_byte_cancellation(&mut fd, Some(1), 0, 0, 1, None, 0);
-    assert_eq!(RuleSubCommute::new().apply_op(fixture.subpiece, &mut fd), 0);
-    assert_eq!(
-        fd.obank().get(fixture.root).unwrap().code(),
-        OpCode::CPUI_INT_ADD
-    );
-}
-
-#[test]
 fn cancelbytearithmetic_declines_shift_and_width_bounds() {
     let cases = [
         (Some(0), 0, 1),
@@ -410,7 +399,7 @@ fn cancelbytearithmetic_declines_shift_and_width_bounds() {
         (Some(1), 0, 2),
     ];
     for (amount, offset, width) in cases {
-        let mut fd = build_fd_with_cancel_byte_arithmetic(true);
+        let mut fd = build_fd();
         let fixture = build_byte_cancellation(&mut fd, amount, offset, 0, width, None, 0);
         assert_eq!(
             RuleSubCommute::new().apply_op(fixture.subpiece, &mut fd),
@@ -423,7 +412,7 @@ fn cancelbytearithmetic_declines_shift_and_width_bounds() {
 #[test]
 fn cancelbytearithmetic_declines_wrong_coefficient_source_and_plain_offset() {
     for case in 0..3 {
-        let mut fd = build_fd_with_cancel_byte_arithmetic(true);
+        let mut fd = build_fd();
         let fixture = build_byte_cancellation(
             &mut fd,
             Some(3),
@@ -449,7 +438,7 @@ fn cancelbytearithmetic_declines_wrong_coefficient_source_and_plain_offset() {
 #[test]
 fn cancelbytearithmetic_declines_constant_and_call_or_load_producers() {
     for case in 0..3 {
-        let mut fd = build_fd_with_cancel_byte_arithmetic(true);
+        let mut fd = build_fd();
         let fixture = build_byte_cancellation(&mut fd, Some(1), 0, 0, 1, None, 0);
         if case == 0 {
             let mask = fd.new_constant(4, 0xff);
@@ -477,7 +466,7 @@ fn cancelbytearithmetic_declines_constant_and_call_or_load_producers() {
 #[test]
 fn cancelbytearithmetic_preserves_both_precision_guards() {
     for high in [false, true] {
-        let mut fd = build_fd_with_cancel_byte_arithmetic(true);
+        let mut fd = build_fd();
         let fixture = build_byte_cancellation(&mut fd, Some(1), 0, 0, 1, None, 0);
         if high {
             fd.vbank_mut()
@@ -497,7 +486,7 @@ fn cancelbytearithmetic_preserves_both_precision_guards() {
 #[test]
 fn cancelbytearithmetic_preserves_every_single_descendant_guard() {
     for case in 0..5 {
-        let mut fd = build_fd_with_cancel_byte_arithmetic(true);
+        let mut fd = build_fd();
         let fixture = build_byte_cancellation(&mut fd, Some(1), 0, 0, 1, None, 0);
         let observed = match case {
             0 => fixture.shifted,
@@ -519,7 +508,7 @@ fn cancelbytearithmetic_requires_exact_modulo_256_coefficient() {
             expected.wrapping_sub(1) & 0xff,
             expected.wrapping_add(1) & 0xff,
         ] {
-            let mut fd = build_fd_with_cancel_byte_arithmetic(true);
+            let mut fd = build_fd();
             let fixture =
                 build_byte_cancellation(&mut fd, Some(amount), 0, 0, 1, Some(coefficient), 0);
             assert_eq!(RuleSubCommute::new().apply_op(fixture.subpiece, &mut fd), 0);
@@ -528,9 +517,9 @@ fn cancelbytearithmetic_requires_exact_modulo_256_coefficient() {
 }
 
 #[test]
-fn cancelbytearithmetic_does_not_gate_legacy_zext_or_piece_paths() {
+fn cancelbytearithmetic_leaves_legacy_zext_or_piece_paths_alone() {
     for extension in [OpCode::CPUI_INT_ZEXT, OpCode::CPUI_PIECE] {
-        let mut fd = build_fd_with_cancel_byte_arithmetic(false);
+        let mut fd = build_fd();
         let (subpiece, _shift) = build_extension_shift_subpiece(&mut fd, extension);
         assert_eq!(
             RuleSubCommute::new().apply_op(subpiece, &mut fd),
@@ -543,9 +532,7 @@ fn cancelbytearithmetic_does_not_gate_legacy_zext_or_piece_paths() {
 #[test]
 fn cancelbytearithmetic_does_not_change_unsigned_division_or_remainder_arms() {
     for opcode in [OpCode::CPUI_INT_DIV, OpCode::CPUI_INT_REM] {
-        let off = divrem_commute_fingerprint(false, opcode);
-        let on = divrem_commute_fingerprint(true, opcode);
-        assert_eq!(off, on, "{opcode:?} must be byte-identical across the gate");
+        let on = divrem_commute_fingerprint(opcode);
         assert_eq!(on.0, 1, "the legacy {opcode:?} commute must still apply");
         assert_eq!(on.1, opcode);
         assert!(on.2);
@@ -555,7 +542,7 @@ fn cancelbytearithmetic_does_not_change_unsigned_division_or_remainder_arms() {
 
 #[test]
 fn cancelbytearithmetic_reaches_a_one_step_fixed_point() {
-    let mut fd = build_fd_with_cancel_byte_arithmetic(true);
+    let mut fd = build_fd();
     let fixture = build_byte_cancellation(&mut fd, Some(1), 0, 0, 1, None, 0);
     assert_eq!(RuleSubCommute::new().apply_op(fixture.subpiece, &mut fd), 1);
     assert_eq!(RuleSubCommute::new().apply_op(fixture.subpiece, &mut fd), 0);
@@ -1158,6 +1145,60 @@ fn concatzero_rejects_nonzero_const() {
     assert_eq!(RuleConcatZero::new().apply_op(cat, &mut fd), 0);
 }
 
+#[test]
+fn concatzero_preserves_structured_values_for_field_recovery() {
+    for (metatype, kept) in [
+        (type_metatype::TYPE_STRUCT, true),
+        (type_metatype::TYPE_INT, false),
+    ] {
+        let mut fd = build_fd();
+        let block = mk_block(&mut fd);
+        let value = mk_vn(&mut fd, 12, 0x10);
+        let zero = fd.new_constant(4, 0);
+        let (op, output) = mk_def(&mut fd, block, OpCode::CPUI_PIECE, 16, 0x30, &[value, zero]);
+        fd.vbank_mut().get_mut(output).unwrap()
+            .update_type(Rc::new(Datatype::new(16, metatype)));
+        assert_eq!(RuleConcatZero::new().apply_op(op, &mut fd), i32::from(!kept), "{metatype:?}");
+        let code = fd.obank().get(op).unwrap().code();
+        assert_eq!(code, if kept { OpCode::CPUI_PIECE } else { OpCode::CPUI_INT_LEFT });
+        if kept {
+            assert_eq!(fd.obank().get(op).unwrap().get_in(0), Some(value));
+            assert_eq!(fd.obank().get(op).unwrap().get_in(1), Some(zero));
+        }
+    }
+}
+
+#[test]
+fn every_copy_on_the_chain_to_the_return_resolves_the_whole_container() {
+    use crate::fspec::ProtoStore;
+    {
+        let mut fd = build_fd();
+        let parent = Rc::new(Datatype::new(8, type_metatype::TYPE_STRUCT));
+        let mut store = crate::fspec::ProtoStoreInternal::new(Rc::new(Datatype::new(0, type_metatype::TYPE_VOID)));
+        store.set_output(&crate::fspec::ParameterPieces {
+            addr: Address::new(ram_space(&fd), 0x80),
+            type_: Some(Rc::clone(&parent)),
+            flags: 0,
+        });
+        fd.get_func_proto_mut().set_store(Box::new(store));
+        fd.get_func_proto_mut().set_output_lock(true);
+        let block = mk_block(&mut fd);
+        let input = mk_vn(&mut fd, 8, 0x10);
+        fd.vbank_mut().get_mut(input).unwrap().update_type_locked(Rc::clone(&parent), true, true);
+        let (first, middle) = mk_def(&mut fd, block, OpCode::CPUI_COPY, 8, 0x20, &[input]);
+        let (second, last) = mk_def(&mut fd, block, OpCode::CPUI_COPY, 8, 0x30, &[middle]);
+        let ret = mk_op(&mut fd, 2, 0x40, OpCode::CPUI_RETURN);
+        let offset = fd.new_constant(4, 0);
+        fd.op_set_input(ret, offset, 0).unwrap();
+        fd.op_set_input(ret, last, 1).unwrap();
+        fd.op_insert(ret, block, None);
+        for (op, slot) in [(first, -1), (first, 0), (second, -1), (second, 0), (ret, 1)] {
+            assert!(crate::kuna_aggregatefields::returns_whole_container(&fd, op, slot, &parent),
+                "op={op:?} slot={slot}");
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // RuleZextCommute  (creates an earlier INT_RIGHT)
 // ---------------------------------------------------------------------------
@@ -1187,6 +1228,53 @@ fn zextcommute_pushes_shift_inside() {
     assert_eq!(fd.obank().get(newshift).unwrap().code(), OpCode::CPUI_INT_RIGHT);
     assert_eq!(fd.obank().get(newshift).unwrap().get_in(0), Some(v));
     assert_eq!(fd.obank().get(newshift).unwrap().get_in(1), Some(c));
+}
+
+#[test]
+fn zextcommute_preserves_wide_shifts_unless_the_count_fits() {
+    for bytes in [1, 2, 4] {
+        for promotion in [false, true] {
+            for constant in [false, true] {
+                let bits = bytes as u64 * 8;
+                let limit = if promotion { bits.max(32) } else { bits };
+                for bound in [0, bits - 1, bits, bits * 2 - 1, 31, 32, 63, u32::MAX as u64] {
+                    let mut fd = build_fd_with(|ctx| ctx.int_promotion = promotion);
+                    let bl = mk_block(&mut fd);
+                    let value = mk_vn(&mut fd, bytes, 0x10);
+                    let (_, extended) = mk_def(&mut fd, bl, OpCode::CPUI_INT_ZEXT, 8, 0x20, &[value]);
+                    let amount = if constant {
+                        fd.new_constant(4, bound)
+                    } else {
+                        let vn = mk_vn(&mut fd, 4, 0x18);
+                        fd.vbank_mut().get_mut(vn).unwrap().set_nz_mask(bound);
+                        vn
+                    };
+                    let (shift, _) = mk_def(&mut fd, bl, OpCode::CPUI_INT_RIGHT, 8, 0x30, &[extended, amount]);
+                    let applied = RuleZextCommute::new().apply_op(shift, &mut fd);
+                    assert_eq!(
+                        applied,
+                        (bound < limit) as int4,
+                        "{bytes} bytes, bound {bound}, constant {constant}, promotion {promotion}"
+                    );
+                    let op = fd.obank().get(shift).unwrap();
+                    if bound >= limit {
+                        assert_eq!(op.code(), OpCode::CPUI_INT_RIGHT);
+                        assert_eq!(op.get_in(0), Some(extended));
+                        assert_eq!(op.get_in(1), Some(amount));
+                    } else {
+                        assert_eq!(op.code(), OpCode::CPUI_INT_ZEXT);
+                        let narrow = op.get_in(0).unwrap();
+                        assert_eq!(fd.vbank().get(narrow).unwrap().get_size(), bytes);
+                        let inner = fd.vbank().get(narrow).unwrap().get_def().unwrap();
+                        let inner = fd.obank().get(inner).unwrap();
+                        assert_eq!(inner.code(), OpCode::CPUI_INT_RIGHT);
+                        assert_eq!(inner.get_in(0), Some(value));
+                        assert_eq!(inner.get_in(1), Some(amount));
+                    }
+                }
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1379,6 +1467,47 @@ fn concatcommute_or_lower() {
     assert_eq!(fd.obank().get(inner).unwrap().get_in(1), Some(w));
     let cc = fd.obank().get(cat).unwrap().get_in(1).unwrap();
     assert_eq!(fd.vbank().get(cc).unwrap().get_offset(), 0x00ff);
+}
+
+#[test]
+fn loadvarnode_promotes_only_proven_disjoint_or_offsets() {
+    for (offset, mask, expected) in [
+        (0x120, 0x120, Some(0x124)),
+        (0x124, 0x124, None),
+        (0x120, u64::MAX, None),
+    ] {
+        for commuted in [false, true] {
+            let mut fd = build_fd();
+            let bl = mk_block(&mut fd);
+            // A constant pseudo-spacebase is the existing global-space form.
+            // The CLI regression exercises the same rewrite on real frame SSA.
+            let base = fd.new_constant(8, 0);
+            fd.vbank_mut().get_mut(base).unwrap().set_spacebase();
+            let displacement = fd.new_constant(8, offset);
+            let (_, address) = mk_def(
+                &mut fd, bl, OpCode::CPUI_INT_ADD, 8, 0x20, &[base, displacement],
+            );
+            fd.vbank_mut().get_mut(address).unwrap().set_nz_mask(mask);
+            let word = fd.new_constant(8, 4);
+            let inputs = if commuted { [word, address] } else { [address, word] };
+            let (_, pointer) = mk_def(&mut fd, bl, OpCode::CPUI_INT_OR, 8, 0x30, &inputs);
+            let space = fd.new_constant(8, ram_space(&fd).get_index() as u64);
+            let (load, _) = mk_def(&mut fd, bl, OpCode::CPUI_LOAD, 4, 0x40, &[space, pointer]);
+            let changed = RuleLoadVarnode::new().apply_op(load, &mut fd);
+            if let Some(expected) = expected {
+                assert_eq!(changed, 1);
+                assert_eq!(fd.obank().get(load).unwrap().code(), OpCode::CPUI_COPY);
+                let input = fd.obank().get(load).unwrap().get_in(0).unwrap();
+                let value = fd.vbank().get(input).unwrap();
+                assert_eq!(value.get_offset(), expected);
+                assert_eq!(value.get_size(), 4);
+                assert_eq!(value.get_space().get_name(), "ram");
+            } else {
+                assert_eq!(changed, 0);
+                assert_eq!(fd.obank().get(load).unwrap().code(), OpCode::CPUI_LOAD);
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

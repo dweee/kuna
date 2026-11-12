@@ -269,6 +269,8 @@ fn kuna_command(env: &[(&str, &str)]) -> Command {
     // whose whole assertion is that the block is absent.
     cmd.env_remove("RUST_BACKTRACE");
     cmd.env_remove("KUNA_JOBS_FAULT");
+    cmd.env_remove("KUNA_RENDER_FAULT");
+    cmd.env_remove("KUNA_JUMPTABLE_FAULT");
     for name in DECODE_ENV {
         cmd.env_remove(name);
     }
@@ -1197,7 +1199,8 @@ fn watchdog_stops_region_structuring_and_the_batch_continues() {
     let doc: serde_json::Value = serde_json::from_str(&stdout).expect(&stderr);
     let functions = doc["functions"].as_array().unwrap();
     let stress = functions.iter().find(|f| f["name"] == "stress").unwrap();
-    assert_eq!(stress["error"], "per-function decompile budget exceeded (1 s)", "{stdout}");
+    let error = stress["error"].as_str().unwrap_or_default();
+    assert!(error.starts_with("per-function decompile budget exceeded (1 s) in "), "{stdout}");
     assert!(stress["code"].is_null(), "{stdout}");
     let after = functions.iter().find(|f| f["name"] == "after").unwrap();
     assert!(after["error"].is_null(), "{stdout}");
@@ -1537,9 +1540,9 @@ fn functions_lists_main() {
 /// the single biggest cause of kuna losing to Ghidra proper on the benchmark
 /// (~50% of the ghidra-beats-kuna GED cases were this boundary overrun).
 ///
-/// The test isolates exactly the fix: `--option noreturn_error off` (no error
+/// The test isolates exactly the fix: `--option noreturn_known off` (no error
 /// recognizer ⇒ no prune ⇒ err_fatal absorbs `compute`) must yield a LARGER
-/// function byte-extent than the default (`noreturn_error on`, the prune fires).
+/// function byte-extent than the default (`noreturn_known on`, the prune fires).
 #[test]
 fn decompile_all_error_nonzero_does_not_absorb_next_function() {
     let bin = noreturn_error_fixture();
@@ -1556,7 +1559,7 @@ fn decompile_all_error_nonzero_does_not_absorb_next_function() {
     // `funcboundflow` (default-on, DIV-67) is a SECOND, name-independent bound that
     // stops the same overrun at `compute`'s entry, so it must also be off to expose
     // the pre-fix overrun this test isolates.
-    let off = code(&["--option", "noreturn_error", "off", "--option", "funcboundflow", "off"]);
+    let off = code(&["--option", "noreturn_known", "off", "--option", "funcboundflow", "off"]);
     // ON (default): the CALL_RETURN prune stops err_fatal at the no-return call.
     let on = code(&[]);
     // `err_warn` belongs to `compute_warn` — a DIFFERENT function two hops after
@@ -1565,12 +1568,12 @@ fn decompile_all_error_nonzero_does_not_absorb_next_function() {
     // overrun; ON (the prune) must not.
     assert!(
         off.contains("err_warn"),
-        "with noreturn_error off, err_fatal should overrun and absorb the following \
+        "with noreturn_known off, err_fatal should overrun and absorb the following \
          functions (the pre-fix behaviour):\n{off}"
     );
     assert!(
         !on.contains("err_warn"),
-        "noreturn_error must prune the `call error(2)` fall-through so err_fatal does \
+        "noreturn_known must prune the `call error(2)` fall-through so err_fatal does \
          NOT absorb `compute`/`compute_warn`:\n{on}"
     );
 }
@@ -1579,7 +1582,7 @@ fn decompile_all_error_nonzero_does_not_absorb_next_function() {
 /// `error(nonzero)` fall-through — not just `decompile-all`. It now builds the Listing by
 /// default (like decompile-all) and `IfcDecompile` applies the CALL_RETURN overrides, so
 /// `err_fatal` @ 0x4011c0 does not overrun into the following `compute`/`compute_warn`.
-/// `--option noreturn_error off` disables the recognizer ⇒ the overrun returns (control).
+/// `--option noreturn_known off` disables the recognizer ⇒ the overrun returns (control).
 #[test]
 fn kuna_decompile_single_error_nonzero_does_not_absorb_next_function() {
     let bin = noreturn_error_fixture();
@@ -1595,11 +1598,11 @@ fn kuna_decompile_single_error_nonzero_does_not_absorb_next_function() {
     // output ONLY if the flow overran past `call error(2)`.  `funcboundflow` (default-on,
     // DIV-67) is a second, name-independent bound at `compute`'s entry, so it too must be
     // off to expose the pre-fix overrun.
-    let off = code(&["--option", "noreturn_error", "off", "--option", "funcboundflow", "off"]);
+    let off = code(&["--option", "noreturn_known", "off", "--option", "funcboundflow", "off"]);
     let on = code(&[]);
     assert!(
         off.contains("err_warn"),
-        "noreturn_error off: single-function err_fatal should overrun (pre-fix):\n{off}"
+        "noreturn_known off: single-function err_fatal should overrun (pre-fix):\n{off}"
     );
     assert!(
         !on.contains("err_warn"),
@@ -1760,16 +1763,7 @@ fn raw_image_discovers_called_functions_beyond_its_seeds() {
     let spec = PathBuf::from(&sp).join("Ghidra/Processors/Cortus/data/languages/aps3.sla");
     assert!(spec.exists(), "required processor spec missing; build specs before running integration tests");
 
-    // Off: the inventory is exactly the seed, as it was before the option.
-    let (stdout, stderr, ok) = run_kuna(&[
-        "functions", &binary, "--json", "--raw-image", "--target", target, "--base",
-        "0x80000000", "--entry", "0x80000000", "--option", "rawdiscover", "off",
-        "--sleighpath", &sp,
-    ]);
-    assert!(ok, "raw functions with rawdiscover off failed: {stderr}");
-    assert!(stdout.contains("\"count\": 1"), "{stdout}");
-
-    // On (the default): the seed, its direct callee, and the sweep-only callee.
+    // The seed, its direct callee, and the sweep-only callee.
     let (stdout, stderr, ok) = run_kuna(&[
         "functions", &binary, "--json", "--raw-image", "--target", target, "--base",
         "0x80000000", "--entry", "0x80000000", "--sleighpath", &sp,
@@ -2986,9 +2980,10 @@ fn a_reader_of_a_redone_wrapper_round_trips() {
 /// shape of crazyflie's `logf`. Before, `qnanf_` was `unsigned int` returning
 /// `0x7fc00000` and `logish` returned `(float)qnanf_()`, a value conversion of
 /// the NaN's bits that evaluates to 2143289344.0. `qp`, `sn` and `nn` return NaNs
-/// `NAN` cannot spell (a payload, a signalling NaN, a negative payload) and keep
-/// their bits, and `third` returns a `double` in `d0` whose low half is not a
-/// float. `put` and `put2` store `core`'s float through an untyped pointer,
+/// `NAN` cannot spell (a payload, a signalling NaN, a negative payload); the
+/// hard-float contract of the default preset (`armfloatreturn`) returns them as
+/// floats reinterpreted from their exact bits, and `third` returns its `double`
+/// in `d0` whole. `put` and `put2` store `core`'s float through an untyped pointer,
 /// which printed `((unsigned int *)a1)[2] = core(a0)`, a conversion by value.
 /// The printed functions, compiled on the host, must compute what the source
 /// computes.
@@ -3002,15 +2997,16 @@ fn a_nan_returned_in_s0_round_trips() {
         "float qnanf_(void)",
         "return NAN;",
         "v1 = qnanf_();",
-        "unsigned int qp(void)",
-        "return 0x7fc00123;",
-        "return 0x7fa00000;",
-        "return 0xffc00005;",
-        "unsigned int third(void)",
+        "float qp(void)",
+        ".from = 0x7fc00123 }).to;",
+        ".from = 0x7fa00000 }).to;",
+        ".from = 0xffc00005 }).to;",
+        "double third(void)",
+        "return 0.3333333333333333;",
     ] {
         assert!(stdout.contains(want), "missing `{want}`:\n{stdout}");
     }
-    for bad in ["0x7fc00000", "(float)qnanf_", "float third", "float qp", "float sn", "float nn", "(unsigned int *)"] {
+    for bad in ["0x7fc00000", "(float)qnanf_", "float third", "(unsigned int *)"] {
         assert!(!stdout.contains(bad), "`{bad}` printed:\n{stdout}");
     }
     assert!(stdout.contains("*(float *)(a1 + a2 * 4) = core(a0);"), "put stores core's float:\n{stdout}");
@@ -3319,7 +3315,8 @@ fn a_return_stated_in_another_register_is_not_reinterpreted() {
 /// integer, which now reinterprets the float at the call. The printed
 /// functions, compiled with gcc and clang and called with the source's floats,
 /// compute the fixture's bits; `fb_bump`, `fb_store` and `fb_mix` compute with,
-/// store or or an integer into the bits and keep their integer types.
+/// store or or an integer into the bits and keep their integer types, except
+/// that hard-float ARM's `fb_mix` returns the convention's float in `s0`.
 #[test]
 fn a_float_bit_helper_round_trips() {
     let sp = specs();
@@ -3337,11 +3334,15 @@ fn a_float_bit_helper_round_trips() {
             "float fb_copysignf(float a0,float a1)",
             "bool fb_isnanf(float a0)",
             "v1 = fb_fabsf(a0 - a1);",
-            "v3 = fb_copysignf(3.0,a0);",
+            "v3 = fb_copysignf(3.0f,a0);",
             "*a1 = ((union { float from; int to; }){ .from = fb_fabsf(a0) }).to + 1;",
             "int fb_bump(int a0)",
             "void fb_store(unsigned int a0,unsigned int *a1)",
-            "unsigned int fb_mix(unsigned int a0,unsigned int a1)",
+            if tag == "armhf" {
+                "float fb_mix(unsigned int a0,unsigned int a1)"
+            } else {
+                "unsigned int fb_mix(unsigned int a0,unsigned int a1)"
+            },
         ] {
             assert!(stdout.contains(want), "{tag}: missing `{want}`:\n{stdout}");
         }
@@ -3406,16 +3407,26 @@ fn a_float_bit_helper_round_trips() {
 /// without reading its result, and was printed before the withdrawal as
 /// `fbabs(((union { unsigned int from; float to; }){ .from = a0 }).to)`, a
 /// float handed to the final `unsigned int fbabs(unsigned int a0)`, which C
-/// converts by value. Every caller of the helper is now decompiled again.
+/// converts by value. Every caller of the helper is now decompiled again. The
+/// withdrawal is checked with `armfloatreturn` off: the hard-float contract of
+/// the default preset returns `s0` as the convention's float, so `fbabs` keeps
+/// its float on both sides and `abs_bits` reinterprets the result.
 #[test]
 fn a_withdrawn_float_bit_helper_is_called_with_its_final_prototype() {
     let fixture = repo_root().join("decompiler/crates/kuna-analysis/tests/fixtures/floatbitswithdraw_armhf.o").to_str().unwrap().to_string();
     let sp = specs();
-    let (stdout, stderr, ok) = run_kuna(&["decompile-all", &fixture, "--sleighpath", &sp]);
+    let (stdout, stderr, ok) = run_kuna(&["decompile-all", &fixture, "--option", "armfloatreturn", "off", "--sleighpath", &sp]);
     assert!(ok, "kuna decompile-all failed: {stderr}");
     assert!(stdout.contains("unsigned int fbabs(unsigned int a0)"), "fbabs is no longer withdrawn; re-pick the case:\n{stdout}");
     assert!(stdout.contains("  fbabs(a0); // tail-call"), "from_bits does not call fbabs with its integer:\n{stdout}");
     assert!(!stdout.contains("float to; }){ .from = a0 }).to)"), "a float is handed to fbabs's integer parameter:\n{stdout}");
+    let (stdout, stderr, ok) = run_kuna(&["decompile-all", &fixture, "--sleighpath", &sp]);
+    assert!(ok, "kuna decompile-all failed: {stderr}");
+    assert!(stdout.contains("float fbabs(float a0)"), "the preset withdrew fbabs's float:\n{stdout}");
+    assert!(
+        stdout.contains("return ((union { float from; unsigned int to; }){ .from = fbabs("),
+        "abs_bits does not reinterpret fbabs's float:\n{stdout}"
+    );
 }
 
 /// `floatret_put_{cm4,a64}.o` (Cortex-M4F and AArch64, clang -O2): `putf2` moves
@@ -3689,28 +3700,6 @@ fn a_return_merged_in_pieces_stays_void() {
 /// `floatret_parse_gcc_O1.o` and `floatret_parse_armel.o` (soft-float ARM):
 /// `parse`, `parse2` and `parsef` return what `strtod` and `strtof` return, and
 /// `rp` keeps `parse`'s bits as an integer, `rp2` stores `parse2`'s `double`, and
-/// `rpf` keeps `parsef`'s bits. With libc signature seeding disabled, neither
-/// callee has a declaration, so
-/// a return through them printed `unsigned long parse(..) { return strtod(..); }`,
-/// which converts the `double` by value once compiled against `<stdlib.h>`. They
-/// stay `void`, as before a caller asked for their result.
-#[test]
-fn a_return_of_an_undeclared_float_callee_stays_void() {
-    let sp = specs();
-    for name in ["floatret_parse_gcc_O1.o", "floatret_parse_armel.o"] {
-        let bin = repo_root().join("decompiler/crates/kuna-analysis/tests/fixtures").join(name).to_str().unwrap().to_string();
-        let (stdout, stderr, ok) = run_kuna(&["decompile-all", &bin, "--sleighpath", &sp, "--option", "libcsigs", "off"]);
-        assert!(ok, "kuna decompile-all failed on {name}: {stderr}");
-        let printed = printed_functions(&stdout, &["parse ", "parse2 ", "parsef ", "rp ", "rp2 ", "rpf "]);
-        for want in ["void parse(", "void parse2(", "void parsef("] {
-            assert!(printed.contains(want), "{name}: missing `{want}`:\n{printed}");
-        }
-        for bad in ["return strtod(", "return strtof("] {
-            assert!(!printed.contains(bad), "{name}: `{bad}` converts the callee's float by value:\n{printed}");
-        }
-    }
-}
-
 /// Code-proven imports receive their known floating-point contracts on x86-64;
 /// ARM retains its exclusion for incompatible floating-point ABI rows.
 #[test]
@@ -3762,13 +3751,16 @@ fn soft_float_imports_keep_their_core_register_values() {
 /// image printed `double sub_10224(..)` beside `rd`'s `unsigned long long v1 =
 /// sub_10224()`, which converts 2.25 to 2, where the rows' absence returns the
 /// right `CONCAT44(v2,v1)`; the hard image printed `unsigned int sub_101f0(..)`
-/// returning `SUB84(v1,0)`, the low half of `d0`. ARM gets none of the rows.
+/// returning `SUB84(v1,0)`, the low half of `d0`. ARM gets none of the rows
+/// with `armfloatreturn` off. Under the default preset's hard-float contract
+/// the hard image takes `strtod`'s row, and `parse` and `clampd` return their
+/// doubles whole in `d0`.
 #[test]
 fn arm_images_get_no_double_libc_rows() {
     let sp = specs();
     for name in ["floatret_armrows_soft", "floatret_armrows_hard"] {
         let bin = repo_root().join("decompiler/crates/kuna-analysis/tests/fixtures").join(name).to_str().unwrap().to_string();
-        let (stdout, stderr, ok) = run_kuna(&["decompile-all", &bin, "--sleighpath", &sp]);
+        let (stdout, stderr, ok) = run_kuna(&["decompile-all", &bin, "--option", "armfloatreturn", "off", "--sleighpath", &sp]);
         assert!(ok, "kuna decompile-all failed on {name}: {stderr}");
         for bad in ["double", "SUB84("] {
             assert!(!stdout.contains(bad), "{name}: `{bad}` from a libc row ARM does not return whole:\n{stdout}");
@@ -3779,7 +3771,34 @@ fn arm_images_get_no_double_libc_rows() {
                 "{name}: `clampd` no longer returns its r0:r1 bits:\n{stdout}"
             );
         }
+        let (preset, stderr, ok) = run_kuna(&["decompile-all", &bin, "--sleighpath", &sp]);
+        assert!(ok, "kuna decompile-all failed on {name}: {stderr}");
+        if name.ends_with("soft") {
+            assert_eq!(preset, stdout, "{name}: the hard-float contract changed a soft-float image");
+        } else {
+            for want in ["double strtod(char *a0,char **a1)", "double sub_101e0(char *a0)", "double sub_101f0(char *a0)", "v1 = strtod(a0,NULL);"] {
+                assert!(preset.contains(want), "{name}: missing `{want}`:\n{preset}");
+            }
+            assert!(!preset.contains("SUB84("), "{name}: a double return is cut to its low word:\n{preset}");
+        }
     }
+}
+
+/// `kuna decompile armfloat_libm_hard mant` builds one function: the held-back
+/// `frexp` and `sin` rows must be parked before that first `Funcdata` takes its
+/// callee-prototype snapshot, or `mant` reads `frexp()` with no arguments.
+#[test]
+fn arm_library_float_rows_reach_a_single_decompile() {
+    let sp = specs();
+    let bin = repo_root().join("decompiler/crates/kuna-analysis/tests/fixtures/armfloat_libm_hard").to_str().unwrap().to_string();
+    for (func, want) in [("mant", "double mant(double a0,int *a1)"), ("mant", "v1 = frexp(a0,a1);"), ("wave", "v1 = sin(a0);")] {
+        let (stdout, stderr, ok) = run_kuna(&["decompile", &bin, func, "--sleighpath", &sp]);
+        assert!(ok, "kuna decompile {func} failed: {stderr}");
+        assert!(stdout.contains(want), "{func}: missing `{want}`:\n{stdout}");
+    }
+    let (off, stderr, ok) = run_kuna(&["decompile", &bin, "mant", "--option", "armfloatreturn", "off", "--sleighpath", &sp]);
+    assert!(ok, "kuna decompile mant failed: {stderr}");
+    assert!(!off.contains("frexp(a0,a1)"), "armfloatreturn off still parked frexp:\n{off}");
 }
 
 /// `dsum`, `norm` and `use` read their argument as `double *`, `struct P *` and
@@ -4172,6 +4191,46 @@ fn jobs_names_synthesized_structs_as_the_serial_run_does() {
             }
         }
     }
+}
+
+/// The one-worker structsynth path decompiles every function that synthesized
+/// in one ordered chunk and holds its records back until the sweep has run, so
+/// the frame it writes as each function starts is all the parent sees of it. A
+/// function that stalls there is the one blamed, not the chunk's first
+/// function, and the window is the warm one: the run does not wait out a
+/// program load on top of it. `sub_14ea` stalls the second time it starts,
+/// which is in the ordered chunk.
+#[test]
+fn jobs_a_stall_in_the_ordered_structsynth_worker_blames_the_function_that_stalled() {
+    let sp = specs();
+    let bin = repo_root()
+        .join("decompiler/crates/kuna-analysis/tests/fixtures/itaniumrtti_x86_64.so")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let args = ["decompile-all", bin.as_str(), "--json", "--max-fn-seconds", "1", "--sleighpath", sp.as_str(),
+        "--option", "protoorder", "off", "--jobs", "2"];
+    let started = Instant::now();
+    let (got, stderr, ok) = run_kuna_env_with_timeout(
+        &args,
+        &[("KUNA_JOBS_FAULT", "synth:serial,stall-again:0x14ea")],
+        Duration::from_secs(240),
+    )
+    .expect("the stalled ordered chunk wedged the pool");
+    assert!(ok, "{stderr}");
+    assert!(stderr.contains("in one ordered chunk, 1 worker process"), "{stderr}");
+    assert_eq!(stderr.matches("KUNA_JOBS_FAULT: injected stall at 0x14ea").count(), 1, "{stderr}");
+    assert!(started.elapsed() < Duration::from_secs(45), "the stall waited out a cold window:\n{stderr}");
+    let records = json_records(&got);
+    let failed: Vec<String> = records
+        .iter()
+        .filter(|r| r.contains("\"error\": \""))
+        .map(|r| record_name(r))
+        .collect();
+    assert_eq!(failed, ["sub_14ea"], "only the function that stalled is lost:\n{stderr}");
+    let lost = records.iter().find(|r| record_name(r) == "sub_14ea").unwrap();
+    assert!(lost.contains("\"error\": \"worker stalled past the per-function watchdog (1s)"), "{lost}");
+    assert!(recovered_count(&stderr).is_some_and(|n| n >= 1), "{stderr}");
 }
 
 /// A worker that cannot install the replayed structures takes its chunk down
@@ -4615,6 +4674,84 @@ fn jobs_a_transient_worker_death_loses_nothing() {
     assert_eq!(stderr.matches("KUNA_JOBS_FAULT: injected panic").count(), 1, "{stderr}");
     assert_eq!(recovered_count(&stderr), Some(json_records(&serial).len()), "{stderr}");
     assert!(!stderr.contains("have no result"), "nothing was lost:\n{stderr}");
+}
+
+/// A render that panics loses only its own function. The panic used to leave
+/// a default printer in the program, so every later function of the batch (in
+/// the serial run, or in the same worker) silently lost the run's printer
+/// settings, here `indentincrement 4`. The fault fires after the opening
+/// brace, so a printer put back without being cleared would indent the rest
+/// one level too deep. `_init` renders first serially, `main` first in the one
+/// pooled chunk.
+#[test]
+fn a_render_panic_leaves_later_functions_on_the_configured_printer() {
+    let (bin, sp) = (fauxware(), specs());
+    let run: Vec<&str> =
+        ["decompile-all", &bin, "--json", "--max-fn-seconds", "0", "--sleighpath", &sp]
+            .into_iter()
+            .chain(SERIAL_ORDER_OFF)
+            .chain(["--option", "indentincrement", "4"])
+            .collect();
+    let pool = ["--jobs", "2", "--jobs-chunk", "64"];
+    for (extra, name, at) in [(&[][..], "_init", "0x4004e0"), (&pool[..], "main", "0x40071d")] {
+        let args: Vec<&str> = run.iter().chain(extra).copied().collect();
+        let (want, stderr, ok) = run_kuna(&args);
+        assert!(ok, "{stderr}");
+        assert!(want.contains("{\\n    puts("), "indentincrement 4 must show in the bodies:\n{want}");
+        let (got, stderr, ok) = run_kuna_env(&args, &[("KUNA_RENDER_FAULT", at)]);
+        assert!(ok, "one render panic must not fail the run:\n{stderr}");
+        let fault = format!("KUNA_RENDER_FAULT: injected render panic at {at}");
+        assert_eq!(stderr.matches(&fault).count(), 1, "{stderr}");
+        let (want, got) = (json_records(&want), json_records(&got));
+        assert_eq!(got.len(), want.len(), "one record per target");
+        for (w, g) in want.iter().zip(&got) {
+            if record_name(w) == name {
+                assert!(
+                    g.contains("\"error\": \"panic while rendering C / extracting variables\""),
+                    "{name} must carry its render panic:\n{g}"
+                );
+            } else {
+                assert_eq!(g, w, "{} rendered differently after {name}'s render panicked", record_name(w));
+            }
+        }
+    }
+}
+
+/// A panic while recovering a jump table is that function's error, serially
+/// and under `--jobs`, as a panic in the main pipeline is. The recovery used
+/// to swallow it: the panic was printed, and the function still got C with
+/// its table dropped (a jump-as-call) and no error. The tables after it are
+/// not attempted, so the panic prints once, and every other function is
+/// unchanged.
+#[test]
+fn a_jump_table_recovery_panic_is_the_functions_error() {
+    let (bin, sp) = (common::fixture("switchtable_x86_64"), specs());
+    let run: Vec<&str> =
+        ["decompile-all", &bin, "--json", "--max-fn-seconds", "0", "--sleighpath", &sp]
+            .into_iter()
+            .chain(SERIAL_ORDER_OFF)
+            .collect();
+    let (want, stderr, ok) = run_kuna(&run);
+    assert!(ok, "{stderr}");
+    let want = json_records(&want);
+    for jobs in ["1", "2"] {
+        let args: Vec<&str> = run.iter().copied().chain(["--jobs", jobs]).collect();
+        let (got, stderr, ok) = run_kuna_env(&args, &[("KUNA_JUMPTABLE_FAULT", "0x100000")]);
+        assert!(ok, "one function's panic must not fail the run:\n{stderr}");
+        let fault = "KUNA_JUMPTABLE_FAULT: injected jump-table recovery panic at 0x100000";
+        assert_eq!(stderr.matches(fault).count(), 1, "--jobs {jobs}:\n{stderr}");
+        let got = json_records(&got);
+        assert_eq!(got.len(), want.len(), "one record per target");
+        for (w, g) in want.iter().zip(&got) {
+            if record_name(w) == "dispatch" {
+                let error = "\"error\": \"decompile pipeline reached an un-ported seam (LOSS-131) \
+                             in jump-table recovery at 0x100007: KUNA_JUMPTABLE_FAULT";
+                assert!(g.contains("\"code\": null") && g.contains(error), "--jobs {jobs}:\n{g}");
+            } else {
+                assert_eq!(g, w, "--jobs {jobs}: {} changed", record_name(w));
+            }
+        }
+    }
 }
 
 /// The stall watchdog's kill is the other way a worker dies.  Its bystanders
@@ -7505,23 +7642,20 @@ int main(void) {
     assert_eq!(got.lines().last(), Some("0"), "the printed functions read different bytes:\n{got}\n{printed}");
 }
 
-/// A call's own return-address push is part of the call under `callpush`.
+/// A call's own return-address push is part of the call.
 /// Every function between the `tested` markers of `callpush_x86_64.c` calls
 /// `alloca`, so its stack pointer is the entry value minus a run-time size and
 /// each later call stored its return address through that pointer as a
 /// statement, `*(unsigned long *)&v9[v5 + -8] = 0x14e7;`.  For the gcc -O0,
-/// gcc -O2, clang -O0 and clang -O2 builds, with the option on and off: off
-/// prints a store of every listed return address (each is the address after a
-/// `call` in the tested functions, from `objdump -d`), on prints none of them,
-/// both arms make the same calls, `stacked` keeps the same number of other
-/// stores (the stack-passed arguments of `spread` and the stack probes), and the
-/// push of `call 1f` in `pc_here`, whose destination is the stored address and
-/// which the function reads back, prints the same in both.  The printed alloca
-/// frames are not compilable C in either arm (the alloca itself prints as
-/// stack-pointer arithmetic, and `spread`'s stack arguments do not reach the
-/// call), so the round trip here is the statement set, not a run: the removed
-/// store writes the slot below the stack pointer that only the callee's `ret`
-/// reads.
+/// gcc -O2, clang -O0 and clang -O2 builds, none of the listed return addresses
+/// (each is the address after a `call` in the tested functions, from
+/// `objdump -d`) prints as a store, while the push of `call 1f` in `pc_here`,
+/// whose destination is the stored address and which the function reads back,
+/// still does.  The printed alloca frames are not compilable C (the alloca
+/// itself prints as stack-pointer arithmetic, and `spread`'s stack arguments do
+/// not reach the call), so the check is the statement set, not a run: the
+/// removed store writes the slot below the stack pointer that only the callee's
+/// `ret` reads.
 #[test]
 fn a_calls_own_return_address_push_is_part_of_the_call() {
     let fx = repo_root().join("decompiler/crates/kuna-analysis/tests/fixtures");
@@ -7562,56 +7696,28 @@ fn a_calls_own_return_address_push_is_part_of_the_call() {
         ),
     ];
     let sp = specs();
-    let calls = |body: &str| -> Vec<String> {
-        let mut v: Vec<String> = ["weigh(", "spread(", "memcpy(", "memset(", "strlen("]
-            .iter()
-            .flat_map(|c| std::iter::repeat(c.to_string()).take(body.matches(c).count()))
-            .collect();
-        v.sort();
-        v
-    };
-    let stores = |body: &str, pushes: &[&str]| -> usize {
-        body.lines()
-            .map(str::trim)
-            .filter(|l| (l.starts_with("*(") || l.starts_with("((")) && l.contains(" = "))
-            .filter(|l| !pushes.iter().any(|p| l.ends_with(&format!("= {p};"))))
-            .count()
-    };
     for (build, pushes, call_next) in builds {
         let bin = fx.join(format!("callpush_{build}_x86_64"));
-        let mut arms: Vec<String> = Vec::new();
-        for arm in ["off", "on"] {
-            let args = ["decompile-all", bin.to_str().unwrap(), "--sleighpath", sp.as_str(), "--option", "callpush", arm];
-            let (stdout, stderr, ok) = run_kuna(&args);
-            assert!(ok, "kuna decompile-all failed: {stderr}");
-            let mut body = String::new();
-            for part in stdout.split("// Function: ").skip(1) {
-                if tested.contains(&part.split(' ').next().unwrap_or("")) {
-                    body.push_str(part);
-                }
+        let args = ["decompile-all", bin.to_str().unwrap(), "--sleighpath", sp.as_str()];
+        let (stdout, stderr, ok) = run_kuna(&args);
+        assert!(ok, "kuna decompile-all failed: {stderr}");
+        let mut body = String::new();
+        for part in stdout.split("// Function: ").skip(1) {
+            if tested.contains(&part.split(' ').next().unwrap_or("")) {
+                body.push_str(part);
             }
-            for name in &tested {
-                assert!(body.starts_with(name) || body.contains(&format!("\n{name} ")), "{build} {arm}: no `{name}`\n{stdout}");
-            }
-            arms.push(body);
         }
-        let (off, on) = (&arms[0], &arms[1]);
+        for name in &tested {
+            assert!(body.starts_with(name) || body.contains(&format!("\n{name} ")), "{build}: no `{name}`\n{stdout}");
+        }
         for p in pushes {
             let stored = format!("= {p};");
-            assert!(off.contains(&stored), "{build} off: the push of return address {p} is not printed\n{off}");
-            assert!(!on.contains(&stored), "{build} on: the push of return address {p} is still printed\n{on}");
+            assert!(!body.contains(&stored), "{build}: the push of return address {p} is still printed\n{body}");
         }
         if let Some(p) = call_next {
             let stored = format!("= {p};");
-            assert!(off.contains(&stored) && on.contains(&stored), "{build}: the push `call 1f` reads back is lost\n{on}");
+            assert!(body.contains(&stored), "{build}: the push `call 1f` reads back is lost\n{body}");
         }
-        assert_eq!(calls(off), calls(on), "{build}: a call was lost or gained\n{off}\n{on}");
-        let stacked = |b: &str| b.split("stacked").nth(1).unwrap().split("// Function: ").next().unwrap().to_string();
-        assert_eq!(
-            stores(&stacked(off), pushes),
-            stores(&stacked(on), pushes),
-            "{build}: a store other than a push changed in `stacked`\n{off}\n{on}"
-        );
     }
 }
 
@@ -8090,7 +8196,15 @@ fn check_elemptr_round_trip(run_native: bool) {
                 let listed = header.lines().find_map(|l| {
                     let why = l.split_once(&format!("/* {n} is "))?.1;
                     let decls = why.split_once("so it is not declared: ")?.1.trim_end_matches(" */");
-                    decls.split(", ").find(|d| d.contains('*') || d.ends_with("[]")).map(str::to_string)
+                    let views: Vec<_> = decls.split(", ").collect();
+                    let byte_address = !bodies.contains(&format!("{n}["))
+                        && views.iter().any(|d| *d == format!("long {n}") || *d == format!("unsigned long {n}"));
+                    if byte_address {
+                        assert!(!header.lines().any(|line| line.starts_with("extern ") && line.contains(n)));
+                        Some(format!("long {n}"))
+                    } else {
+                        views.into_iter().find(|d| d.contains('*') || d.ends_with("[]")).map(str::to_string)
+                    }
                 });
                 // A name the header leaves out is main's integer global; one the
                 // bodies subscript is a pointer.
@@ -9666,6 +9780,171 @@ fn bejoin_evidence_reads_a_callee_pair_alike_in_every_run() {
     }
 }
 
+/// A 64-bit sum, and ARMv7's single-instruction product, compile to the bytes
+/// of the `int` that returns their high word, so the callee alone proves
+/// neither; the default, `bejoin callers`, also takes a caller that reads the
+/// second register after the call. In `bejoin_callers.c`, `c_add` and `c_mul`
+/// store both words of `add64` and `umul64`, and `c_pass` both words of
+/// `pass`, which returns `add64`'s value through a frame of its own, while
+/// `c_hi` and `c_mulhi` read only the first register of `add_hi` and
+/// `umul_hi`, and gcc keeps `c_keep`'s `b` in `r1` across `bl keep`, which
+/// never writes it. The verdict comes from the image's own call sites and
+/// symbols, so every function prints the same in a whole `decompile-all`, one
+/// narrowed by `--functions`, `--jobs 2` and a single `kuna decompile` (with
+/// `protoorder` off: its callee-first prototypes reach only the whole serial
+/// run, on main too), and every caller reads its callee's pair in one order in
+/// the default runs. `add64`, `umul64` and `pass` are compiled beside the
+/// source with gcc and clang and must compute it, and the `int`s print as
+/// with `bejoin evidence`.
+#[test]
+fn bejoin_callers_read_a_pair_alike_in_every_run() {
+    const FUNCS: [&str; 12] =
+        ["add64", "add_hi", "umul64", "umul_hi", "keep", "pass", "c_add", "c_hi", "c_mul", "c_mulhi", "c_keep", "c_pass"];
+    let sp = specs();
+    let fixtures = repo_root().join("decompiler/crates/kuna-analysis/tests/fixtures");
+    for (fixture, pair) in [("bejoin_callers_ppc32_O2", "// r3:r4"), ("bejoin_callers_arm32_be_O2.o", "// r0:r1")] {
+        let bin = fixtures.join(fixture).to_str().unwrap().to_string();
+        let run = |extra: &[&str]| {
+            let mut args = vec!["decompile-all", bin.as_str(), "--sleighpath", sp.as_str()];
+            args.extend_from_slice(extra);
+            let (out, stderr, ok) = run_kuna(&args);
+            assert!(ok, "kuna decompile-all {fixture} {extra:?} failed: {stderr}");
+            out
+        };
+        let single = |f: &str, extra: &[&str]| {
+            let mut args = vec!["decompile", bin.as_str(), f, "--sleighpath", sp.as_str()];
+            args.extend_from_slice(extra);
+            let (out, stderr, ok) = run_kuna(&args);
+            assert!(ok, "kuna decompile {fixture} {f} failed: {stderr}");
+            out.trim().to_string()
+        };
+        let body = |listing: &str, f: &str| {
+            let text = callrettype_functions(listing, &[f]);
+            text.split_once('\n').map(|(_, b)| b.trim().to_string()).unwrap_or_default()
+        };
+        let off = ["--option", "protoorder", "off"];
+        let whole = run(&off);
+        let jobs = run(&["--option", "protoorder", "off", "--jobs", "2"]);
+        for f in FUNCS {
+            let text = body(&whole, f);
+            assert!(!text.is_empty(), "{fixture}: {f} prints:\n{whole}");
+            let narrowed = run(&["--option", "protoorder", "off", "--functions", f]);
+            for (mode, other) in [("--jobs 2", body(&jobs, f)), ("--functions", body(&narrowed, f)), ("decompile", single(f, &off))] {
+                assert_eq!(other, text, "{fixture}: {f} prints differently under {mode}");
+            }
+        }
+        let full = run(&[]);
+        for f in ["c_add", "c_mul", "c_pass"] {
+            for (mode, text) in [("decompile-all", body(&full, f)), ("decompile", single(f, &[]))] {
+                assert!(text.contains(pair), "{fixture} ({mode}): {f} reads its callee's pair {pair}:\n{text}");
+            }
+        }
+        let evidence = run(&["--option", "bejoin", "evidence"]);
+        for f in ["add_hi", "umul_hi", "keep", "c_hi", "c_mulhi", "c_keep"] {
+            assert_eq!(body(&full, f), body(&evidence, f), "{fixture}: {f} reads one register:\n{full}");
+        }
+        let add = body(&full, "add64");
+        assert!(add.contains("return CONCAT44(a0 + a2 + (unsigned int)CARRY4(a1,a3),a1 + a3);"), "{fixture}: add64 returns its sum high word first:\n{add}");
+        assert_ne!(add, body(&evidence, "add64"), "{fixture}: bejoin evidence leaves add64's halves swapped");
+        let wide: &[&str] = if fixture.ends_with(".o") { &["add64", "umul64", "pass"] } else { &["add64", "pass"] };
+        let printed = callrettype_functions(&full, wide);
+        let sigs: String = printed
+            .split("// Function: ")
+            .skip(1)
+            .filter_map(|part| part.lines().find(|l| l.contains('(')))
+            .map(|sig| format!("{sig};\n"))
+            .collect();
+        let product = if wide.contains(&"umul64") { "bad += (u64)umul64((unsigned)a, (unsigned)b) != (u64)(unsigned)a * (unsigned)b;\n" } else { "" };
+        let src_text = format!(
+            "#include <stdio.h>\n\
+             typedef unsigned long long u64;\n\
+             #define CONCAT44(h, l) ((unsigned long long)(unsigned int)(h) << 32 | (unsigned int)(l))\n\
+             #define CARRY4(a, b) ((unsigned int)(a) + (unsigned int)(b) < (unsigned int)(a))\n\
+             {sigs}{printed}\n\
+             int main(void) {{\n  static const u64 xs[6] = {{0, 1, 0xffffffffULL, 0x100000000ULL, 0x123456789abcdef0ULL, ~0ULL}};\n  \
+             int bad = 0;\n  for (int i = 0; i < 6; i++)\n    for (int j = 0; j < 6; j++) {{\n      u64 a = xs[i], b = xs[j];\n      \
+             bad += (u64)add64((int)(a >> 32), (unsigned)a, (int)(b >> 32), (unsigned)b) != a + b;\n      \
+             bad += (u64)pass((int)(a >> 32), (unsigned)a, (int)(b >> 32), (unsigned)b) != a + b;\n      {product}    }}\n  \
+             printf(\"%d\\n\", bad);\n  return 0;\n}}\n"
+        );
+        bejoin_round_trip(&format!("callers-{fixture}"), &src_text, &printed);
+    }
+}
+
+/// A call kuna does not know never returns is followed by code of another
+/// path, which reads the second return register for a value of its own, so
+/// it is no caller reading the callee's pair. In `bejoin_unreach.c`, built
+/// for PowerPC, `hi` and `hj` return the high word of a 64-bit sum, and each
+/// is called once ahead of `__builtin_unreachable()`: gcc lays out the block
+/// a `bne` reaches right after `u_unr`'s `bl hi` (`add 3,7,4`), and the jump
+/// table's next case right after `u_sw`'s `bl hj` (`mulli 3,4,3`). In
+/// `bejoin_unreach_arm.c`, built for ARM big-endian, the literal pool follows
+/// `u_pool`'s `bl hi`, and its first word decodes as `andeq r0,r2,r0,lsl r1`.
+/// In `bejoin_unreach_ppc.c`, linked with the local symbols discarded, the
+/// static `s_next` follows `u_tail`'s `bl hi` and reads its second argument,
+/// and built with gcc's hot/cold partition, `u_cold.cold` lays the rare block
+/// its hot part enters right after the `bl hi` (`mr 3,4`). In
+/// `bejoin_unreach_thumb.c`, built for big-endian Thumb, the literal pool after
+/// `u_pool`'s `bl hi` holds `0x00080123`, which decodes as `movs r0,r1`. In
+/// `bejoin_unreach_eh.cc`, built for PowerPC and ARM big-endian (linked, and
+/// as an ARM object), the `catch` landing pad follows `u_eh`'s call of `hi`
+/// and compares the selector the unwinder leaves in the second register. In
+/// `bejoin_unreach_hidden.c`, linked with the local symbols discarded, a
+/// static function that only a pointer or a tail call reaches follows each
+/// `bl`, and on PowerPC so does the rare block of a `.cold` part whose symbol
+/// went with them; the sizes the symbols state keep the walk out of both.
+/// `c_hi` reads only the first register of each, so every function prints as
+/// with `bejoin evidence`, in a whole `decompile-all` and a single
+/// `kuna decompile`.
+#[test]
+fn bejoin_callers_ignore_code_a_call_does_not_return_to() {
+    const HIDDEN: &[&str] = &["hi_p", "hi_t", "hi_c", "u_ptr", "u_tl", "u_cold", "c_hi"];
+    let sp = specs();
+    let fixtures = repo_root().join("decompiler/crates/kuna-analysis/tests/fixtures");
+    let cases: [(&str, &[&str], &str); 10] = [
+        ("bejoin_unreach_ppc32_O1", &["hi", "hj", "u_unr", "u_sw", "c_hi"], "return CONCAT44(a1 + a3,"),
+        ("bejoin_unreach_arm32_be_O2", &["hi", "u_pool", "c_hi"], "return hi(a0,a1,a2,a3) + 1;"),
+        ("bejoin_unreach_strip_ppc32_O2", &["hi", "u_tail", "u_cold", "c_hi"], "return CONCAT44(a1 + a3,"),
+        ("bejoin_unreach_cold_ppc32_O2", &["hi", "u_tail", "u_cold", "c_hi"], "return CONCAT44(a1 + a3,"),
+        ("bejoin_unreach_thumb_be_O2", &["hi", "u_pool", "c_hi"], "return hi(a0,a1,a2,a3) + 1;"),
+        ("bejoin_unreach_eh_ppc32_O2", &["hi", "u_eh", "c_hi"], "return hi(a0,a1,a2,a3) + 1;"),
+        ("bejoin_unreach_eh_arm32_be_O2", &["hi", "u_eh", "c_hi"], "return hi(a0,a1,a2,a3) + 1;"),
+        ("bejoin_unreach_eh_arm32_be_O2_obj", &["hi", "u_eh", "c_hi"], "return hi(a0,a1,a2,a3) + 1;"),
+        ("bejoin_unreach_hidden_ppc32_O2", HIDDEN, "return v1 + v2 + 1 + hi_c(a0,a1,a2,a3);"),
+        ("bejoin_unreach_hidden_arm32_be_O2", HIDDEN, "return v1 + v2 + 1 + hi_c(a0,a1,a2,a3);"),
+    ];
+    for (fixture, funcs, expect) in cases {
+        let bin = fixtures.join(fixture).to_str().unwrap().to_string();
+        let run = |extra: &[&str]| {
+            let mut args = vec!["decompile-all", bin.as_str(), "--sleighpath", sp.as_str()];
+            args.extend_from_slice(extra);
+            let (out, stderr, ok) = run_kuna(&args);
+            assert!(ok, "kuna decompile-all {fixture} {extra:?} failed: {stderr}");
+            out
+        };
+        let body = |listing: &str, f: &str| {
+            let text = callrettype_functions(listing, &[f]);
+            text.split_once('\n').map(|(_, b)| b.trim().to_string()).unwrap_or_default()
+        };
+        let single = |f: &str, extra: &[&str]| {
+            let mut args = vec!["decompile", bin.as_str(), f, "--sleighpath", sp.as_str()];
+            args.extend_from_slice(extra);
+            let (out, stderr, ok) = run_kuna(&args);
+            assert!(ok, "kuna decompile {fixture} {f} failed: {stderr}");
+            out.trim().to_string()
+        };
+        let evidence = ["--option", "bejoin", "evidence"];
+        let (full, narrow) = (run(&[]), run(&evidence));
+        for f in funcs {
+            let text = body(&full, f);
+            assert!(!text.is_empty(), "{fixture}: {f} prints:\n{full}");
+            assert_eq!(text, body(&narrow, f), "{fixture}: {f} prints as with bejoin evidence:\n{full}");
+            assert_eq!(single(f, &[]), single(f, &evidence), "{fixture}: {f} prints as with bejoin evidence in a single decompile");
+        }
+        assert!(full.contains(expect), "{fixture}: expected `{expect}`:\n{full}");
+    }
+}
+
 /// gcc -Os on MIPS computes `chk`'s exit argument from `b + 1`, made in the
 /// delay slot of the branch to the RETURN (`beqz a0; addiu v1,a1,1`), so
 /// `return 0` finds `b + 1` in `$3` beside the zero in `$2`, the shape of a
@@ -9721,6 +10000,51 @@ fn a_value_only_a_no_return_path_reads_proves_nothing() {
          printf(\"%d\\n\", bad);\n  return 0;\n}}\n"
     );
     bejoin_round_trip("bejoin_noreturn_mips32_Os", &src_text, &printed);
+}
+
+/// gcc -O0 on ARM big-endian reloads a `long long` stack temporary into
+/// `r0:r1` and moves the `int` taken from its high word back into `r0` out of
+/// the stack slot it kept it in, so the pair holds both loaded words, the
+/// shape of `return *p`. A register moved back to the value it already held,
+/// through a stack slot or not, proves nothing while the other register is
+/// left where the reload put it, and neither does a low word whose reload
+/// something else reads (`hi_lo_stored` stores it on), so the three `int`s
+/// and their caller print as with `bejoin off`, while `ll_copy`, the `long
+/// long` itself, still joins high word first. `hi_kept` does the same to
+/// `ll_copy`'s pair and is not proven either; `ll_kept` and `ll_passed` move
+/// both of its words back into place and return it whole. `hi_atomic` moves
+/// `__atomic_load_8`'s pair back whole, as `ll_atomic` does, and then its
+/// `int` back into `r0` once more, so it is not proven either.
+#[test]
+fn an_int_kept_in_a_stack_slot_proves_no_loaded_pair() {
+    let sp = specs();
+    let bin = repo_root()
+        .join("decompiler/crates/kuna-analysis/tests/fixtures/bejoin_reload_arm32_be_O0.o")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let run = |mode: &str| {
+        let (stdout, stderr, ok) = run_kuna(&["decompile-all", &bin, "--sleighpath", &sp, "--option", "bejoin", mode]);
+        assert!(ok, "kuna decompile-all bejoin_reload_arm32_be_O0.o ({mode}) failed: {stderr}");
+        stdout
+    };
+    let (evidence, off) = (run("evidence"), run("off"));
+    let ints = ["hi_local", "hi_lo_stored", "hi_named", "hi_use"];
+    let structs = regex::Regex::new(r"struct_\d+").unwrap();
+    let norm = |listing: &str| structs.replace_all(&callrettype_functions(listing, &ints), "struct_N").into_owned();
+    assert_eq!(norm(&evidence), norm(&off), "an int moved back out of its stack slot proves nothing:\n{evidence}");
+    let ll = callrettype_functions(&evidence, &["ll_copy"]);
+    assert!(ll.contains("return *a0;"), "ll_copy returns its long long whole:\n{ll}");
+    for f in ["ll_kept", "ll_passed"] {
+        let w = callrettype_functions(&evidence, &[f]);
+        assert!(w.contains("return ll_copy(a0);"), "{f} hands ll_copy's pair back whole:\n{w}");
+    }
+    let hk = callrettype_functions(&evidence, &["hi_kept"]);
+    assert!(!hk.is_empty() && !hk.contains("return ll_copy(a0);"), "hi_kept moves only its int back:\n{hk}");
+    let la = callrettype_functions(&evidence, &["ll_atomic"]);
+    assert!(la.contains("return __atomic_load_8(a0,0);"), "ll_atomic hands __atomic_load_8's pair back whole:\n{la}");
+    let ha = callrettype_functions(&evidence, &["hi_atomic"]);
+    assert!(!ha.is_empty() && !ha.contains("return __atomic_load_8(a0,0);"), "hi_atomic moves its int back once more:\n{ha}");
 }
 
 /// An `int` worked out from the high half of a 64-bit temporary leaves the low
@@ -9845,9 +10169,6 @@ fn an_aarch64_double_return_leaves_out_the_zero_fill() {
     let sp = specs();
     let fixture = repo_root().join("decompiler/crates/kuna-analysis/tests/fixtures/zerofillreturn_a64.o");
     let fixture = fixture.to_str().unwrap();
-    let (off, stderr, ok) = run_kuna(&["decompile-all", fixture, "--sleighpath", &sp, "--option", "zerofillreturn", "off"]);
-    assert!(ok, "kuna decompile-all failed: {stderr}");
-    assert!(off.contains("undefined16 scale("), "the fill no longer joins the return with the option off:\n{off}");
     let (stdout, stderr, ok) = run_kuna(&["decompile-all", fixture, "--sleighpath", &sp]);
     assert!(ok, "kuna decompile-all failed: {stderr}");
     for want in ["double scale(int a0,double *a1)", "double recip(int a0)", "double tail(int a0,double *a1)", "return 0.0;"] {
@@ -9880,20 +10201,16 @@ fn an_aarch64_double_return_leaves_out_the_zero_fill() {
 /// `cboth` path, which the float-return check counted as a conversion: `pick`
 /// was decompiled again without its return and printed `void`, beside
 /// `(double)pick(a0)` in `user`. A value left in a floating register is not an
-/// integer converted to a float, with the zero-fill option off or on.
+/// integer converted to a float.
 #[test]
 fn a_tail_call_wrapper_keeps_the_float_its_readers_read() {
     let sp = specs();
     let fixture = repo_root().join("decompiler/crates/kuna-analysis/tests/fixtures/voidret_complexpick_a64.o");
     let fixture = fixture.to_str().unwrap();
-    for extra in [&[][..], &["--option", "zerofillreturn", "off"][..]] {
-        let mut args = vec!["decompile-all", fixture, "--sleighpath", sp.as_str()];
-        args.extend_from_slice(extra);
-        let (stdout, stderr, ok) = run_kuna(&args);
-        assert!(ok, "kuna decompile-all failed: {stderr}");
-        for want in ["double pick(double a0)", "return cpart(a0); // tail-call", "v1 = pick(a0);"] {
-            assert!(stdout.contains(want), "{extra:?}: missing `{want}`:\n{stdout}");
-        }
+    let (stdout, stderr, ok) = run_kuna(&["decompile-all", fixture, "--sleighpath", sp.as_str()]);
+    assert!(ok, "kuna decompile-all failed: {stderr}");
+    for want in ["double pick(double a0)", "return cpart(a0); // tail-call", "v1 = pick(a0);"] {
+        assert!(stdout.contains(want), "missing `{want}`:\n{stdout}");
     }
 }
 

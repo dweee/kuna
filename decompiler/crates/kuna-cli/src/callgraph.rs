@@ -1,5 +1,6 @@
 //! Call-graph queries over the shared reference index and canonical inventory.
 
+mod arm_closure;
 mod plan;
 pub(crate) use plan::callee_first_plan;
 
@@ -17,6 +18,39 @@ pub(crate) struct CallGraph {
     index: XrefIndex,
     /// Canonical `(entry, extent)` pairs, ascending by entry.
     entries: Vec<(u64, u64)>,
+    /// (kuna `pltlocal`) `(stub, definition)` pairs a call through the stub is
+    /// built at; empty with the option off.
+    plt_local: Vec<(u64, u64)>,
+}
+
+/// (kuna `callbacktype`) [`CallGraph::callback_refs`]: what the graph said
+/// about each entry it was asked for. An entry it was not asked for has no
+/// references.
+pub(crate) struct CallbackRefs {
+    by_entry: BTreeMap<u64, EntryRefs>,
+}
+
+struct EntryRefs {
+    taken: Vec<(u64, Option<u64>)>,
+    called: bool,
+    callers: Option<Vec<u64>>,
+}
+
+impl CallbackRefs {
+    /// [`CallGraph::address_taken_refs`] for `entry`.
+    pub(crate) fn address_taken_refs(&self, entry: u64) -> Vec<(u64, Option<u64>)> {
+        self.by_entry.get(&entry).map_or_else(Vec::new, |r| r.taken.clone())
+    }
+
+    /// [`CallGraph::called_directly`] for `entry`.
+    pub(crate) fn called_directly(&self, entry: u64) -> bool {
+        self.by_entry.get(&entry).is_some_and(|r| r.called)
+    }
+
+    /// [`CallGraph::direct_callers`] for `entry`.
+    pub(crate) fn direct_callers(&self, entry: u64) -> Option<Vec<u64>> {
+        self.by_entry.get(&entry).map_or(Some(Vec::new()), |r| r.callers.clone())
+    }
 }
 
 impl CallGraph {
@@ -74,7 +108,14 @@ impl CallGraph {
             }
         }
         entries.sort_unstable();
-        CallGraph { index, entries }
+        let plt_local = prog.arch().plt_local.to_vec();
+        CallGraph { index, entries, plt_local }
+    }
+
+    /// (kuna `pltlocal`) The function a call to `entry` is built at: the
+    /// definition a bound PLT stub forwards to, else `entry` itself.
+    pub(crate) fn call_target(&self, entry: u64) -> u64 {
+        kuna_decomp::kuna_pltlocal::target_of(&self.plt_local, entry).unwrap_or(entry)
     }
 
     /// (kuna `callbacktype`) The entries of the functions that CALL or tail-jump
@@ -112,6 +153,25 @@ impl CallGraph {
             .collect()
     }
 
+    /// (kuna `callbacktype`) The answers [`Self::address_taken_refs`],
+    /// [`Self::called_directly`] and [`Self::direct_callers`] give for each of
+    /// `entries`, kept so a run can let the reference index go long before it
+    /// asks them.
+    pub(crate) fn callback_refs(&self, entries: impl IntoIterator<Item = u64>) -> CallbackRefs {
+        let by_entry = entries
+            .into_iter()
+            .map(|entry| {
+                let refs = EntryRefs {
+                    taken: self.address_taken_refs(entry),
+                    called: self.called_directly(entry),
+                    callers: self.direct_callers(entry),
+                };
+                (entry, refs)
+            })
+            .collect();
+        CallbackRefs { by_entry }
+    }
+
     /// (kuna `calleevote`) Every direct call and tail jump to the function
     /// entered at `entry` from another function, by instruction address, or
     /// `None` when its callers cannot all be listed: it is in `open`
@@ -136,7 +196,9 @@ impl CallGraph {
     }
 
     /// Every inventory entry reachable from `spec` through call, tail-jump, and
-    /// address-taken-function-pointer edges, `spec`'s own function included.
+    /// address-taken-function-pointer edges, `spec`'s own function included; a
+    /// reached PLT stub bound to the image's own definition reaches it too
+    /// ([`Self::call_target`]).
     ///
     /// Function pointers count: a callback registered with `CreateThread` or an
     /// atexit handler is code the named function reaches, and dropping it would
@@ -160,8 +222,10 @@ impl CallGraph {
         while let Some(node) = queue.pop_front() {
             for r in self.index.refs_from_function(node) {
                 if let Some(callee) = self.callee_of(r) {
-                    if reached.insert(callee) {
-                        queue.push_back(callee);
+                    for callee in [callee, self.call_target(callee)] {
+                        if reached.insert(callee) {
+                            queue.push_back(callee);
+                        }
                     }
                 }
             }
@@ -303,6 +367,48 @@ impl CallGraph {
             .unwrap_or_else(|| seeds.iter().copied().collect())
     }
 
+    /// (kuna `narrowargs callers`) Every call and tail jump to each function
+    /// of a 32-bit ARM image whose callers the image lets us list, by entry:
+    /// nothing in its bytes builds or holds the address ([`arm_closure::scan`])
+    /// and the walk materializes it nowhere, every reference comes from a known
+    /// function (the function itself included), and every instruction that
+    /// decodes as a branch to it is one of those references. Nothing is closed
+    /// in an image whose dynamic relocations cannot be read (Android packed
+    /// relocations). `None` for any other image.
+    pub(crate) fn arm_closed_sites(&self, binary: &str, pref: SlicePref) -> Option<BTreeMap<u64, Vec<u64>>> {
+        let bytes = image_bytes(binary, pref).ok()?;
+        let file = kuna_analysis::loadimage_object::parse_object(&bytes).ok()?;
+        if file.architecture() != object::Architecture::Arm
+            || file.is_64()
+            || file.kind() == object::ObjectKind::Relocatable
+        {
+            return None;
+        }
+        if !arm_closure::relocations_readable(&file) {
+            return Some(BTreeMap::new());
+        }
+        let seeds: Vec<u64> = self.entries.iter().map(|(entry, _)| *entry).collect();
+        let image = arm_closure::scan(&file, &seeds);
+        let mut out = BTreeMap::new();
+        'entry: for &entry in &seeds {
+            if image.open.contains(&entry) {
+                continue;
+            }
+            let mut sites = Vec::new();
+            for r in self.index.refs_to(entry) {
+                if !matches!(r.kind, XrefKind::Call | XrefKind::Jump) || self.owner_of(r.from).is_none() {
+                    continue 'entry;
+                }
+                sites.push(r.from);
+            }
+            let unseen = image.branches.get(&entry).is_some_and(|from| from.iter().any(|f| !sites.contains(f)));
+            if !sites.is_empty() && !unseen {
+                out.insert(entry, sites);
+            }
+        }
+        Some(out)
+    }
+
     /// Does anything CALL `vma`?  Data and branch references do not count: the
     /// question a triaging agent asks is which functions no call site reaches.
     pub(crate) fn has_caller(&self, vma: u64) -> bool {
@@ -391,7 +497,7 @@ fn open_function_entries(file: &object::File, bytes: &[u8], entries: &[u64]) -> 
 /// (kuna `calleevote`) Does the image put this section's bytes in memory? On
 /// ELF that is the `SHF_ALLOC` flag, whatever the address (firmware loads code
 /// at 0); other formats map every section they carry bytes for.
-fn image_loads(section: &object::Section) -> bool {
+pub(super) fn image_loads(section: &object::Section) -> bool {
     if section.kind() == object::SectionKind::UninitializedData {
         return false;
     }
@@ -512,6 +618,7 @@ mod tests {
                 ("listing", "on"),
                 ("funcstart_patterns", "on"),
                 ("aif", "off"),
+                ("tailcallentry", "off"),
             ] {
                 prog.arch_mut().set_kuna_option(name, value).unwrap();
             }
@@ -571,6 +678,7 @@ mod tests {
                 ("funcstart_patterns", "on"),
                 ("armframes", "on"),
                 ("aif", "off"),
+                ("tailcallentry", "off"),
             ] {
                 prog.arch_mut().set_kuna_option(name, value).unwrap();
             }

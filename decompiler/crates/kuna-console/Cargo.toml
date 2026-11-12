@@ -21,6 +21,7 @@ kuna-analysis.workspace = true
 # `object::File` to drive `Listing::build`.  Already in the workspace graph via
 # kuna-analysis, so this adds no new crate.
 object.workspace = true
+unicode-ident = "1"
 
 [dev-dependencies]
 object = { workspace = true, features = ["write"] }
@@ -48,12 +49,20 @@ name = "integration"
 path = "tests/integration.rs"
 
 [[test]]
+name = "verify_budget_stop"
+path = "tests/verify_budget_stop.rs"
+
+[[test]]
 name = "verify_dwarfstructs"
 path = "tests/verify_dwarfstructs.rs"
 
 [[test]]
 name = "verify_dwarfvariants"
 path = "tests/verify_dwarfvariants.rs"
+
+[[test]]
+name = "verify_variantnames"
+path = "tests/verify_variantnames.rs"
 
 [[test]]
 name = "verify_fid"
@@ -80,10 +89,6 @@ name = "verify_pdb"
 path = "tests/verify_pdb.rs"
 
 [[test]]
-name = "verify_relocrebase_gate"
-path = "tests/verify_relocrebase_gate.rs"
-
-[[test]]
 name = "verify_rexthunk"
 path = "tests/verify_rexthunk.rs"
 
@@ -102,3 +107,19 @@ path = "tests/verify_symbolnamerepair.rs"
 [[test]]
 name = "verify_typedepth"
 path = "tests/verify_typedepth.rs"
+
+[[test]]
+name = "verify_goabi"
+path = "tests/verify_goabi.rs"
+
+[[test]]
+name = "verify_goreg"
+path = "tests/verify_goreg.rs"
+
+[[test]]
+name = "verify_swiftdemangle"
+path = "tests/verify_swiftdemangle.rs"
+
+[[test]]
+name = "verify_gotypes"
+path = "tests/verify_gotypes.rs"

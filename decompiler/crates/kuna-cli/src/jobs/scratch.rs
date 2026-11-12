@@ -21,7 +21,12 @@ impl ScratchDir {
     /// sweep can ever reclaim the directory.
     fn create_in(temp: &Path) -> Result<Self, String> {
         sweep_stale_scratch(temp);
-        let create_error = |e| format!("cannot create the worker scratch dir in {}: {e}", temp.display());
+        let create_error = |e| {
+            format!(
+                "cannot create the worker scratch dir in {}: {e}",
+                temp.display()
+            )
+        };
         std::fs::create_dir_all(temp).map_err(create_error)?;
         let prefix = format!("{SCRATCH_PREFIX}{}-", std::process::id());
         let mut builder = tempfile::Builder::new();
@@ -46,7 +51,11 @@ impl ScratchDir {
         }
         let pending = tempfile::NamedTempFile::new_in(dir.path()).map_err(create_error)?;
         let owner = match pending.as_file().try_lock() {
-            Ok(()) => Some(pending.persist(dir.path().join(OWNER_LOCK)).map_err(|e| create_error(e.error))?),
+            Ok(()) => Some(
+                pending
+                    .persist(dir.path().join(OWNER_LOCK))
+                    .map_err(|e| create_error(e.error))?,
+            ),
             Err(_) => None,
         };
         Ok(Self { _owner: owner, dir })
@@ -59,8 +68,15 @@ impl ScratchDir {
 
 /// Reclaim only published, unlocked owners. PIDs and directory ages cannot
 /// prove abandonment when processes share storage across PID namespaces.
+///
+/// Reclamation is best effort: a lock released here is only free once no
+/// descriptor names it anywhere, and a child forked by another thread holds an
+/// inherited copy until it execs. A sweep in that window leaves the directory
+/// for the next sweep, and every `ScratchDir::create` sweeps again.
 fn sweep_stale_scratch(temp: &Path) {
-    let Ok(entries) = std::fs::read_dir(temp) else { return };
+    let Ok(entries) = std::fs::read_dir(temp) else {
+        return;
+    };
     for entry in entries.flatten() {
         let name = entry.file_name();
         if name.to_str().and_then(scratch_owner).is_none()
@@ -68,7 +84,11 @@ fn sweep_stale_scratch(temp: &Path) {
         {
             continue;
         }
-        let Ok(owner) = OpenOptions::new().read(true).write(true).open(entry.path().join(OWNER_LOCK)) else {
+        let Ok(owner) = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(entry.path().join(OWNER_LOCK))
+        else {
             continue;
         };
         if owner.try_lock().is_ok() {
@@ -80,14 +100,19 @@ fn sweep_stale_scratch(temp: &Path) {
 /// Read the diagnostic PID from a versioned scratch name; it does not prove liveness.
 fn scratch_owner(name: &str) -> Option<u32> {
     let (pid, suffix) = name.strip_prefix(SCRATCH_PREFIX)?.split_once('-')?;
-    if suffix.is_empty() { return None; }
+    if suffix.is_empty() {
+        return None;
+    }
     pid.parse().ok()
 }
 
 /// Recognize the scratch-name prefix used by the parent's assignment protocol.
 pub(super) fn pool_scratch(dir: &str) -> Option<PathBuf> {
     let path = Path::new(dir);
-    path.file_name()?.to_str()?.starts_with(POOL_PREFIX).then(|| path.to_path_buf())
+    path.file_name()?
+        .to_str()?
+        .starts_with(POOL_PREFIX)
+        .then(|| path.to_path_buf())
 }
 
 #[cfg(test)]
@@ -115,7 +140,10 @@ mod tests {
             std::fs::write(path.join("inventory.spec"), b"payload").unwrap();
             path
         };
-        assert!(!kept.exists(), "a non-empty scratch dir must go with its guard");
+        assert!(
+            !kept.exists(),
+            "a non-empty scratch dir must go with its guard"
+        );
 
         let leaked = std::sync::Mutex::new(PathBuf::new());
         let _ = std::panic::catch_unwind(|| {
@@ -134,10 +162,21 @@ mod tests {
             Some(PathBuf::from("/tmp/kuna-jobs-4242-99"))
         );
         for foreign in ["/tmp", "/home/u/out", "kuna-jobs-1/nested", "/"] {
-            assert_eq!(pool_scratch(foreign), None, "{foreign} is not a pool scratch dir");
+            assert_eq!(
+                pool_scratch(foreign),
+                None,
+                "{foreign} is not a pool scratch dir"
+            );
         }
         assert_eq!(scratch_owner("kuna-jobs-v2-4242-17384"), Some(4242));
-        for bad in ["kuna-jobs-4242-17384", "kuna-jobs-v2-", "kuna-jobs-v2-abc-1", "kuna-jobs-v2-1-", "kunajobs-1-2", "tmpdir"] {
+        for bad in [
+            "kuna-jobs-4242-17384",
+            "kuna-jobs-v2-",
+            "kuna-jobs-v2-abc-1",
+            "kuna-jobs-v2-1-",
+            "kunajobs-1-2",
+            "tmpdir",
+        ] {
             assert_eq!(scratch_owner(bad), None, "{bad}");
         }
     }
@@ -157,8 +196,14 @@ mod tests {
 
         sweep_stale_scratch(&temp);
 
-        assert!(mine.is_dir(), "a live run's directory must survive the sweep");
-        assert!(unrelated.is_dir(), "the sweep must not touch directories it did not create");
+        assert!(
+            mine.is_dir(),
+            "a live run's directory must survive the sweep"
+        );
+        assert!(
+            unrelated.is_dir(),
+            "the sweep must not touch directories it did not create"
+        );
         assert!(!dead.exists(), "a released owner's directory must be swept");
         let _ = std::fs::remove_dir_all(&dead);
         let _ = std::fs::remove_dir_all(&unrelated);
@@ -173,19 +218,28 @@ mod tests {
         let second_path = second.path().to_path_buf();
         assert_ne!(first_path, second_path);
         for path in [&first_path, &second_path] {
-            assert_eq!(scratch_owner(path.file_name().unwrap().to_str().unwrap()), Some(std::process::id()));
+            assert_eq!(
+                scratch_owner(path.file_name().unwrap().to_str().unwrap()),
+                Some(std::process::id())
+            );
             assert_eq!(pool_scratch(path.to_str().unwrap()), Some(path.clone()));
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                assert_eq!(std::fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o700);
+                assert_eq!(
+                    std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                    0o700
+                );
             }
         }
         std::fs::write(first.path().join("inventory.spec"), b"first").unwrap();
         std::fs::write(second.path().join("inventory.spec"), b"second").unwrap();
         drop(first);
         assert!(!first_path.exists());
-        assert_eq!(std::fs::read(second.path().join("inventory.spec")).unwrap(), b"second");
+        assert_eq!(
+            std::fs::read(second.path().join("inventory.spec")).unwrap(),
+            b"second"
+        );
         drop(second);
         assert!(!second_path.exists());
         assert_eq!(std::fs::read_dir(base.path()).unwrap().count(), 0);
@@ -224,23 +278,44 @@ mod tests {
         std::fs::create_dir(&legacy).unwrap();
         std::fs::write(legacy.join("inventory.spec"), b"live inventory").unwrap();
         sweep_stale_scratch(base.path());
-        assert_eq!(std::fs::read(legacy.join("inventory.spec")).unwrap(), b"live inventory");
+        assert_eq!(
+            std::fs::read(legacy.join("inventory.spec")).unwrap(),
+            b"live inventory"
+        );
     }
 
     #[test]
     fn an_owner_lock_controls_cleanup_without_consulting_the_pid() {
         let base = tempfile::tempdir().unwrap();
         for pid in [u32::MAX, std::process::id()] {
-            let dir = base.path().join(format!("kuna-jobs-v2-{pid}-owner"));
-            std::fs::create_dir(&dir).unwrap();
-            let owner = std::fs::File::create(dir.join("owner.lock")).unwrap();
+            // A live owner is spared: the lock, not the PID, decides.
+            let held = base.path().join(format!("kuna-jobs-v2-{pid}-held"));
+            std::fs::create_dir(&held).unwrap();
+            let owner = std::fs::File::create(held.join(OWNER_LOCK)).unwrap();
             owner.try_lock().unwrap();
-            std::fs::write(dir.join("inventory.spec"), b"live inventory").unwrap();
+            std::fs::write(held.join("inventory.spec"), b"live inventory").unwrap();
             sweep_stale_scratch(base.path());
-            assert_eq!(std::fs::read(dir.join("inventory.spec")).unwrap(), b"live inventory");
+            assert_eq!(
+                std::fs::read(held.join("inventory.spec")).unwrap(),
+                b"live inventory"
+            );
             drop(owner);
+
+            // A released owner is reclaimed even though the name carries a live
+            // PID. That is the state a finished or crashed owner leaves: the
+            // lock file is there and no descriptor names it. Closing our own
+            // descriptor cannot show it, because a sibling thread that forks
+            // just before this sweep hands the child an inherited copy of the
+            // descriptor, and `O_CLOEXEC` closes that copy only inside `execve`.
+            let released = base.path().join(format!("kuna-jobs-v2-{pid}-released"));
+            std::fs::create_dir(&released).unwrap();
+            std::fs::write(released.join(OWNER_LOCK), b"").unwrap();
+            std::fs::write(released.join("inventory.spec"), b"live inventory").unwrap();
             sweep_stale_scratch(base.path());
-            assert!(!dir.exists(), "a released owner must be reclaimable even with a live PID");
+            assert!(
+                !released.exists(),
+                "a released owner must be reclaimable even with a live PID"
+            );
         }
     }
 
@@ -256,6 +331,7 @@ mod tests {
         let owner = pending.persist(dir.join("owner.lock")).unwrap();
         sweep_stale_scratch(base.path());
         assert!(dir.is_dir());
+        owner.unlock().unwrap();
         drop(owner);
         sweep_stale_scratch(base.path());
         assert!(!dir.exists());
@@ -281,5 +357,4 @@ mod tests {
         });
         assert_eq!(std::fs::read_dir(base.path()).unwrap().count(), 0);
     }
-
 }

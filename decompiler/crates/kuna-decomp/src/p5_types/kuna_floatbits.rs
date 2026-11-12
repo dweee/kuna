@@ -1,4 +1,4 @@
-//! (kuna `floatbits`) A float helper that works on the bits is still a float (P5).
+//! A float helper that works on the bits is still a float (P5).
 //!
 //! `fabsf` in newlib is `GET_FLOAT_WORD(ix, x); SET_FLOAT_WORD(x, ix &
 //! 0x7fffffff); return x;`, which hard-float ARM compiles to `vmov r3,s0; bic
@@ -58,12 +58,9 @@ pub(crate) struct Plan {
 }
 
 impl Plan {
-    /// The plan for `data`'s current IR, empty when the option is off or no
-    /// input arrives in a float-class register.
+    /// The plan for `data`'s current IR, empty when no input arrives in a
+    /// float-class register.
     pub(crate) fn of(data: &Funcdata) -> Plan {
-        if !data.get_arch().float_bits {
-            return Plan::default();
-        }
         let proto = data.get_func_proto();
         if !proto.has_model() || proto.is_input_locked() {
             return Plan::default();
@@ -134,9 +131,6 @@ impl Plan {
 /// against the float (`kuna_voidret.rs (elsewhere_than_return)`): betaflight's
 /// `bl fabsf; vcmpe.f32 s0, s15; .. pop {r4, pc}` returns the `r0` the call left.
 pub(crate) fn held_bits_token(data: &mut Funcdata, op: crate::context::OpId) -> Option<Rc<Datatype>> {
-    if !data.get_arch().float_bits {
-        return None;
-    }
     let (outvn, float) = {
         let fc = data.get_call_specs(data.get_call_specs_index(op)?);
         if fc.proto().is_output_locked() {
@@ -180,7 +174,7 @@ fn walk(data: &Funcdata, input: VarnodeId, candidates: &[VarnodeId]) -> Option<W
             return None;
         }
         let node = data.vbank().get(v)?;
-        if node.is_type_lock() || node.is_persist() || in_data_space(data, node) {
+        if (node.is_type_lock() && !crate::kuna_armfloatreturn::float_locked_return(data, v)) || node.is_persist() || in_data_space(data, node) {
             return None;
         }
         for r in node.descend_iter() {
@@ -340,7 +334,7 @@ const DOUBLE_FIELDS: [u64; 7] = [
 
 /// Does `c` keep its meaning when an `==` or `!=` with it prints as a float
 /// comparison?  Only for a constant that is a normal number or an infinity
-/// whose printed literal, which C reads as a `double`, is the constant's own
+/// whose shortest digits, read back as a `double`, are the constant's own
 /// value: a zero compares equal to the other zero, a NaN to nothing, a
 /// denormal to zero where the FPU flushes them, and `0.1`, the shortest
 /// spelling of `0.1f`, is another double, while the binary compares bits.
@@ -400,7 +394,7 @@ fn returned_beside_ok(data: &Funcdata, vn: VarnodeId, accepted: &[VarnodeId]) ->
         .all(|&w| {
             data.vbank().get(w).is_some_and(|n| {
                 n.get_size() == size
-                    && !n.is_type_lock()
+                    && (!n.is_type_lock() || crate::kuna_armfloatreturn::float_locked_return(data, w))
                     && if n.is_constant() { crate::kuna_floatreg::spells(data, w) } else { bits_of(data, w, accepted, true) }
             })
         })
