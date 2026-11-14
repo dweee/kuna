@@ -608,6 +608,7 @@ impl Action for ActionDefaultParams {
                             .or_else(|| crate::kuna_swiftcall::throwing_call(data, data.get_call_specs(i).get_op()))
                             .or(bound_model)
                             .or_else(|| crate::kuna_swiftcall::indirect_call(data, data.get_call_specs(i).get_op()))
+                            .or_else(|| data.get_call_specs(i).callee_reg_model().cloned())
                             .unwrap_or_else(|| evalfp.clone());
                         data.get_call_specs_mut(i).proto_mut().set_internal(model, void_ty.clone());
                         // (kuna) A console `map return <addr>`-only callee: keep the
@@ -718,8 +719,17 @@ impl Action for ActionExtraPopSetup {
         let sb_addr = Address::new(point_space, point.offset);
         let sb_size = point.size as int4;
 
+        let exact = crate::p4_calls::kuna_calleepurge::every_pop_settled(data);
         for i in 0..data.num_calls() {
-            let extrapop = data.get_call_specs(i).get_extra_pop();
+            let mut extrapop = data.get_call_specs(i).get_extra_pop();
+            if extrapop == EXTRAPOP_UNKNOWN && exact {
+                // (kuna) A pop the callee's own returns prove; see
+                // [`crate::p4_calls::kuna_calleepurge`].
+                if let Some(ep) = data.get_call_specs(i).callee_purge() {
+                    data.get_call_specs_mut(i).proto_mut().set_extra_pop(ep);
+                    extrapop = ep;
+                }
+            }
             if extrapop == 0 {
                 continue;
             }
@@ -1260,6 +1270,7 @@ impl ActionActiveParam {
         &mut self,
         data: &mut Funcdata,
         aliascheck: &mut Option<crate::varmap::AliasChecker>,
+        held: &mut crate::p4_calls::kuna_calleestackargs::Contenders,
         idx: int4,
     ) -> bool {
         use crate::funcdata_callsite::check_input_trial_use;
@@ -1289,7 +1300,7 @@ impl ActionActiveParam {
 
         if !data.get_call_specs_mut(idx).get_active_input().is_fully_checked() {
             if let Some(ac) = aliascheck.as_mut() {
-                check_input_trial_use(idx, data, ac);
+                check_input_trial_use(idx, data, ac, held);
             }
         }
         data.get_call_specs_mut(idx).get_active_input().finish_pass();
@@ -1337,6 +1348,7 @@ impl Action for ActionActiveParam {
         // aliascheck.gather(&data, getStackSpace(), true): deferred local-alias
         // checker for the spacebase-parameter branch.
         let mut aliascheck = data.build_alias_checker_deferred();
+        let mut held = crate::p4_calls::kuna_calleestackargs::Contenders::default();
         let manager_rc = data.get_arch().manage.clone();
         // (kuna) `calleearityfwd`: call sites that finalize with an empty argument
         // list, retried at the end of the pass against the siblings that finalize
@@ -1374,7 +1386,7 @@ impl Action for ActionActiveParam {
                 let mut ready = Vec::new();
                 let mut pause = false;
                 for idx in 0..data.num_calls() {
-                    if !self.check_call_trials(data, &mut aliascheck, idx) {
+                    if !self.check_call_trials(data, &mut aliascheck, &mut held, idx) {
                         continue;
                     }
                     ready.push(idx);
@@ -1404,7 +1416,7 @@ impl Action for ActionActiveParam {
         let mut ready = ready_calls.into_iter();
         for position in 0..count {
             let idx = if bootstrap { ready.next().expect("checked call") } else { position as int4 };
-            if !bootstrap && !self.check_call_trials(data, &mut aliascheck, idx) {
+            if !bootstrap && !self.check_call_trials(data, &mut aliascheck, &mut held, idx) {
                 continue;
             }
             {
@@ -2110,6 +2122,26 @@ fn update_input_types(
         let ty = crate::kuna_armfloatreturn::unused_vfp_type(data, active, triallist, i)
             .or_else(|| data.high_get_type(vn))
             .unwrap_or_else(|| Rc::new(crate::dtype::Datatype::new(1, crate::dtype::type_metatype::TYPE_UNKNOWN)));
+        // (kuna `gonewtype`) A `go.typedesc *` parameter type is the interface
+        // type word of an `any` argument mislabeled with the descriptor it points
+        // at: a `&type:T` descriptor global flows into a runtime/stdlib
+        // `any`-taking callee (`runtime.gopanic`, `fmt.(*pp).printArg`,
+        // `encoding/binary.Read`, ...) and local type inference — or the
+        // callee-vote plane — commits that pointer-to-descriptor onto the word.
+        // A `go.typedesc` is a synthesized descriptor shell, never a value type
+        // anything is declared as, so it is provably never a real parameter type;
+        // demote it to the honest untyped word of the same (pointer) width rather
+        // than export the wrong concrete signature. The genuine runtime type
+        // `abi.Type`, which reflect/runtime functions legitimately take by
+        // pointer, is a different real type and is untouched.
+        let ty = if crate::kuna_calleevote::is_go_typedesc_pointer(&ty) {
+            Rc::new(crate::dtype::Datatype::new(
+                ty.get_size(),
+                crate::dtype::type_metatype::TYPE_UNKNOWN,
+            ))
+        } else {
+            ty
+        };
         let _ = is_persist;
         // (kuna `elfmain`) A runtime argument of an executable's own `main` takes
         // its runtime name. See `kuna_elfmaindecl`.

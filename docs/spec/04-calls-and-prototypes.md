@@ -589,6 +589,17 @@ variants cover the modern cspec vocabulary: `GotoStack`, `ConvertToPointer`,
 storage classes), `ConsumeAs`, `HiddenReturnAssign`, and the resource-burning
 side-effects `ConsumeExtra`, `ExtraStack`, `ConsumeRemaining`.
 
+Primitive classification includes bitfields as integer storage, including a
+struct consisting only of bitfields. `kuna_aggregateabi.rs (primitive_fields)`
+minimizes their containers to occupied bytes, merges overlapping ranges and
+splits them into naturally aligned integer chunks. These bytes participate in
+dual-class joins alongside ordinary members, so a whole-field `unsigned short`
+argument uses the integer register class and a later double keeps its floating
+class. Bitfield positions do not impose ordinary-member alignment; ordinary
+members still undergo the existing alignment and padding checks. Direct-field
+classification uses the same occupied ranges without flattening nested members.
+This preserves bitfield-only GPR arguments in the Octeon direct-field models.
+
 When a `MultiSlotAssign` takes no register and spills the whole argument to the
 stack, upstream rounds its slot up to the data type's alignment. The kuna
 `<join stackalign="false"/>` attribute skips that rounding, so the argument
@@ -1433,6 +1444,68 @@ that machinery.
   current function's own prototype is never a fallback. A `FuncProto` taken
   from a typed data slot is copied intact, including its calling-convention
   model.
+  (kuna) The MSVC x86-32 one-operand x87 math intrinsics (`__CIsqrt`,
+  `__CIsin`, `__CIcos`, `__CItan`, `__CIexp`, `__CIlog`, `__CIlog10`,
+  `__CIasin`, `__CIacos`, `__CIatan`, `__CIsinh`, `__CIcosh`, `__CItanh`;
+  imported from `msvcrt.dll` as `_CIsin` and so on) take their operand in `ST0` and return
+  in `ST0`, and no `x86win.cspec` model has an `ST0` input: a call to one
+  recovered no argument, nothing read `ST0`, and the expression that computed
+  the operand was dead-code eliminated. A model of their own,
+  `__kuna_x87unary`, is registered after the spec's named models on x86-32
+  (`decompiler/crates/kuna-decomp/src/p4_calls/kuna_x87intrinsic.rs
+  (prototype_xml)`): one floating-point input and one output in `ST0`,
+  `extrapop` 4, the `__cdecl` unaffected set. A shared model cannot take the
+  `ST0` input without inventing it on every other callee (§2,
+  `kuna_msvcftol`). The analysis tier binds the model to each intrinsic by
+  address and parks the locked signature `long double name(long double)`
+  there too, so `ActionDefaultParams` seeds the call from that signature under
+  that model. An imported intrinsic is exempt from the rule that a C runtime
+  import is `__cdecl` (step 5d of the engine's analysis commit): seeded under
+  `__cdecl`, the locked `long double` operand would be read as ten bytes of the
+  caller's stack, taking the argument pushed for an earlier call with it. The lock matters: with the model alone, an operand the caller
+  also spills to the frame and reloads after the call (`fst qword [esp+c];
+  call __CIcos; ...; fld qword [esp+c]`, the common `cos`-then-`sin` shape)
+  failed the input trial and the call printed without it. The operand stays
+  where the result returns, so the x87 stack depth is unchanged across the
+  call. The two-operand helpers (`__CIpow`, `__CIatan2`, `__CIfmod`) get a
+  second model, `__kuna_x87binary`: the first operand in `ST1` and the second
+  in `ST0`, which is the order the source loads them (`atan2(y, x)` pushes `y`
+  first), the result in `ST0`, and `ST1` killed by the call. They pop one x87
+  slot, which a model cannot state; it does not matter because MSVC calls them
+  with only their two operands on the x87 stack, spilling anything else first,
+  so no value the caller keeps there sits below the popped slot.
+  (kuna `calleereginputs`, default off) On x86-32 under a compiler spec whose
+  default model leaves extrapop unknown (`x86win.cspec`), a direct call with no
+  declared prototype takes the spec's own `__thiscall` model instead of the
+  default when its callee reads ECX before writing it, and `__fastcall` when it
+  reads ECX and EDX
+  (`decompiler/crates/kuna-decomp/src/p4_calls/kuna_calleereginputs.rs
+  (callee_register_model)`). The default `__stdcall` has no register
+  parameters, so a `this` passed in ECX was dropped at every such call, and
+  the caller's own stores below the call were offered to the callee as stack
+  arguments in its place: a constructor run on one local was handed another
+  local's fields. Flow reads the callee when it builds the call spec, because
+  only flow holds the instruction decoder. The callee's p-code is followed
+  along the straight line its first instructions run, through direct `jmp`s
+  (so an incremental-link stub reaches the body), until a conditional branch,
+  a call, a return, an indirect jump or 64 instructions. A register read before
+  it is written is an input, except a register a `push` saves (SLEIGH lifts it
+  as a copy into a temporary that only the stack store reads), a copy of a
+  register onto itself (the `mov edi,edi` hot-patch prologue, the
+  `lea ecx,[ecx]` padding nop), and a result the old value cannot change
+  (`xor`/`sub` with itself, `or` with all ones, `and` with zero). A callee that
+  also reads EAX, EBX, ESI or EDI keeps the default: no spec model states that
+  convention (Borland `register`, an MSVC whole-program custom convention,
+  `_chkstk`), or the routine captures every register (`__report_gsfailure`,
+  `_invoke_watson`), and an ECX parameter would steal a value the call does not
+  take. The import table is never walked, and the answer is cached per callee
+  on the architecture. Arguments in other registers (a static function MSVC
+  passes a count in EDI) are not recovered. The option ships off: on real
+  MSVC images the newly live ECX operands feed the unknown-extrapop stack
+  solver, which re-solves some frames worse (an AutoIt-compiled image loses
+  stack arguments at about 2,100 calls, Win32 APIs included), and a call whose
+  ECX holds a register the caller only inherited drops the stack arguments
+  behind it, even where every model choice is right.
 - **`ActionExtraPopSetup`** (`coreaction_protos.rs (ActionExtraPopSetup)`)
   models the stack pointer across each call: a known extrapop becomes an
   explicit `INT_ADD sp, #extrapop` after the call; an unknown one becomes an
@@ -1442,6 +1515,60 @@ that machinery.
   `option extrapop`
   (`decompiler/crates/kuna-decomp/src/p0_knowledge/options.rs
   (OptionExtraPop)`).
+  On x86-32 under a compiler spec whose default model leaves extrapop unknown
+  (`x86win.cspec`'s `__stdcall`, and with it `__thiscall`/`__fastcall` callees
+  the image does not declare), a direct call whose prototype states no extrapop
+  can take the one its callee's own code proves before the INDIRECT is chosen
+  (`decompiler/crates/kuna-decomp/src/p4_calls/kuna_calleepurge.rs
+  (callee_extra_pop)`). Flow asks for it as it builds the call spec, because
+  only flow holds the instruction decoder. The callee's p-code is walked from
+  its entry along every path, through fall-through and direct branches, so a
+  call routed through an incremental-link `jmp` thunk reaches the body. The
+  walk tracks the stack pointer and the general registers as entry-relative
+  stack addresses (exact, a bounded range, the caller's frame pointer, or
+  unplaced). A return states an extrapop only when the stack pointer is exactly
+  back at its entry value as the `RET` starts; the extrapop is then the
+  constant the `RET` adds (`RET 0x14` lifts as `ESP += 4; ESP += 0x14;
+  RETURN`, extrapop 0x18), and it has to be a multiple of 4 and at most 0x404.
+  A direct call inside the callee moves the stack pointer by that callee's own
+  proven extrapop, read the same way three levels down; a call to a function
+  the image names as not returning ends the path. Any other call (an indirect
+  or import call, a callee the walk cannot settle) leaves the stack pointer
+  bounded but unplaced, so the callee's returns are then proven only by
+  restoring it from a frame pointer the callee set itself (`mov esp,ebp`,
+  `leave`). The CRT helpers that move their caller's stack
+  (`_chkstk`/`_alloca_probe`, `__SEH_prolog4`/`__SEH_epilog4`,
+  `__EH_prolog3`/`__EH_epilog3`) return with the stack pointer moved by their
+  own arithmetic (`sub esp,eax`, `xchg esp,eax`) or loaded from the caller's
+  frame pointer, or pop their own return address; they are recorded as
+  stack-moving, and a call to one leaves the caller's stack pointer and the
+  callee-saved registers the helper writes unplaced. That imprecision stays the
+  call's where a path through it meets one that did not take it, so the caller
+  itself is not recorded as stack-moving. Every reachable return
+  has to agree. An indirect jump, an undecodable instruction, a call target
+  that is an import's address-table slot, or a walk past its
+  2048-instruction budget states nothing. `int3` falls through and `ud2` ends
+  its path. Walks are cached on the architecture: one whose nested calls fit
+  within the depth it was asked for is the answer at every greater depth, and
+  one the depth limit cut short is kept per depth, so the answer never depends
+  on which function asked first. Decoded instructions are shared between
+  walks in a bounded cache.
+
+  A proven extrapop is applied only in a function where every call then has
+  one, stated by its prototype or proven by its callee
+  (`kuna_calleepurge.rs (every_pop_settled)`), so the solver is left nothing
+  to guess. The solver's guesses for the calls it cannot read are coherent with
+  each other rather than with the truth: an import's guess counts the pushes in
+  front of it, which for `WinMain(GetModuleHandleA(0), 0, cmd, show)` include
+  three of the outer call's, and an internal callee's guess of "pops only the
+  return address" is short by exactly what the import over-counted. Making one
+  of those calls exact moves the stack offsets of the guessed calls around it,
+  and their arguments drop, so a function with any guessed call keeps the
+  solver's answer for all of them. Where the proof applies it fixes the
+  solver's "pops only the return address" for every `__stdcall` and
+  `__thiscall` callee, which shifts each later stack offset by the arguments
+  the callee popped, so later calls lose stack arguments and locals whose
+  address is taken alias outgoing-argument slots.
 - **`ActionFuncLink`** (`coreaction_protos.rs (ActionFuncLink)`) arms each
   call site. Unlocked or varargs prototype → input recovery on
   (`init_active_input`). Locked prototype → one pre-marked trial per declared
@@ -1549,6 +1676,86 @@ classified:
   argument. That is visible as deleted basic blocks, not merely as a shorter
   argument list. (kuna) The caller-relative Varnode address is the one probed
   (`decompiler/crates/kuna-decomp/src/p4_calls/kuna_callsitestackargs.rs`, always on).
+- (kuna `calleeargs`, default on) **Callee stack-argument extent.** On
+  x86-32 under a model that leaves extrapop unknown (`x86win.cspec`), a direct
+  call whose callee's own code can be read takes its stack arguments from what
+  that code touches
+  (`decompiler/crates/kuna-decomp/src/p4_calls/kuna_calleestackargs.rs
+  (callee_stack_arg_bytes)`). The walk that proves the callee's pop (chapter
+  text above, `kuna_calleepurge.rs (callee_arg_bytes)`) also records the
+  highest byte at or above the first argument slot that a load or store
+  touches, through the stack pointer or any register holding a stack address
+  the walk placed exactly (a `mov esi,esp` copy, a frame pointer the callee set
+  with `mov ebp,esp`), rounded up to the 4-byte slot. A nested direct call
+  whose own extent is known touches its arguments in the callee's frame; one
+  whose extent is not known is taken to read only the arguments pushed for it.
+  A pointer into the callee's locals, however it is indexed or stepped, is
+  taken to stay among them while the walk can see it. A stack address the
+  walk loses sight of is followed as lost: one stored in a stack slot and
+  loaded back by any access that overlaps the slot (`push esp; pop eax`, a
+  `movq` copy), and one a nested call leaves in a caller-saved register (a
+  helper that hands back `lea eax,[esp+4]`); a load or store through a lost
+  address leaves the extent unstated, and so does a stack address written
+  outside the general registers (parked in `xmm0`), into part of one, or to a
+  stack location whose slot is not followed (an argument's own slot, a slot
+  deeper than the 64 below the return address). Slots are followed
+  flow-sensitively, so a plain value stored over a slot clears it, and a lost
+  address that is never dereferenced (the `pop ecx` that cleans a pushed
+  local's address) costs nothing. A stack address stored through a pointer
+  the walk cannot place leaves the extent unstated as well, except the
+  caller's frame pointer, which the CRT's `_NLG_Notify` records in a global; a
+  local's address handed to a call is still taken to stay among the locals.
+  This bookkeeping runs only with the option on and never changes
+  a value the pop proof reads; turning the option on or off drops the walks
+  already taken, so a walk is never reused with the other setting. A nested call to a function recorded as
+  stack-moving (above) whose own extent is not stated leaves the extent
+  unstated: it can read anywhere in its caller's frame. The extent is stated only when the walk saw every
+  path and placed every access: an indirect jump, a budget overrun, an access
+  through an unplaced stack address (the frame pointer the caller left, one a
+  helper such as `__SEH_prolog4` set, a stack pointer moved by a call the walk
+  cannot read, an argument address indexed at run time), or an address at or
+  above the return address that is stored, returned or live in a register at a
+  call (`va_start`, a by-value `this` in `ecx`) states nothing. The bound a call
+  site uses widens the extent to what the callee's returns pop (`ret 8` takes
+  two slots whether or not both are read) and to what the caller removes in the
+  run of instructions right after the call (`pop ecx`, `add esp,8`: a `__cdecl`
+  cleanup covers the arguments pushed for that call). Where the extent is
+  stated, a stack trial starting at or past the bound (or past what the callee
+  pops, if that is more) is no-use, and a trial within the touched extent
+  skips the local-alias test, because the callee reads that slot whatever a
+  pointer elsewhere in the caller may reach; a trial straddling the bound is
+  left to the upstream test. No call takes an extent in a function that calls
+  a stack-moving helper (`_chkstk`, `__SEH_prolog4`): the solver can only
+  guess what such a call does to the stack pointer, so the trial offsets there
+  are guesses too, and dropping a trial that carries a local's address would
+  hide that the callee writes through it (the local then folds to a constant
+  and the code reading it disappears). The first rule tells the pushes for an
+  outer call from an inner call's: an argument pushed for a virtual call before
+  an inner `this`-only method call is not the method's. The second keeps the
+  flow-insensitive alias test from refusing every pushed argument of a function
+  whose by-value struct copy (`sub esp,0x20; mov edi,esp; rep movsd`) keeps a
+  bottom-of-frame pointer alive. Upstream marks the stack range of every
+  argument a call takes as unmapped, so a store to that range that no call
+  takes is dead; a call whose extent is not stated (an import, an indirect
+  call, a callee framed by `__SEH_prolog4`) keeps the upstream test, and stores
+  a refused call reads but does not take can drop where another call in the
+  same function takes the same slots. That test takes a pushed value no other
+  call holds, so a value the bound frees moves to it: correct where it is that
+  call's argument (the outer virtual call above), a stray argument where it is
+  a local of the caller (a pushed `/GS` cookie, a zero-initialised buffer)
+  past what the call's callee pops or its caller removes. So a trial past the
+  bound is still dropped unless a direct call in the same function whose
+  callee states no extent but whose window is known (the most its reached
+  returns pop, or the caller's cleanup after it) would take the same stored
+  value, on some path through the INDIRECTs and MULTIEQUALs on it, from a slot
+  past that window (`kuna_calleestackargs.rs (contested)`); then the trial is
+  left to the upstream test, as with the option off. An indirect or import
+  call has no window and never holds a trial back, so a stray store can still
+  attach to one. An unread trailing parameter of a
+  `__cdecl` callee whose cleanup the compiler deferred past a later call is
+  dropped with an outer call's pushes, which is why this is an option. The call
+  whose by-value argument the pointer builds still fails the trial on its first
+  slot and takes nothing.
 - **Jump-target register** (kuna, `tailcalljump on`): a tail call that flow
   recovered from a veneer's computed jump (chapter 02) records the register the
   jump read its target from (`fspec.rs (FuncCallSpecs::carries_jump_target)`).
@@ -3991,9 +4198,10 @@ tier's `(addr, model)` facts land in `Architecture::loader_proto_models` and
 reach every function's handle as `ArchContext::bound_proto_models`
 (`decompiler/crates/kuna-decomp/src/substrate/context.rs
 (ArchContext::bound_proto_model)`). The function's own decompile, when no
-prototype and no parameter lock is declared for it, sets the model on its
-prototype and locks the model alone, so `ActionPrototypeTypes` keeps it and
-input recovery runs under it; `ArchContext::callee_proto_model` answers the
+prototype is declared for it, sets the model on its prototype and locks the
+model alone, so `ActionPrototypeTypes` keeps it and input recovery runs under
+it; a parameter lock (a class getter's pinned `self`) is applied on top and
+does not displace the model; `ArchContext::callee_proto_model` answers the
 bound model for a callee with no declared pieces, and `ActionDefaultParams`
 gives a call to it that model instead of the evaluation default, so the
 caller's argument recovery sees the callee's `swiftself`.
@@ -4024,7 +4232,11 @@ register is one in every Swift function that does not throw and in any C or
 C++ code linked in, and a zero written there before a call and read back as
 a value (a loop counter, a sum) is still that zero after the call
 (`tested_after` keeps the register and up to three copies of it in view,
-passes over stores of them to the stack, and takes a zero the instruction
+follows a store of one of them to a stack slot (a base register plus a
+constant) into a later load of the same slot while the base register is
+unchanged, so a caller that spills the error register, reuses it and tests
+the reloaded value is still a caller of a throwing function, passes over any
+other store of them, and takes a zero the instruction
 first loads into a temporary as the constant: the arm64 `-Onone` caller
 copies x21 and stores the copy before its `cbnz x21`, and arm64 compares a
 register with an immediate zero through such a temporary). And a struct or
@@ -4037,8 +4249,23 @@ scored no-use in `ActionActiveParam` (`stale_self`). A call to a C function
 does not count (`may_take_self`): one under a non-Swift model whose callee
 has a C name (`swift_retain`, `objc_msgSend`, a `@_cdecl` export, not an
 engine `sub_`/`FUN_` placeholder) preserves the register and reads none of
-it, so a value set before it is still set for the call that follows. A Swift
-function, an unnamed callee or an indirect target may read it.
+it, so a value set before it is still set for the call that follows. Nor
+does a direct callee whose body leaves the register unread: on its one
+straight path from the entry, before any branch or call out of it, it writes
+the register first or returns without touching it (`seed_self_readers`, read
+in the decompile drive while the translator is reachable and cached per
+image, and again after a restart re-flow; the probe is `first_touch`'s linear
+scan, which passes over a store of the register through the stack pointer and
+a load back into it, but counts a store of it anywhere else, and the copy a
+`push` or `stp` makes first, as a read). A Swift leaf such as
+`tick(x) = x * 3 + 1` called between the caller setting r13 and a mutating
+call so leaves that call its `self`. Nor does a callee a symbol names as a
+Swift function of a module rather than a member of a type
+(`SwiftAbi::no_self`, from the analysis tier's `swift_types.no_self`): such a
+function takes no `self` and preserves the register whatever its body does,
+so `spin(_:)`, whose loop puts a branch on its first path, leaves the call
+after it its `self` too. Any other Swift function, unnamed callee or
+indirect target may read it.
 
 A method passes its own `self` on without touching the register: `settle`
 calls `fee(for:)` and its own getter with x20 / r13 exactly as it received
@@ -4054,9 +4281,14 @@ callee that may not take `self`. A call that then passes nothing but that
 `calleearity`), still a call that recovered nothing, so the arguments they
 would have found for it are found after the `self`. An
 indirect call takes `__swiftcall` too when its block loads the target from
-memory — a vtable slot, a witness-table entry, a closure's function
-(`indirect_call`); a trap's target or a coroutine continuation returned by the
-previous call is not a load and keeps the C model. Whether such a call passes
+memory and the call shows it is Swift's (`indirect_call`): the slot is
+reached through another loaded pointer (an isa's vtable, a witness table
+read out of a container), or the caller writes `swiftself` after the
+previous call (a method's `self`, a witness's, a closure's context). A C
+function pointer loaded from a global or from a field of a pointer the caller
+holds, with `swiftself` left alone (`h.hook(x)` for a `@convention(c)`
+field), keeps the C model; so does a trap's target or a coroutine
+continuation returned by the previous call, which is not a load. Whether such a call passes
 `swiftself` is decided by its target alone (`indirect_self`): the register is
 an argument exactly when the target is loaded through the isa of the value
 the register holds (`obj->isa[k](obj, …)`, a method dispatched on that

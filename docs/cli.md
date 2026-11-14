@@ -18,6 +18,13 @@ to be: no panic text, no broken-pipe diagnostic. It suppresses the *diagnostic*,
 on a regressed baseline exits `1` and the DIV-45 failure contract below holds with or without
 a reader. Other stdout write failures are real errors: reported, and exit `1`.
 
+Thin Mach-O loads and CLI metadata probes use a private read-only file mapping.
+Keep the input file unchanged for the duration of analysis: private mapping does
+not isolate reads from external writes or truncation. Set `KUNA_LOAD_MMAP=off`
+to use the owned input path instead; mapping failures also fall back to that path.
+Fat Mach-O and other formats retain their existing reads. In-process byte overlays
+modify owned regions without writing to the input file.
+
 An ELF whose **section table is unusable** is loaded anyway, from its program headers.
 A corrupt `e_shoff`/`e_shnum`/`e_shstrndx` used to reject the whole file — every
 command exited `1` with `not in recognized object file format: Invalid ELF section
@@ -261,7 +268,7 @@ flag, and exit 1 instead of spinning on.
 
 `--json` emits the `decompile-all` document for the one selected function (see
 *The JSON documents* under `decompile-all`), and takes the same record
-selection: `--no-vars` and `--omit line_mappings,variables,types` behave as they
+selection: `--no-vars` and `--omit aliases,line_mappings,variables,types` behave as they
 do there. Without `--json` both are refused, since the C text carries none of
 those collections.
 
@@ -492,6 +499,12 @@ statically linked image turns `ptrace()` into
 prototype passes cannot reach this case: they match a name the *image* carries,
 and a stripped image carries none. An explicit `--assert prototype` on the same
 function still wins.
+
+A name that a call-fixup targets installs that fixup the same way:
+`--define-function 0x6519c0=__ftol2_sse` makes each `fld …; call 0x6519c0` a plain
+`(int)(…)` conversion of its x87 operand. On a PE32 i386 image kuna already
+recognizes the MSVC `__ftol` family by its bytes, so this is only needed for a
+helper build it does not know.
 
 A declared `end` that cuts real control flow is reported rather than silently
 truncating the body: the function carries a `// warn: Function flows out of bounds`
@@ -933,7 +946,7 @@ engine's own reason.
 $ kuna decompile ./a.out --addr 0x13c9 --assert 'flow 0x1405 call'; echo "exit $?"
 int sub_13c9(void)
 ...
-error: --assert "flow 0x1405 call" refused by the pipeline: Could not apply flowoverride (the C below was produced WITHOUT it)
+error: --assert "flow 0x1405 call" refused by the pipeline: Could not apply flowoverride (the C below does not show it)
 exit 1
 ```
 
@@ -974,11 +987,13 @@ other thirty-nine to one stale name — and `--assert-strict` makes any rejectio
 exit non-zero.
 
 `"fatal": true` is the exception, and it exits non-zero on its own. It marks a
-directive kuna accepted and then **refused while applying it** — today a `flow`
-override the flow-follower could not apply. A rename that did not bind leaves a
-correct body one annotation short and you can see which; a refused flow override
-leaves C that describes a different control-flow graph than the one you asked for
-and looks exactly like the C you wanted, so it is reported as the run's verdict.
+directive kuna accepted and then **refused while applying it**. A rename that never
+bound leaves a correct body one annotation short and you can see which. A refused
+`flow` override leaves C that describes a different control-flow graph than the one
+you asked for and looks exactly like the C you wanted. A `name` or `type` that bound
+but whose local the replayed C does not then declare under that name or with that
+type leaves C that may already be reshaped by it, under the names you meant to
+replace. Both are reported as the run's verdict.
 
 **Order matters, and so does scoping.** Directives are applied in the order given:
 `type v2 char[16]` then `name v2 credbuf` retypes and then renames, where the
@@ -1811,24 +1826,27 @@ what `--omit variables` below is for.
 **`--omit KEY[,KEY]...`** (repeatable, `decompile-all --json` and
 `decompile --json`) leaves whole collections out of every record, for a caller
 that wants the function's identity, `code` and `error` and not the rest. The keys
-are `line_mappings`, `variables` and `types`; `variables` also withholds
-`stack_objects`, which `--no-vars` already ties to it. An omitted key is absent
-from every record, not emptied, and the document says which ones in a top-level
+are `aliases`, `line_mappings`, `variables` and `types`; `variables` also withholds
+`stack_objects`, which `--no-vars` already ties to it. `aliases` is for an entry
+exported under many names: the record keeps its primary `name` and address, and
+`kuna functions --json` (which takes no `--omit`) still lists every alias. An
+omitted key is absent from every record, not emptied, and the document says which
+ones in a top-level
 `omitted` array, in record order. `variables: []` therefore still means a function
 whose variables were examined and none reported, and an absent `stack_objects`
 with no `omitted` still means none were recovered. A document that omits nothing
 has no `omitted` key, so the default document is unchanged. The run-level
 `language`, `count`, `error` and `assertions` and each record's `name`,
-`address`, `address_hex`, `aliases`, `object_location`, `size`, `code`, `error`
-and `unstructured_gotos` (and `interior_to` and `declared`, where they apply) are
+`address`, `address_hex`, `object_location`, `size`, `code`, `error` and
+`unstructured_gotos` (and `interior_to` and `declared`, where they apply) are
 always present;
 `code` and the exit status are what they are without the flag. An unknown key
 exits 2.
 
 ```bash
-kuna decompile ./fixture audit_many --json --omit line_mappings,variables,types
+kuna decompile ./fixture audit_many --json --omit aliases,line_mappings,variables,types
 #   {"binary": "./fixture", "language": "c-language",
-#    "omitted": ["line_mappings", "variables", "types", "stack_objects"],
+#    "omitted": ["aliases", "line_mappings", "variables", "types", "stack_objects"],
 #    "count": 1, "error": null,
 #    "functions": [{"name": "audit_many", ..., "code": "void audit_many(void) ...",
 #                   "error": null, "unstructured_gotos": 0}],
@@ -1840,10 +1858,12 @@ The line mappings and the variables' `line_numbers`/`addresses` come from a seco
 markup render of each function, which runs unless both `line_mappings` and the
 variables (`--omit variables` or `--no-vars`) are left out; `--omit variables`
 skips the variable and stack-object extraction, as `--no-vars` does. For one
-x86-64 function of 500 volatile stores, omitting all three takes the document
-from 75,234 bytes to 22,603 (its C is 21,623). Over 24 decbench binaries
-(3,830 functions) the whole-binary document shrinks to 18% of its default size,
-and a whole-binary run of `cmp` or `ln` takes 3-6% less time.
+x86-64 function of 500 volatile stores, omitting `line_mappings`, `variables` and
+`types` takes the document from 75,234 bytes to 22,603 (its C is 21,623). Over 24
+decbench binaries (3,830 functions) the whole-binary document shrinks to 18% of its
+default size, and a whole-binary run of `cmp` or `ln` takes 3-6% less time. For a
+two-instruction function exported under 600 names of 177 bytes each, those three
+leave 114,080 bytes, and adding `aliases` takes it to 836 (its C is 217).
 
 `types` is the layout side of the same record: one object per composite, enum or
 typedef the function's C names, carrying its name, its definition text (the same
@@ -1956,7 +1976,9 @@ Behaviors specific to `decompile-all`:
   where the wider inventory is the point; a single-function request that already
   named its function gains nothing from it. (The gap was invisible under the
   default `auto` policy below 500 KiB, which resolves to `aggressive` and names
-  all three options itself.)
+  all three options itself.) The injected `aif on` is the byte-granular gap
+  cursor; `aggressive` sets `aif strict`, the aligned one, and an explicit
+  `--option aif on` after it replaces `strict` by last-write precedence.
   `kuna functions` shares the **discovery** half of that policy (DIV-68): on a
   non-x86-64 binary it injects `funcstart_patterns on`, `aif on`, and the
   `listing on` those two are gated behind, so the inventory always contains every
@@ -4295,8 +4317,79 @@ and is passed to the `decomp_dbg` subprocess through `KUNA_DYLD_IMAGE`. The
 console spells it `option dyldimage NAME`, given before `load file`; it is
 accepted before any image is loaded.
 
+## `kuna fid` — function identification by fingerprint
+
+`kuna fid build <lib.a|*.o ...> -o <out.fid> --lang <id> --cspec <id>` writes a kuna
+`.fid` database of FID fingerprints; `--option listing on --option fid on` with the
+`kuna_fid_db` environment variable naming it renames matching stripped functions
+(see `docs/options.md`, option `fid`). Use `--option fid strict` to require
+the same record to match the specific hash and code-unit count as well. Strict
+mode can reject correct matches, and both modes leave multi-name buckets
+unresolved. The specific hash includes operand values that change between
+links, so strict suits a database built from the same link as the target;
+against a `libc.a` database it keeps only a few percent of the correct names.
+A name strict declines still counts against a different FLIRT name at that
+address.
+
+### Build a FID database
+
+When an input symbol has a nonzero size, `kuna fid build` clips its linear
+decode to that size and the next function entry. ARM32 Thumb function symbols
+are decoded in Thumb mode at their even address. Symbols without a size retain
+the next-entry approximation. Rebuilding an older database can change its
+records because trailing padding is no longer included; existing databases
+remain readable, but need rebuilding to benefit from the new extents.
+
+### `kuna fid query` — candidates for an address, without renaming
+
+`kuna fid query <binary> --db <file.fid> --addr <address> [--addr <address> ...] --json`
+reports full-hash candidates without renaming. Addresses are hex, `0x` optional.
+The kuna `.fid` database language must match the binary; Ghidra `.fidbf` is not
+supported.
+
+For one address, the JSON root contains `binary`, `database`, `requested_address`,
+`address`, `entry_source`, `instruction_boundary`, `identity_verified`, `status`
+and `candidates`. `requested_address` is the input; for an ARM32 Thumb pointer
+`address` has its low bit cleared. `entry_source` is `discovered` when the initial
+Listing already has a function there, or `user_supplied` when the query adds it.
+`instruction_boundary` is `instruction_start`, `inside_instruction`, `undecoded`,
+or `non_executable`, according to the initial Listing. These are analysis facts,
+not proof that the address is a function entry.
+
+Status `single_candidate` means the full-hash bucket has one distinct name;
+`ambiguous` means multiple names and `no_match` an empty bucket. These three also
+carry `database_format` (`kuna_fid`), `language`, `match_basis` (`full_hash`) and
+the function's own `full_hash`, `specific_hash` and `code_unit_size`; each candidate
+is `{name, specific_hash, specific_hash_matches, code_unit_size, code_unit_size_matches}`, sorted by name.
+`identity_verified` is always false: even a single candidate can be wrong, and
+functions whose masked bodies are identical share a bucket, so one name can be
+reported at several addresses. Specific hashes are reported for comparison and do
+not decide the match. The result summarizes their agreement as
+`specific_hash_evidence`: `matching_candidate`, `no_candidate_matches`, or
+`no_candidates`. `unavailable` includes a `reason`, such as `too_short` (fewer
+code units than FID hashes), `mask_failed` (an instruction did not decode) or
+`decode_context_mismatch` (the ARM32 decode context no longer reproduced the
+Listing). Malformed or incompatible input is an error.
+
+For multiple addresses the root is `{binary, database, queries}`; `queries`
+contains results in input order, including duplicate addresses. An address that
+cannot be queried has `status: "error"` and a `reason`; a database or binary
+error fails the command. One address retains the single-result JSON shape. The
+input and database are loaded once, and discovered functions share the Listing.
+Other addresses get separate Listings, and each query uses a scoped decode
+context to avoid changing another result; each such address therefore costs one
+more walk of the whole image. The query's Listing is seeded from the container
+alone, so `kuna functions` can name entries it reports as `user_supplied`. The
+Listing uses a contiguous-entry approximation and does not account for
+relocations; relocatable query targets are unsupported.
+
+Exit codes: `0` the document was written (whatever each `status`); `1` the binary
+or database could not be read or loaded (a relocatable object included), the
+database language differs, or the single queried address is not a decodable
+entry; `2` a malformed command line, with the usage block.
+
 ## Everything else
 
-`kuna modes` (list the option presets) and `kuna fid` (function identification) also
-exist, plus minor flags not covered here (`--no-vars`, `--raw`, `--regions`, `--timeout`,
-…) — ask the command itself with `kuna <subcommand> --help`.
+`kuna modes` (list the option presets) also exists, plus minor flags not covered
+here (`--no-vars`, `--raw`, `--regions`, `--timeout`, …) — ask the command itself
+with `kuna <subcommand> --help`.
