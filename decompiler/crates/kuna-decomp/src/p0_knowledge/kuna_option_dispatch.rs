@@ -130,6 +130,11 @@ kuna_options! { self, p1;
         crate::kuna_fpuemu::apply(self);
         Ok(msg)
     },
+    "mzdgroup" => {
+        let msg = on_off!(mz_dgroup_on, "MS-DOS data segment in DS");
+        crate::kuna_mzdgroup::apply(self);
+        msg
+    },
     "syscallregs" => {
         let (mode, msg) = crate::kuna_syscallregs::OptionSyscallRegs.apply(p1)?;
         self.syscall_regs = mode;
@@ -160,6 +165,7 @@ kuna_options! { self, p1;
         self.field_type = val;
         Ok(msg)
     },
+    "chkstkdarwin" => on_off!(chkstk_darwin, "Darwin stack-probe call removal"),
     "tailcalljump" => {
         let (jumps, tables, msg) = crate::kuna_tailcalljump::tail_call_mode(p1)?;
         self.tail_call_jumps = jumps;
@@ -190,8 +196,16 @@ kuna_options! { self, p1;
         self.be_join = mode;
         Ok(msg)
     },
+    "octeoneffects" => {
+        let (mode, msg) = crate::kuna_octeoneffects::OcteonEffectsMode::parse(p1)?;
+        self.octeon_effects = mode;
+        Ok(msg)
+    },
     "bejoinpass" => {
         let (mode, msg) = crate::kuna_bejoinpass::BeJoinPassMode::parse(p1)?;
+        if mode != self.be_join_pass {
+            self.kuna_wide.forget_verdicts();
+        }
         self.be_join_pass = mode;
         Ok(msg)
     },
@@ -210,6 +224,7 @@ kuna_options! { self, p1;
         self.go_bool = mode.as_u8();
         Ok(msg)
     },
+    "gonewtype" => on_off!(go_new_type, "Go newobject result typing"),
     "rustprobestack" => {
         let (mode, msg) = crate::kuna_rustprobestack::parse_mode(p1).map_err(KunaError::parse)?;
         self.rust_probestack = mode;
@@ -338,6 +353,11 @@ kuna_options! { self, p1;
         let (val, msg) =
             crate::p6_variables::kuna_castobject::OptionCastObject.apply(p1)?;
         self.cast_object = val;
+        Ok(msg)
+    },
+    "calleeargs" => {
+        let (val, msg) = crate::p4_calls::kuna_calleestackargs::OptionCalleeArgs.apply(p1)?;
+        self.kuna_calleeargs = val;
         Ok(msg)
     },
     "argclobber" => {
@@ -646,6 +666,20 @@ kuna_options! { self, p1;
         Ok(msg)
     },
     "callerptr" => on_off!(caller_ptr, "Caller pointer-class parameter typing"),
+    "calleereginputs" => {
+        let (on, custom) = match p1.trim().to_ascii_lowercase().as_str() {
+            "custom" => (true, true),
+            "" | "on" => (true, false),
+            "off" => (false, false),
+            _ => return Err(KunaError::parse("Must specify off, on or custom")),
+        };
+        self.callee_reginputs = on;
+        self.callee_reginputs_custom = custom;
+        Ok(format!(
+            "Callee register-input call models set to {}",
+            if custom { "custom" } else if on { "on" } else { "off" }
+        ))
+    },
     "callbacktype" => {
         let (mode, msg) = crate::kuna_callbacktype::OptionCallbackType.apply(p1)?;
         self.callbacktype = mode;
@@ -659,6 +693,7 @@ kuna_options! { self, p1;
     },
     "noreturn_known" => on_off!(analysis_noreturn_known, "No-return-known analysis pass"),
     "libgccsigs" => on_off!(analysis_libgccsigs, "libgcc __divdi3 DI-mode contract"),
+    "gotypeglobals" => on_off!(analysis_go_type_globals, "Go type-descriptor globals"),
     "libctypes" => {
         use crate::kuna_libctypes::LibcTypesLayout;
         let layout = match p1.trim().to_ascii_lowercase().as_str() {
@@ -798,6 +833,28 @@ kuna_options! { self, p1;
         Ok(format!("symbol-name character sanitizing set to {}", mode.as_str()))
     },
     "dwarf" => on_off!(analysis_dwarf, "DWARF recovery analysis pass"),
+    "cvftrace" => {
+        let (names, lines) = match p1.trim().to_ascii_lowercase().as_str() {
+            "on" | "1" | "true" => (true, false),
+            "lines" => (true, true),
+            "off" | "0" | "false" => (false, false),
+            other => {
+                return Err(KunaError::lowlevel(format!(
+                    "cvftrace: expected `on`, `lines` or `off`, got `{other}`"
+                )))
+            }
+        };
+        self.analysis_cvftrace = names;
+        self.analysis_cvftrace_lines = lines;
+        Ok(format!(
+            "CVF .trace routine names turned {}",
+            match (names, lines) {
+                (false, _) => "off",
+                (true, false) => "on",
+                (true, true) => "on, with source-line comments",
+            }
+        ))
+    },
     "dwarf_lines" => {
         on_off!(analysis_dwarf_lines, "DWARF .debug_line source-line comment pass")
     },
@@ -831,19 +888,27 @@ kuna_options! { self, p1;
     "noreturn_reach" => {
         on_off!(analysis_noreturn_reach, "CFG-reachability no-return rule (Ghidra targetOnlyCallsNoReturn)")
     },
-    "fid" => on_off!(analysis_fid, "FID fingerprint matcher Listing consumer"),
+    "fid" => {
+        let (enabled, strict) = match p1 {
+            "off" => (false, false),
+            "" | "on" => (true, false),
+            "strict" => (true, true),
+            _ => return Err(KunaError::parse("fid expects on, off, or strict")),
+        };
+        self.analysis_fid = enabled;
+        self.analysis_fid_strict = strict;
+        let state = if strict { "strict" } else if enabled { "on" } else { "off" };
+        Ok(format!("FID fingerprint matcher set to {state}"))
+    },
+    "flirt" => on_off!(analysis_flirt, "FLIRT signature matcher Listing consumer"),
     "rtti" => on_off!(analysis_rtti, "MSVC RTTI / vftable class-name recovery pass"),
     "itaniumrtti" => {
         on_off!(analysis_itaniumrtti, "Itanium (GCC/Clang) RTTI / vtable recovery pass")
     },
     "aif" => {
-        on_off!(analysis_aif, "Aggressive Instruction Finder gap-walk Listing consumer")
-    },
-    "aifstrict" => {
-        on_off!(analysis_aifstrict, "AIF gap-cursor aligned slide (GH-299)")
-    },
-    "aifcorroborate" => {
-        on_off!(analysis_aifcorroborate, "AIF accept corroboration test (GH-313)")
+        let (mode, msg) = crate::kuna_aif::parse_aif_mode(p1)?;
+        self.analysis_aif = mode;
+        Ok(msg)
     },
     "aifpoolslide" => {
         on_off!(analysis_aifpoolslide, "AIF literal-pool candidate slide (GH-299)")
