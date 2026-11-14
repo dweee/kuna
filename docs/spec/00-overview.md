@@ -303,16 +303,20 @@ Four front-ends drive one engine assembly:
   which renders its one function through the same serializer
   (`decompiler/crates/kuna-cli/src/decompile_all.rs (result_json)`). A caller can
   narrow it with `--omit` (`decompiler/crates/kuna-cli/src/decompile_all/omit.rs`):
-  each named collection (`line_mappings`, `variables` with `stack_objects`,
-  `types`) is absent from every record and listed in a top-level `omitted`, so
-  absence is never read as an examined empty collection; a document that omits
+  each named collection (`aliases`, `line_mappings`, `variables` with
+  `stack_objects`, `types`) is absent from every record and listed in a
+  top-level `omitted`, so absence is never read as an examined empty
+  collection; a document that omits
   nothing carries no `omitted` key and is byte-identical to one rendered without
   the flag. The omission reaches the decompile loop, not just the serializer:
   `--omit variables` skips the variable and stack-object extraction exactly as
   `--no-vars` does, and the markup render behind the line mappings and the
   variables' line evidence (`print_c_with_provenance`) runs only when one of the
   two is still wanted (`decompile_all.rs (Args::wants_provenance)`). `code` is
-  the plain render in every case, so it does not change.
+  the plain render in every case, so it does not change. `aliases` names no
+  decompile work: the list is an inventory fact gathered at load time, so
+  omitting it only shrinks the record of an entry exporting hundreds of names,
+  which keeps its primary `name` and address.
 
   The full callable-symbol inventory these surfaces share is
   `decompiler/crates/kuna-console/src/engine.rs (ConsoleProgram::function_entries_canonical)`,
@@ -1796,7 +1800,18 @@ asks the ledger which names have been superseded and decompiles again, once,
 exactly the results that spell one. The default callee-first order
 (`protoorder`, chapter [04](04-calls-and-prototypes.md)) runs the same sweep at
 its end, in its own plan order
-(`decompiler/crates/kuna-cli/src/decompile_all/callee_first.rs (converge_callee_first)`).
+(`decompiler/crates/kuna-cli/src/decompile_all/callee_first.rs (converge_callee_first)`),
+and within a budget: a redo costs what the function's first decompile cost, so
+the redos are admitted shortest first, charged the lines each first body
+printed, up to 5% of what the whole first pass printed or 2,000 lines,
+whichever is more
+(`decompiler/crates/kuna-cli/src/decompile_all/callee_first.rs (STRUCT_SWEEP_BUDGET_PCT)`),
+and a body of at most 32 lines is always admitted. A function the budget does
+not reach keeps its first body, whose superseded structure is still defined and
+still answers for it. Every other binary measured redoes under 2,000 lines, so
+the budget reaches only outliers: an AutoIt-compiled 1.2 MB image names
+superseded `this` records in 37 bodies of about 1,500 lines, the interior
+entries of one interpreter routine, and redoing them took a fifth of its run.
 
 (kuna) **A result read from a `void` function.** After each function of the
 callee-first plan, the driver decompiles again every function recovered `void`
@@ -3403,7 +3418,9 @@ and an agent writes:
 - **The Override store** (`decompiler/crates/kuna-decomp/src/p0_knowledge/overrides.rs
   (Override)`): per-function commands that override pipeline decisions — flow
   reclassification, direct-call redirects, prototype replacement, multistage
-  jump-table requests, dead-code delays, forced gotos. Its defining property is
+  jump-table requests, dead-code delays, forced gotos, and (kuna) per-call-site
+  output type locks (`insert_output_typelock`, applied by the P5
+  `sitetypelock` action — chapter 05). Its defining property is
   that it **survives `Funcdata::clear`**
   (`decompiler/crates/kuna-decomp/src/substrate/funcdata.rs (clear)` resets the
   arenas and analysis state but not the override store): a mid-pipeline pass that
