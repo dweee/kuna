@@ -3178,19 +3178,15 @@ fn a_float_register_parameter_round_trips() {
             assert!(stdout.contains(want), "{tag}: missing `{want}`:\n{stdout}");
         }
         let printed = printed_functions(&stdout, &["sink ", "negsink ", "iget3 ", "use ", "k3b "]);
-        let global = printed
-            .lines()
-            .find_map(|l| l.trim().strip_prefix("return ").and_then(|r| r.strip_suffix(';')).filter(|g| g.starts_with("dat_")))
-            .unwrap_or_else(|| panic!("{tag}: iget3 returns no global:\n{printed}"));
         let constants: String = printed
             .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-            .filter(|w| w.starts_with("dat_") && *w != global)
+            .filter(|w| w.starts_with("dat_"))
             .map(|w| format!("const float {w} = 2.0f;\n"))
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
             .collect();
         let src = format!(
-            "#include <stdio.h>\n#include <string.h>\n{BITS}unsigned int {global} = 0x40490fdbu;\n{constants}{printed}\n\
+            "#include <stdio.h>\n#include <string.h>\n{BITS}int gj = 0x40490fdb;\n{constants}{printed}\n\
              int main(void) {{\n  unsigned p[2] = {{0, 0x3fc00000u}};\n  float o[2] = {{0}}, q = 0;\n  int k = 0;\n  \
              negsink((void *)p, o);\n  k3b((void *)&k, &q);\n  \
              printf(\"%llx %llx %d %llx\\n\", BITS(o[0]), BITS(o[1]), k, BITS(q));\n  return 0;\n}}\n"
@@ -3612,13 +3608,15 @@ fn a_float_return_beside_a_global_read_stays_an_integer() {
 /// The entry hands `f`'s `eax` to `ExitProcess`, so `f` is decompiled again to
 /// return it, and that decompile restarts once its second indirect call
 /// resolves to `ExitProcess`. On its one returning path `f` returns the handle
-/// the comparison also reads: `return -1;`. Patched to also load through the
-/// handle on that path (`je` to a `mov ecx,[eax]` the `ExitProcess` path jumps
-/// over), the pass before the restart returned `eax`, joined with what the
-/// unresolved call left, and the pass after it refused the handle; the first
-/// pass's output survived as `int sub_401020(..)` around a bare `return;`, and
-/// the function must be `void` again. No function that declares a return type
-/// prints a bare `return;`.
+/// the comparison also reads, the `INVALID_HANDLE_VALUE` bits `0xffffffff`.
+/// The restart starts from the prototype the function was given, as upstream's
+/// `Funcdata::clear` does, so the return type is what the restarted pass
+/// recovers (`unsigned int`), not the first pass's. Patched to also load
+/// through the handle on that path (`je` to a `mov ecx,[eax]` the
+/// `ExitProcess` path jumps over), the pass before the restart returned `eax`,
+/// joined with what the unresolved call left, and the pass after it refused
+/// the handle: the function must be `void`. No function that declares a return
+/// type prints a bare `return;`.
 #[test]
 fn a_return_refused_after_a_restart_leaves_the_function_void() {
     let fixture = repo_root().join("decompiler/crates/kuna-analysis/tests/fixtures/floatret_restart_pe_i386.exe");
@@ -3636,7 +3634,10 @@ fn a_return_refused_after_a_restart_leaves_the_function_void() {
         printed_functions(&stdout, &["sub_401020 "])
     };
     let printed = decompile(fixture.to_str().unwrap());
-    assert!(printed.contains("int sub_401020(unsigned int a0)") && printed.contains("return -1;"), "{printed}");
+    assert!(
+        printed.contains("unsigned int sub_401020(unsigned int a0)") && printed.contains("return 0xffffffff;"),
+        "{printed}"
+    );
 
     let mut image = std::fs::read(&fixture).unwrap();
     let at = |image: &[u8], pattern: &[u8]| image.windows(pattern.len()).position(|w| w == pattern).unwrap();
@@ -6621,12 +6622,12 @@ int main(void) {
             ALL,
             want.as_str(),
             &[
-                ("\n  unsigned int v1; // stack - 0x14\n  \n  if (waitpid(a0,(int *)&v1,0) <= -1)",
-                 "\n  int v1; // stack - 0x14\n  \n  if (waitpid(a0,&v1,0) <= -1)"),
-                ("    return (int)v1 >> 8 & 0xff;", "    return v1 >> 8 & 0xff;"),
-                ("\n  unsigned int v1; // stack - 0x14\n  \n  v1 = a0;\n  waitpid(0x7ffffff0,(int *)&v1,1);",
-                 "\n  int v1; // stack - 0x14\n  \n  v1 = a0;\n  waitpid(0x7ffffff0,&v1,1);"),
-                ("(int)v1 >> 8 & 0xff : (int)v1 >> 0x14;", "v1 >> 8 & 0xff : v1 >> 0x14;"),
+                ("\n  unsigned int stat_loc; // stack - 0x14\n  \n  if (waitpid(a0,(int *)&stat_loc,0) <= -1)",
+                 "\n  int stat_loc; // stack - 0x14\n  \n  if (waitpid(a0,&stat_loc,0) <= -1)"),
+                ("    return (int)stat_loc >> 8 & 0xff;", "    return stat_loc >> 8 & 0xff;"),
+                ("\n  unsigned int stat_loc; // stack - 0x14\n  \n  stat_loc = a0;\n  waitpid(0x7ffffff0,(int *)&stat_loc,1);",
+                 "\n  int stat_loc; // stack - 0x14\n  \n  stat_loc = a0;\n  waitpid(0x7ffffff0,&stat_loc,1);"),
+                ("(int)stat_loc >> 8 & 0xff : (int)stat_loc >> 0x14;", "stat_loc >> 8 & 0xff : stat_loc >> 0x14;"),
             ],
             UNCHANGED,
         ),
@@ -6635,14 +6636,14 @@ int main(void) {
             ALL,
             want.as_str(),
             &[
-                ("\n  unsigned int v1; // stack - 0x14", "\n  int v1; // stack - 0x14"),
-                ("if (0 <= waitpid(a0,(int *)&v1,0)) {", "if (0 <= waitpid(a0,&v1,0)) {"),
-                ("  waitpid(0x7ffffff0,(int *)&v1,1);\n  v3 = (v1 & 0x7f) ? (int)v1 >> 8",
-                 "  waitpid(0x7ffffff0,&v1,1);\n  v3 = (v1 & 0x7f) ? v1 >> 8"),
+                ("\n  unsigned int stat_loc; // stack - 0x14", "\n  int stat_loc; // stack - 0x14"),
+                ("if (0 <= waitpid(a0,(int *)&stat_loc,0)) {", "if (0 <= waitpid(a0,&stat_loc,0)) {"),
+                ("  waitpid(0x7ffffff0,(int *)&stat_loc,1);\n  v3 = (stat_loc & 0x7f) ? (int)stat_loc >> 8",
+                 "  waitpid(0x7ffffff0,&stat_loc,1);\n  v3 = (stat_loc & 0x7f) ? stat_loc >> 8"),
             ],
             UNCHANGED,
         ),
-        ("castobject_gcc_O2_x86_64", ALL, want.as_str(), &[("(int *)&v1", "(int *)&v1")], EVERY),
+        ("castobject_gcc_O2_x86_64", ALL, want.as_str(), &[("(int *)&stat_loc", "(int *)&stat_loc")], EVERY),
         ("castobject_clang_O2_x86_64", CLANG_O2, want_clang_o2.as_str(), &[], &EVERY[5..]),
     ];
     let sp = specs();
