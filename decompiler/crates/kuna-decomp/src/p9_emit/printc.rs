@@ -1564,7 +1564,14 @@ pub struct PrintC {
     /// as one `// slug, slug` end-of-line comment by
     /// [`flush_eol_warnings`](PrintC::flush_eol_warnings) at the owning line's
     /// last token (statement `;`, `if (cond) {` header, prototype, ...).
-    pub(crate) eol_warns: Vec<(String, std::rc::Rc<kuna_base::space::AddrSpace>, u64)>,
+    pub(crate) eol_warns: Vec<(
+        String,
+        std::rc::Rc<kuna_base::space::AddrSpace>,
+        u64,
+        Option<crate::kuna_functionwarnings::Warning>,
+    )>,
+    /// The analysis warnings the last plain render wrote, positioned in its text.
+    warnings: Vec<crate::kuna_functionwarnings::Warning>,
     /// Per-document spelling for a local HighVariable whose recovered name
     /// collides in the C function scope. Body references consume the same map.
     local_name_overrides: std::collections::HashMap<crate::context::HighVariableId, String>,
@@ -1580,6 +1587,7 @@ pub struct PrintC {
     local_name_standalones: std::collections::HashSet<crate::context::HighVariableId>,
     /// (kuna) The locals the last document declared, as [`DeclaredLocal`]s.
     declared_locals: Vec<DeclaredLocal>,
+    declared_local_index: std::collections::HashMap<crate::context::HighVariableId, usize>,
     /// (kuna) The entry of the function the last document printed.
     declared_entry: Option<Address>,
     /// Final C declarations, including storage and symbol overrides.
@@ -1636,6 +1644,7 @@ impl PrintC {
             rt_ctx: RealTypeCtx::OFF,
             out_lang: crate::kuna_lang::OutLang::C,
             eol_warns: Vec::new(),
+            warnings: Vec::new(),
             local_name_overrides: std::collections::HashMap::new(),
             indirect_input_aliases: std::collections::HashSet::new(),
             signature_param_names: std::collections::HashMap::new(),
@@ -1643,6 +1652,7 @@ impl PrintC {
             local_name_aliases: std::collections::HashMap::new(),
             local_name_standalones: std::collections::HashSet::new(),
             declared_locals: Vec::new(),
+            declared_local_index: Default::default(),
             declared_entry: None,
             pointer_decls: crate::kuna_pointerargs::Declarations::default(),
             record_pointer_arguments: false,
@@ -1977,6 +1987,7 @@ impl PrintC {
         self.clear_rpn();
         self.emit_fd = None;
         self.eol_warns.clear();
+        self.warnings.clear();
         self.void_tail_return = None;
         self.stmt_op = None;
         self.label_names.clear();
@@ -1987,6 +1998,7 @@ impl PrintC {
         self.local_name_aliases.clear();
         self.local_name_standalones.clear();
         self.declared_locals.clear();
+        self.declared_local_index.clear();
         self.declared_entry = None;
         self.pointer_decls.clear();
         self.record_pointer_arguments = false;
@@ -2437,6 +2449,23 @@ impl PrintC {
         Some(record)
     }
 
+    /// The analysis warnings the last plain render, whose text was `untrimmed`,
+    /// wrote, positioned against that text with its leading newlines removed.
+    pub fn take_warnings(&mut self, untrimmed: &str) -> Vec<crate::kuna_functionwarnings::Warning> {
+        let mut warnings = std::mem::take(&mut self.warnings);
+        crate::kuna_functionwarnings::trim_lines(&mut warnings, untrimmed);
+        warnings
+    }
+
+    /// Record `warning` on the line of the comment `token` just written; a
+    /// markup pass records nothing.
+    fn record_warning(&mut self, mut warning: crate::kuna_functionwarnings::Warning, token: &str) {
+        if let PrintEmit::NoMarkup(emit) = &mut self.emit {
+            warning.line = emit.position().line - token.matches('\n').count();
+            self.warnings.push(warning);
+        }
+    }
+
     /// C++ `PrintC::docFunction` (printc.cc:2790), transcribed faithfully and
     /// driven over a real [`Funcdata`] + [`Architecture`]: emit the signature
     /// shell (real return type from the recovered proto), then the **structured
@@ -2618,9 +2647,13 @@ impl PrintC {
         self.local_name_aliases.clear();
         self.local_name_standalones.clear();
         self.declared_locals.clear();
+        self.declared_local_index.clear();
         self.declared_entry = Some(fd.get_address().clone());
         self.pointer_decls.clear();
         self.begin_pointer_record(fd);
+        if !self.emit.emits_markup() {
+            self.warnings.clear();
+        }
         // (kuna `signedness`) Round the declared signedness of this function's
         // integer locals from the operations applied to them.  Computed before
         // any declaration is written and consumed by
@@ -2721,13 +2754,13 @@ impl PrintC {
             // a pipeline failure (the driver stamped its reason), NOT structuring
             // declining on analyzed IR.
             self.emit.tag_line();
-            let text = match fd.kuna_pipeline_failure() {
-                Some(reason) => format!("/* WARNING: decompilation failed: {reason} */"),
-                None => {
-                    "/* WARNING: structured blocks unavailable (structuring declined) */".to_string()
-                }
+            let warning = match fd.kuna_pipeline_failure() {
+                Some(reason) => format!("WARNING: decompilation failed: {reason}"),
+                None => "WARNING: structured blocks unavailable (structuring declined)".to_string(),
             };
+            let text = format!("/* {warning} */");
             self.emit.print(&text, SyntaxHighlight::CommentColor);
+            self.record_warning(crate::kuna_functionwarnings::Warning::new(None, &warning), &text);
         }
         // (kuna warnstyle, DIV-39) drain any slug still pending from a
         // construct with no closer flush point onto the last body line, so no
@@ -3105,18 +3138,16 @@ impl PrintC {
         for text in headers {
             // (kuna warnstyle, DIV-39) Inline mode: header warnings collect as
             // slugs and flush at the end of the prototype line.
+            let warning = crate::kuna_functionwarnings::Warning::new(Some(off), &text);
             if self.options.warn_inline {
-                self.eol_warns.push((warning_slug(&text), std::rc::Rc::clone(&space), off));
+                self.eol_warns.push((warning_slug(&text), std::rc::Rc::clone(&space), off, Some(warning)));
                 continue;
             }
             // emitLineComment(0, comm): a fresh line then the `/* text */` token.
             self.emit.tag_line();
-            self.emit.tag_comment(
-                &format!("/* {text} */"),
-                SyntaxHighlight::CommentColor,
-                &space,
-                off,
-            );
+            let token = format!("/* {text} */");
+            self.emit.tag_comment(&token, SyntaxHighlight::CommentColor, &space, off);
+            self.record_warning(warning, &token);
         }
     }
 
@@ -3746,6 +3777,7 @@ impl PrintC {
             if array_count.is_none() {
                 self.cast_implied.record_local(*high, name, format!("{decl_type}{decl_back}"));
             }
+            self.declared_local_index.entry(*high).or_insert(self.declared_locals.len());
             self.declared_locals.push(DeclaredLocal {
                 high: *high,
                 base: base_names.get(high).cloned().unwrap_or_else(|| name.clone()),
@@ -3881,7 +3913,7 @@ impl PrintC {
     /// its own, or the one it was collapsed into.
     pub fn declared_local(&self, high: crate::context::HighVariableId) -> Option<&DeclaredLocal> {
         let owner = self.local_name_aliases.get(&high).copied().unwrap_or(high);
-        self.declared_locals.iter().find(|local| local.high == owner)
+        self.declared_local_index.get(&owner).and_then(|&i| self.declared_locals.get(i))
     }
 
     /// Resolve the emitted spelling of a named HighVariable in this function.
@@ -4497,6 +4529,9 @@ impl PrintC {
             if (instr_comment_type & tp) == 0 {
                 continue;
             }
+            let warning = (tp == ct::WARNING && addr.get_space().is_some()).then(|| {
+                crate::kuna_functionwarnings::Warning::new(Some(addr.get_offset()), &String::from_utf8_lossy(&text))
+            });
             // (kuna warnstyle, DIV-39) Inline mode: a WARNING comment becomes a
             // terse `// slug` collected for the owning line's end; every other
             // comment type keeps the banner-line render.
@@ -4508,12 +4543,16 @@ impl PrintC {
                         warning_slug(&text_str),
                         space,
                         addr.get_offset(),
+                        warning,
                     ));
                     self.commsorter.mark_last_emitted();
                     continue;
                 }
             }
             self.emit_line_comment(-1, &text, &addr);
+            if let Some(warning) = warning {
+                self.record_warning(warning, &String::from_utf8_lossy(&text));
+            }
             // emitLineComment sets comm->setEmitted(true) (printlanguage.cc:655),
             // so a later walk over the same window skips it.
             self.commsorter.mark_last_emitted();
@@ -4535,12 +4574,11 @@ impl PrintC {
         let joined =
             warns.iter().map(|w| w.0.as_str()).collect::<Vec<_>>().join(", ");
         self.emit.spaces(1, 0);
-        self.emit.tag_comment(
-            &format!("// {joined}"),
-            SyntaxHighlight::CommentColor,
-            &space,
-            off,
-        );
+        let token = format!("// {joined}");
+        self.emit.tag_comment(&token, SyntaxHighlight::CommentColor, &space, off);
+        for warning in warns.into_iter().filter_map(|w| w.3) {
+            self.record_warning(warning, &token);
+        }
     }
 
     /// C++ `PrintLanguage::emitLineComment` (printlanguage.cc:596): a fresh line
@@ -5813,7 +5851,11 @@ impl PrintC {
                 self.emit_comment_group(fd, Some(inst));
                 self.emit.tag_line();
             }
-            self.emit_statement(fd, arch, inst);
+            if let Some(last) = self.emit_rust_array_init(fd, arch, inst) {
+                cur = fd.bb_op_next(last);
+            } else {
+                self.emit_statement(fd, arch, inst);
+            }
             // (kuna warnstyle, DIV-39) warnings collected for this statement
             // land after its semicolon — but NEVER inside a comma-separated
             // header (`while (...)` / `for (...)` parens), where an inline
@@ -5955,6 +5997,7 @@ impl PrintC {
             && (crate::p9_emit::kuna_armregistershift::plan_arm_register_lsl(fd, arch, op)
                 .is_some()
                 || crate::p9_emit::kuna_armconstantshift::plan_arm_constant_lsl(fd, arch, op)
+                    .or_else(|| self.fixed64_shift_plan(fd, arch, op))
                     .is_some())
         {
             return false;
@@ -6420,8 +6463,9 @@ impl PrintC {
                 return;
             }
             if tok.print1 == "<<" {
-                if let Some(plan) = crate::p9_emit::kuna_armconstantshift::plan_arm_constant_lsl(fd, arch, op) {
-                    self.emit_arm_constant_lsl(fd, arch, op, plan);
+                if let Some(plan) = crate::p9_emit::kuna_armconstantshift::plan_arm_constant_lsl(fd, arch, op)
+                    .or_else(|| self.fixed64_shift_plan(fd, arch, op)) {
+                    self.emit_constant_lsl(fd, arch, op, plan);
                     return;
                 }
             }
@@ -6564,13 +6608,27 @@ impl PrintC {
         }
     }
 
+    fn printed_operand_type(&self, fd: &Funcdata, vn: VarnodeId, op: OpId) -> std::rc::Rc<crate::dtype::Datatype> {
+        fd.vbank().get(vn).and_then(|v| (!v.is_implied()).then_some(v.get_high()).flatten())
+            .and_then(|high| self.declared_local(high)).and_then(|local| local.ty.clone())
+            .or_else(|| declared_variable_type(fd, vn))
+            .unwrap_or_else(|| fd.vn_type_read_facing(vn, op))
+    }
+
+    fn fixed64_shift_plan(&self, fd: &Funcdata, arch: &Architecture, op: OpId)
+        -> Option<crate::p9_emit::kuna_constantshift::ConstantLslPlan>
+    {
+        crate::p9_emit::kuna_constantshift::plan_fixed64_lsl(fd, arch, op,
+            |vn| self.printed_operand_type(fd, vn, op))
+    }
+
     /// Emit each fixed-shift operand once, converting the shiftee before LSL.
-    fn emit_arm_constant_lsl(
+    fn emit_constant_lsl(
         &mut self,
         fd: &Funcdata,
         arch: &Architecture,
         op: OpId,
-        plan: crate::p9_emit::kuna_armconstantshift::ArmConstantLslPlan,
+        plan: crate::p9_emit::kuna_constantshift::ConstantLslPlan,
     ) {
         if let Some(result_type) = &plan.signed_result_type {
             self.push_cast_open(result_type, op);
@@ -6851,7 +6909,16 @@ impl PrintC {
                 }
                 for i in 1..nin {
                     if let Some(vn) = fd.obank().get(op).and_then(|o| o.get_in(i)) {
-                        self.push_vn_ir(fd, arch, vn, op);
+                        // (kuna kernelbug) a `__WARN(file,line)` line is a decimal.
+                        let line = in0_off == crate::userop::BUILTIN_KERNEL_WARN as u64
+                            && i == nin - 1
+                            && fd.vbank().get(vn).is_some_and(|v| v.is_constant() && v.get_size() == 4);
+                        if line {
+                            let val = fd.vbank().get(vn).map(|v| v.get_offset()).unwrap_or(0);
+                            self.push_constant_ir_fmt_sign(val, 4, op, display_format::FORCE_DEC, false);
+                        } else {
+                            self.push_vn_ir(fd, arch, vn, op);
+                        }
                     }
                 }
             } else {
@@ -9384,27 +9451,25 @@ impl PrintC {
     /// If the bitfield is not at byte offset 0 a PTRSUB must be present accessing
     /// the bitfield storage range; that PTRSUB is skipped and member syntax is
     /// used only when *another* PTRSUB/PTRADD remains underneath
-    /// ([`check_array_deref`](Self::check_array_deref)).
+    /// ([`check_array_deref`](Self::check_array_deref)). Divergence: a PTRSUB
+    /// whose offset falls inside the bitfield's container is skipped as well; it
+    /// reaches part of a container that starts at offset 0, which the C parser
+    /// gives a whole run of bitfields.
     fn check_bit_field_member(&self, fd: &Funcdata, vn: VarnodeId, field: &crate::dtype::TypeBitField) -> bool {
+        let ptrsub = fd
+            .vbank()
+            .get(vn)
+            .and_then(|v| v.get_def())
+            .and_then(|op| fd.obank().get(op))
+            .filter(|o| o.code() == OpCode::CPUI_PTRSUB);
+        let inside = ptrsub
+            .and_then(|o| o.get_in(1))
+            .and_then(|off| fd.vbank().get(off))
+            .is_some_and(|off| (1..field.byte_size as uintb).contains(&off.get_offset()));
         let mut vn = vn;
-        if field.byte_offset != 0 {
-            // Bitfield not at offset 0, a PTRSUB should be present.
-            let v = match fd.vbank().get(vn) {
+        if field.byte_offset != 0 || inside {
+            vn = match ptrsub.and_then(|o| o.get_in(0)) {
                 Some(v) => v,
-                None => return false,
-            };
-            if !v.is_written() {
-                return false;
-            }
-            let op = match v.get_def() {
-                Some(o) => o,
-                None => return false,
-            };
-            if fd.obank().get(op).map(|o| o.code()) != Some(OpCode::CPUI_PTRSUB) {
-                return false;
-            }
-            vn = match fd.obank().get(op).and_then(|o| o.get_in(0)) {
-                Some(v) => v, // Skip this PTRSUB
                 None => return false,
             };
         }
@@ -10590,7 +10655,7 @@ impl PrintC {
             if matches!(ct.get_metatype(), TYPE_PTR | TYPE_PTRREL) {
                 // (kuna `elemptr`) A pointer the rule gave `char *` says the bytes
                 // are indexed, never that they end at a zero byte.
-                if off != 0 && !crate::kuna_elemptr::reaches_element_pointer(fd, vn) {
+                if !v.is_synthetic_literal() && off != 0 && !crate::kuna_elemptr::reaches_element_pointer(fd, vn) {
                     if let Some(sub) = ct.get_ptr_to() {
                         // (kuna `cfstrings`) An entry reads as its string whatever its type.
                         let sub = if sub.is_char_print() { Some(sub) } else { cfstring_char(arch, off) };
@@ -10647,7 +10712,7 @@ impl PrintC {
                     ));
                     return;
                 }
-                if self.out_lang == crate::kuna_lang::OutLang::C
+                if !v.is_synthetic_literal() && self.out_lang == crate::kuna_lang::OutLang::C
                     && self.options.global_ref
                     && ct.get_metatype() == crate::dtype::type_metatype::TYPE_PTR
                     && ct.get_word_size() == Some(1)
@@ -10670,7 +10735,7 @@ impl PrintC {
                         return;
                     }
                 }
-                if let Some(addr) = self.globalref.decide(fd, arch, vn, op, off, &ct) {
+                if let Some(addr) = (!v.is_synthetic_literal()).then(|| self.globalref.decide(fd, arch, vn, op, off, &ct)).flatten() {
                     self.push_global_ref_ir(arch, addr, op, vn);
                     return;
                 }
@@ -13696,6 +13761,9 @@ fn to_emit_hl(hl: crate::printlanguage::SyntaxHighlight) -> SyntaxHighlight {
         Pl::special_color => SyntaxHighlight::SpecialColor,
     }
 }
+
+#[path = "kuna_rustarrayinit.rs"]
+mod kuna_rustarrayinit;
 
 #[cfg(test)]
 mod tests;

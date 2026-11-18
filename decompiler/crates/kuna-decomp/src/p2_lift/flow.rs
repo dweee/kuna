@@ -252,6 +252,11 @@ pub trait FlowEnvironment {
         false
     }
 
+    /// The ISA-mode marker does not change general-register values.
+    fn is_isa_mode_switch(&self, _userop_index: uintb) -> bool {
+        false
+    }
+
     /// Emit the callother-fixup p-code for the \e injected user-op `userop_index`
     /// into `emit`, resolving its parameters against `context` (C++
     /// `FlowInfo::injectUserOp` → `payload->inject(icontext,emitter)` via the
@@ -358,6 +363,14 @@ pub trait FlowEnvironment {
         false
     }
 
+    /// (kuna #1288) Is `op` the CALLIND half of an interrupt that ends an MS-DOS
+    /// program (`INT 20h`, `INT 27h`, `INT 21h` with AH 00h/31h/4Ch)?  Flow ends
+    /// there as after a call to a no-return function.  The default shell reports
+    /// `false`.
+    fn is_dos_exit_callind(&self, _fd: &Funcdata, _op: OpId) -> bool {
+        false
+    }
+
     /// (kuna `msvcsig`) The import slot the CALLIND `op` calls through, when that
     /// slot carries a locked MSVC prototype, so the call is direct from the flow
     /// on. See [`kuna_msvcimportcall`](crate::kuna_msvcimportcall). The default
@@ -385,6 +398,25 @@ pub trait FlowEnvironment {
         _fd: &Funcdata,
         _op: OpId,
     ) -> Option<crate::kuna_int3pad::Int3PadSite> {
+        None
+    }
+
+    /// (kuna) Is `op` the BRANCHIND half of an AArch64 `brk` whose immediate a
+    /// compiler emits for a trap that does not return?  Matched, it becomes a
+    /// no-return halt.  See [`kuna_brktrap`](crate::kuna_brktrap).
+    fn brk_trap(&self, _fd: &Funcdata, _op: OpId) -> Option<crate::kuna_brktrap::BrkTrap> {
+        None
+    }
+
+    /// (kuna) Is `op` the BRANCHIND half of a trap a Linux kernel `__bug_table`
+    /// entry names? Matched, the trap's CALLOTHER and the entry are returned and
+    /// the site prints as `BUG()` or `__WARN(file,line)`. See
+    /// [`kuna_kernelbug`](crate::kuna_kernelbug).
+    fn kernel_bug_site(
+        &self,
+        _fd: &Funcdata,
+        _op: OpId,
+    ) -> Option<(OpId, crate::kuna_kernelbug::KernelBugSite)> {
         None
     }
 
@@ -445,12 +477,71 @@ pub trait FlowEnvironment {
         None
     }
 
+    /// The name a direct call to `entry` prints when no function is known there
+    /// but a processor-spec `<default_symbols>` label outside the default code
+    /// space is (eBPF's helper ids in the `syscall` space): the label names the
+    /// callee, as a Ghidra function created at a labelled address does. Only a
+    /// name: the label makes `entry` no function boundary, so `query_call` stays
+    /// `None` for it.
+    fn query_call_label(&self, _entry: &Address) -> Option<String> {
+        None
+    }
+
     /// (kuna `pltlocal`) The function the PLT stub at a direct-call `entry` is
     /// bound to by the image's own relocations, which the call spec is built at.
     /// The default shell has no loader and reports `None`. See
     /// [`crate::p4_calls::kuna_pltlocal`].
     fn query_call_definition(&self, _entry: &Address) -> Option<Address> {
         None
+    }
+
+    /// The model the register inputs of the function at the direct-call `entry`
+    /// select. See [`crate::p4_calls::kuna_calleereginputs`].
+    fn query_call_register_model(&self, _entry: &Address) -> Option<std::rc::Rc<crate::fspec::ProtoModel>> {
+        None
+    }
+
+    /// The extrapop the returns of the function at the direct-call `entry`
+    /// state. See [`crate::p4_calls::kuna_calleepurge`].
+    fn query_call_extra_pop(&self, _entry: &Address) -> Option<int4> {
+        None
+    }
+
+    /// The stack bytes the caller removes right after the indirect call at
+    /// `call_at`. See [`crate::p4_calls::kuna_calleereginputs`].
+    fn query_callind_cleanup(&self, _call_at: &Address) -> u32 {
+        0
+    }
+
+    /// The stack-argument bytes the function at the direct-call `entry` can
+    /// take at the call at `call_at`. See [`crate::p4_calls::kuna_calleestackargs`].
+    fn query_call_stack_arg_bytes(
+        &self,
+        _entry: &Address,
+        _call_at: &Address,
+    ) -> Option<crate::p4_calls::kuna_calleepurge::StackArgs> {
+        None
+    }
+
+    /// The stack bytes the function at the direct-call `entry` pops, or the
+    /// caller removes after the call at `call_at`, when it states no stack
+    /// extent. See [`crate::p4_calls::kuna_calleestackargs`].
+    fn query_call_stack_window(&self, _entry: &Address, _call_at: &Address) -> Option<u32> {
+        None
+    }
+
+    /// The stack bytes the reached returns of the function at the direct-call
+    /// `entry` pop above the return address, when it states no stack extent.
+    /// See [`crate::p4_calls::kuna_calleestackargs`].
+    fn query_call_return_pop(&self, _entry: &Address) -> Option<u32> {
+        None
+    }
+
+    /// Does the function at the direct-call `entry` move its caller's stack
+    /// pointer (`_chkstk`, `__SEH_prolog4`)? See
+    /// [`crate::p4_calls::kuna_calleestackargs`].
+    fn query_call_moves_stack(&self, _entry: &Address) -> bool {
+        false
     }
 
     /// Does the function at the direct-call `entry` address have its prototype
@@ -464,6 +555,15 @@ pub trait FlowEnvironment {
     /// not run off the end of the function into unmapped bytes.  The W3 shell has
     /// no symbol table and reports `false`.
     fn query_call_no_return(&self, _entry: &Address) -> bool {
+        false
+    }
+
+    /// (kuna `noreturn_known`) Is this one direct call to `entry`, the instruction
+    /// at `call` falling through to `fallthrough`, no-return although the callee
+    /// is not? See
+    /// [`is_proxy_no_return_at`](crate::p4_calls::kuna_calleenoreturn::is_proxy_no_return_at).
+    /// The default shell reports `false`.
+    fn query_call_no_return_at(&self, _entry: &Address, _call: &Address, _fallthrough: &Address) -> bool {
         false
     }
 
@@ -488,6 +588,24 @@ pub trait FlowEnvironment {
     /// consume.  Environments without a safe raw one-instruction probe
     /// conservatively report false and retain the bound.
     fn funcbound_entry_is_unconditional_return(&self, _entry: &Address) -> bool {
+        false
+    }
+
+    /// (kuna `funcboundflow`) How far past the fall-through `next` the
+    /// function's literal pool starts, from the extents the analysis tier
+    /// proved ([`kuna_pool_pad`](crate::kuna_funcboundflow::kuna_pool_pad));
+    /// `None` when none starts within the padding allowance. The default shell
+    /// reports `None`, so no call's fall-through is bounded at a pool.
+    fn funcbound_pool_pad(&self, _next: &Address) -> Option<u64> {
+        None
+    }
+
+    /// (kuna `funcboundflow`) Do the `len` bytes at `addr` decode as instructions
+    /// that do nothing — the alignment padding a compiler can leave between a
+    /// call and the literal pool after it
+    /// ([`kuna_is_padding_run`](crate::kuna_funcboundflow::kuna_is_padding_run))?
+    /// The default shell reports `false`, keeping the fall-through.
+    fn funcbound_padding_run(&self, _addr: &Address, _len: int4) -> bool {
         false
     }
 
@@ -619,6 +737,10 @@ pub struct FlowInfo<'a, E: FlowEnvironment> {
     /// same-space cutoffs was deliberately clipped just like an out-of-range
     /// target; an address before the cutoff remains a genuine missing-op error.
     funcbound_cutoffs: std::collections::BTreeSet<Address>,
+    /// (kuna `funcboundflow`) Is the literal-pool bound live: the gate is on and
+    /// the code space is byte-addressed (a pool word's address is a byte
+    /// address, as the fall-through's is).
+    pool_bound: bool,
     /// Addresses to which there is flow — the work stack (C++ `addrlist`).
     addrlist: Vec<Address>,
     arm_context: bool,
@@ -732,6 +854,7 @@ impl<'a, E: FlowEnvironment> FlowInfo<'a, E> {
         let entry = data.get_address().clone();
         let space = entry.get_space().expect("FlowInfo: entry has no space").clone();
         let baddr = Address::new(space.clone(), 0);
+        let byte_addressed = space.get_word_size() == 1;
         let eaddr = Address::new(space, !0u64);
         // The per-function Override lives on the Funcdata (`localoverride`); the
         // env-routed `has_flow_override` is the W2-era boundary default (always false)
@@ -744,6 +867,7 @@ impl<'a, E: FlowEnvironment> FlowInfo<'a, E> {
             unprocessed: Vec::new(),
             outofbounds: std::collections::BTreeSet::new(),
             funcbound_cutoffs: std::collections::BTreeSet::new(),
+            pool_bound: env.funcbound_flow_enabled() && byte_addressed,
             addrlist: Vec::new(),
             arm_context: env.arm_decode_mode(&entry).is_some(),
             tablelist: Vec::new(),
@@ -1370,6 +1494,15 @@ impl<'a, E: FlowEnvironment> FlowInfo<'a, E> {
                 let branchind = self.env.resolve_typeop(OpCode::CPUI_BRANCHIND);
                 self.data.op_set_opcode(curop, branchind);
             }
+            if crate::kuna_returnbranch::computed_target(
+                &self.data,
+                curop,
+                &self.visited,
+                |index| self.env.is_isa_mode_switch(index),
+            ) {
+                let branchind = self.env.resolve_typeop(OpCode::CPUI_BRANCHIND);
+                self.data.op_set_opcode(curop, branchind);
+            }
             match self.data.obank().get(curop).expect("xref_control_flow: stale op").code() {
                 OpCode::CPUI_CBRANCH => {
                     let destaddr = self.branch_in0_addr(curop);
@@ -1448,6 +1581,32 @@ impl<'a, E: FlowEnvironment> FlowInfo<'a, E> {
                         op = None;
                         *isfallthru = true;
                         break;
+                    }
+                    if let Some((callother, site)) = self.env.kernel_bug_site(&self.data, curop) {
+                        let addr =
+                            self.data.obank().get(curop).expect("kernelbug: stale op").get_addr().clone();
+                        crate::kuna_kernelbug::rewrite(&mut self.data, curop, callother, &site)?;
+                        self.data.op_destroy_raw(curop)?;
+                        if site.warning {
+                            op = Some(callother);
+                            continue;
+                        }
+                        let halt = self.artificial_halt(&addr, pcodeop_flags::noreturn)?;
+                        self.data.op_dead_insert_after(halt, callother);
+                        cursor = Some(halt);
+                        continue;
+                    }
+                    if let Some(trap) = self.env.brk_trap(&self.data, curop) {
+                        if let Some(code) = &trap.code {
+                            crate::kuna_brktrap::read_code(&mut self.data, trap.callother, code)?;
+                        }
+                        let addr =
+                            self.data.obank().get(curop).expect("brktrap: stale op").get_addr().clone();
+                        let halt = self.artificial_halt(&addr, pcodeop_flags::noreturn)?;
+                        self.data.op_dead_insert_after(halt, curop);
+                        self.data.op_destroy_raw(curop)?;
+                        cursor = Some(halt);
+                        continue;
                     }
                     self.tablelist.push(curop); // Put off trying to recover the table
                     if self.data.obank().get(curop).expect("xref").get_time() >= maxtime {
@@ -1914,6 +2073,14 @@ truncating the fall-through here"
             self.maxaddr = endaddr.clone();
         }
 
+        if !self.data.get_arch().nullable_relocations.is_empty() {
+            let first = if emptyflag { self.dead_head() } else { marker.and_then(|op| self.dead_next(op)) };
+            let mut ops = Vec::new();
+            let mut cursor = first;
+            while let Some(op) = cursor { ops.push(op); cursor = self.dead_next(op); }
+            crate::kuna_nullable_reloc::materialize(&mut self.data, curaddr, step, &ops);
+        }
+
         // oiter points at first new op: beginDead() if was empty, else ++marker.
         let first_new: Option<OpId> = if emptyflag {
             self.dead_head()
@@ -1922,6 +2089,7 @@ truncating the fall-through here"
         };
 
         self.overlap_cbranch_target = None; // (kuna overlapbranch) per-instruction
+        let mut ends_in_call = false;
         if let Some(firstop) = first_new {
             // (kuna retpushedhalf) The push/pop stack-maintenance shape is only
             // visible here: copy propagation later collapses the store and the
@@ -1931,6 +2099,7 @@ truncating the fall-through here"
                 insn_ops.push(next);
             }
             crate::kuna_retpushedhalf::observe_instruction(&mut self.data, &insn_ops);
+            ends_in_call = self.pool_bound && self.ends_in_unconditional_call(&insn_ops);
             let seq = self.data.obank().get(firstop).expect("process: stale firstop").get_seq_num().clone();
             if let Some(stat) = self.visited.get_mut(curaddr) {
                 stat.seqnum = seq;
@@ -2016,6 +2185,18 @@ truncating the fall-through here"
                     curaddr,
                 );
                 isfallthru = false;
+            } else if ends_in_call && self.is_pool_fallthru(&next) {
+                // (kuna funcboundflow) The call's fall-through is the function's
+                // own literal pool, so the call does not return. The halt stays
+                // in the call's block, as a known no-return callee's does, and
+                // `next` out of `visited`: only this fall-through reaches a pool
+                // word.
+                self.artificial_halt(curaddr, pcodeop_flags::noreturn)?;
+                self.data.warning(
+                    "funcboundflow: the call's fall-through is this function's literal pool; truncating flow here",
+                    curaddr,
+                );
+                isfallthru = false;
             } else if self.baddr <= next
                 && next <= self.eaddr
                 && !self.is_flow_for_inline()
@@ -2058,6 +2239,31 @@ truncating the fall-through here"
             step,
             target.get_offset(),
             len,
+        )
+    }
+
+    /// (kuna `funcboundflow`) Is the last op of one instruction's `ops` a
+    /// `CALL`/`CALLIND` that no `CBRANCH` makes conditional?
+    fn ends_in_unconditional_call(&self, ops: &[OpId]) -> bool {
+        let mut last = None;
+        let mut conditional = false;
+        for &op in ops {
+            let Some(o) = self.data.obank().get(op) else { continue };
+            last = Some(o.code());
+            conditional |= o.code() == OpCode::CPUI_CBRANCH;
+        }
+        !conditional && matches!(last, Some(OpCode::CPUI_CALL | OpCode::CPUI_CALLIND))
+    }
+
+    /// (kuna `funcboundflow`) Is the fall-through to `next` the start of this
+    /// function's literal pool, allowing for the compiler's alignment padding?
+    /// See
+    /// [`kuna_should_bound_at_pool`](crate::kuna_funcboundflow::kuna_should_bound_at_pool).
+    fn is_pool_fallthru(&self, next: &Address) -> bool {
+        let pad = self.env.funcbound_pool_pad(next);
+        crate::kuna_funcboundflow::kuna_should_bound_at_pool(
+            pad,
+            pad.is_some_and(|pad| pad == 0 || self.env.funcbound_padding_run(next, pad as int4)),
         )
     }
 
@@ -2752,6 +2958,14 @@ truncating the fall-through here"
                 entry = info.entry;
             }
         }
+        let numeric = self.data.obank().get(op).and_then(|o| o.get_in(0))
+            .and_then(|vn| self.data.vbank().get(vn)).is_some_and(|v| v.is_synthetic_literal());
+        if numeric {
+            let target = self.data.new_constant(entry.get_addr_size() as i32, entry.get_offset());
+            self.data.op_set_input(op, target, 0)?;
+            self.data.op_set_opcode_code(op, OpCode::CPUI_CALLIND);
+            return self.setup_callind_specs(op);
+        }
         self.build_call_specs(op, entry.clone(), false)?;
         self.qlst_count += 1;
         // While weaving a call-fixup body, a nested direct CALL to the SAME
@@ -2792,7 +3006,9 @@ truncating the fall-through here"
         }
         // The noreturn flag is also reported straight from the symbol table for
         // envs that carry it only there (the W4-era `query_call_no_return` hook).
-        let no_return = is_no_return || (!entry.is_invalid() && self.env.query_call_no_return(entry));
+        let no_return = is_no_return
+            || (!entry.is_invalid()
+                && (self.env.query_call_no_return(entry) || self.call_site_no_return(op, entry)));
         if no_return {
             let addr = self
                 .data
@@ -2812,6 +3028,19 @@ truncating the fall-through here"
             return Ok(true);
         }
         Ok(false)
+    }
+
+    /// [`FlowEnvironment::query_call_no_return_at`] for the decoded instruction
+    /// holding the call `op`.
+    fn call_site_no_return(&self, op: OpId, entry: &Address) -> bool {
+        let Some(call) = self.data.obank().get(op).map(|o| o.get_addr().clone()) else {
+            return false;
+        };
+        let Some(stat) = self.visited.get(&call) else {
+            return false;
+        };
+        let fallthrough = &call + i64::from(stat.size);
+        self.env.query_call_no_return_at(entry, &call, &fallthrough)
     }
 
     /// Set up the FuncCallSpecs for a new CALLIND site (C++ `setupCallindSpecs`,
@@ -2881,6 +3110,15 @@ truncating the fall-through here"
             self.data.op_dead_insert_after(haltop, op);
             return Ok(true);
         }
+        // (kuna #1288) An interrupt that ends an MS-DOS program is a no-return
+        // call. The warning is kept: which service an `INT 21h` asks for is in
+        // AH, which the C does not show.
+        if self.env.is_dos_exit_callind(&self.data, op) {
+            if let Some(idx) = self.data.get_call_specs_index(op) {
+                self.data.get_call_specs_mut(idx).proto_mut().set_no_return(true);
+            }
+            return self.check_for_flow_modification(op, &Address::default());
+        }
         // (kuna `int3pad`) The same lowering over vector 3 is a decoded `int3`:
         // control ran into a breakpoint byte, which the printer otherwise renders
         // as an ordinary call through a pointer.  Name it, and under `int3pad
@@ -2925,6 +3163,25 @@ truncating the fall-through here"
         if callee != entry {
             fc.set_plt_stub(entry.clone());
         }
+        if !indirect && !callee.is_invalid() {
+            fc.set_callee_reg_model(self.env.query_call_register_model(&callee));
+            fc.set_callee_purge(self.env.query_call_extra_pop(&callee));
+            let call_at = self.data.obank().get(op).map(|o| o.get_addr().clone());
+            if let Some(call_at) = call_at {
+                let args = self.env.query_call_stack_arg_bytes(&callee, &call_at);
+                fc.set_callee_stack_arg_bytes(args);
+                if args.is_none() {
+                    fc.set_callee_stack_window(self.env.query_call_stack_window(&callee, &call_at));
+                    fc.set_callee_return_pop(self.env.query_call_return_pop(&callee));
+                }
+            }
+            fc.set_callee_moves_stack(self.env.query_call_moves_stack(&callee));
+        }
+        if indirect {
+            if let Some(call_at) = self.data.obank().get(op).map(|o| o.get_addr().clone()) {
+                fc.set_callind_cleanup(self.env.query_callind_cleanup(&call_at));
+            }
+        }
         // C++ `data.getOverride().applyPrototype(data, *res)` (flow.cc:706 direct /
         // flow.cc:732 indirect, BEFORE `queryCall`): an `override prototype <addr>
         // <decl>` keyed by the call op's address copies its parsed prototype onto
@@ -2951,7 +3208,9 @@ truncating the fall-through here"
         // queryCall: resolve the direct callee symbol's name (W4 proto copy
         // postponed to ActionDefaultParams).
         if !indirect && !entry.is_invalid() {
-            if let Some(name) = self.env.query_call(&entry) {
+            if let Some(name) =
+                self.env.query_call(&entry).or_else(|| self.env.query_call_label(&entry))
+            {
                 let _ = fc.set_funcdata(callee.clone(), &name);
             }
             // C++ queryCall: fspecs.copyFlowEffects(otherfunc->getFuncProto()) —

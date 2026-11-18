@@ -5,6 +5,19 @@ Anchors:
   - decompiler/crates/kuna-decomp/src/p9_emit
 ```
 
+The CLI's `functions --json` serializes borrowed inventory records through
+`decompiler/crates/kuna-cli/src/decompile_all/functions_serialize.rs`. It visits
+one record at a time without constructing a document-wide `Json` array or
+copying names and aliases. Records go directly to the stdout boundary's buffered
+writer through a fixed 64 KiB serialization buffer, so no complete output string
+is retained. `serde_json` owns the JSON structure and indentation; an adapter
+preserves ASCII-safe string escapes, including DEL and UTF-16 surrogate pairs.
+Both this adapter and the shared `jsonfmt` string writer use `UnicodeEscape`
+from `decompiler/crates/kuna-cli/src/jsonfmt/writer.rs` for Unicode escapes.
+Field order, optional fields, numeric spelling and the trailing newline are preserved.
+`scripts/bench_functions_macho.py` generates an arm64 Mach-O with a configurable
+number of one-instruction functions for reproducing inventory memory measurements.
+
 An integer SUBPIECE of an implied struct value preserves the extracted width
 when rendered as a field access (`kuna_fieldextract.rs`). If the field is wider
 than the result, the emitter converts the field to the operation's integer type
@@ -1588,6 +1601,27 @@ signed-comparison probes pass the shifted result to a typed comparison helper
 so the comparison cannot canonicalize the shift into signed multiplication.
 Defining signed multiplication on overflow is outside this repair.
 
+**(kuna) Fixed 64-bit shifts in C — `option armconstshift all`.** The value
+`all` extends the ARM repair above to every architecture's fixed 64-bit left
+shift whose count is below 64 and whose operand prints as signed, including an
+implied sign extension of a narrower value. It computes through an unsigned
+64-bit C cast that keeps the complete input, extension included, and converts a
+signed output back after shifting so signed readers retain their
+interpretation: `(long)((unsigned long)(long)x << 0x1f)`.
+`decompiler/crates/kuna-decomp/src/p9_emit/kuna_constantshift.rs (plan_fixed64_lsl)`
+plans it and shares ARM's fixed-shift emitter, so each operand appears once and
+the IR and other readers are unchanged. The planner asks the printer for the
+operand's declared local type, since the printed signedness decides whether C
+shifts a signed value; the printer indexes its declared locals for that lookup.
+When the known bits prove the signed result nonnegative and representable, the
+compact form stays. Dynamic and out-of-range counts, other widths, unsigned
+operands and other output languages keep their rendering, and `on` remains the
+ARM-only repair. Like `on`, `all` is off by default: it adds a cast pair to every
+scaled 64-bit index and sign-bit test. `tests/stages/kuna-wide-shifts.xml` pins the
+default spelling and the converted one on x86-64, AArch64, PowerPC64 and MIPS64
+objects from `tests/fixtures/wide-integer-emission/`; `kuna-cli/tests/wide_shift_emission.rs`
+executes the emitted C at O0/O2 under UBSan over signed boundary bit patterns.
+
 **Every label labels a statement.** Label placement in the printed C is valid
 C99/C11/C17 and does not rely on C23. In those dialects a label is part of a
 labeled statement, so `case 2:`, `default:` or `label_10ad:` directly before a
@@ -1953,6 +1987,15 @@ explicit pointer cast before `->`. The member offset follows the selected
 pointee; snapshot declarations and byte arithmetic keep their existing
 representations. Matching types, implied expressions, relative pointers and
 explicit `nocasts` retain their ordinary rendering.
+
+A bitfield read or written through a LOAD or STORE chooses member (`.`) or
+pointer (`->`) syntax in `printc.rs (check_bit_field_member)`. As upstream
+does, a bitfield at a nonzero byte offset skips the PTRSUB that reaches its
+storage before looking for a member access underneath. A PTRSUB whose offset
+falls strictly inside the bitfield's container is skipped as well: it reaches
+part of a container that starts at offset zero, as the C parser lays out a run
+of bitfields, so a two-byte load of `wide` at offset 1 prints `p->wide` rather
+than `p.wide`.
 
 **Precedence without an AST.** Operators and leaves are not buffered into a
 tree; they stream through a reverse-polish stack. `printc.rs (PrintC::push_op)`
@@ -2918,6 +2961,25 @@ the bytes — and leaves the exact-hit path untouched
 fallback: if the address turns out not to be read-only, or the bytes do not
 decode, the constant prints as an integer exactly as before.
 
+**The Swift string object.** Swift passes a string literal of 16 bytes or more
+(a shorter one is packed into the words themselves) as two words: its count with
+flags, and an object word holding the literal's address minus 32, tagged in bit
+63. When the tag is ORed in after a join, constant folding leaves the untagged
+object as a bare constant. Large literals are 16-byte aligned, so that constant
+is the start of, or a point inside, the literal stored before, and either arm
+above would print that other literal's text. `ActionConstantPtr` therefore
+leaves a constant as a number when
+`decompiler/crates/kuna-decomp/src/p9_emit/kuna_swiftstrobj.rs
+(is_string_object)` holds: every use of it, followed through COPY, MULTIEQUAL
+and INDIRECT, is an INT_OR with `0x8000000000000000`, and the 16 bytes 32 past
+it are read-only, hold no NUL and read as UTF-8. It then prints as an address,
+as the object already does when the tag folds into the same constant. A literal
+address biased only after the join reaches an INT_ADD first, so it keeps its
+literal and prints as `&v[-0x20] | 0x8000000000000000`. The check does not
+consult the `sourcelang` fact: the shape it needs is specific to Swift, it costs
+one use lookup on a constant that is not shaped like it, and a bytechunk image
+carries no detected language.
+
 **The zero-character literal.** The probe's accept test is the string manager's
 `is_string`, and that answers yes for *any* read-only location whose first
 character-width unit is a NUL: `stringmanage.rs
@@ -3273,6 +3335,39 @@ count. The switch fall-through marker is a comment with no diverging call and is
 deliberately outside this count: it is a different lossy construct, and naming
 one number `unstructured_gotos` that meant two things would be worse than
 reporting the one.
+
+**A function's warnings are recorded as the printer writes them.** Each
+per-function JSON record carries `warnings`, taken from the engine's warning
+store rather than read back out of `code`. `p9_emit/kuna_functionwarnings.rs`
+holds one record per warning a render wrote: the address the engine indexed
+it at, its stored text, and the line of the render holding its comment. The printer records one wherever it writes a
+warning: `printc.rs (PrintC::emit_comment_func_header)` for a `warningheader`
+comment, at the function's entry; `printc.rs (PrintC::emit_comment_group)` for a
+comment whose type is exactly `WARNING`, the type `Funcdata::warning` stamps, at
+the instruction it was indexed at; `printc.rs (PrintC::flush_eol_warnings)`,
+which gives every warning collected under `warnstyle inline` the line it
+appends them to, so the warnings joined into one `// a, b` comment keep an
+address each; and the shell a body without structured blocks prints
+(`structured blocks unavailable`, or `decompilation failed` on the console's
+text surface), which has no address. A comment of any other type never reaches
+a record, whatever it spells: an `--assert comment` (its type carries the user
+bit), a declaration's storage comment, a DWARF line, the original name a Rust or
+Go render keeps above the prototype. Only a plain render records; a markup pass
+over the same function keeps the plain render's records, and
+`printc.rs (PrintC::take_warnings)` rebases their lines onto the trimmed `code`
+as `take_pointer_arguments` does. The edits made after printing (the cookie
+return rewrite, pointer-argument casts, the `--jobs` structure renames) keep
+every line where it was, so each record's `line` holds its comment. The
+records ride `FuncResult::warnings` across the `--jobs` wire and the result
+store, and each address is mapped to the target's address units as
+`line_mappings` is. `kind` is the kind of an engine stem the slugs leave whole
+(`STEMS`: decode failures, flow truncation, out-of-bounds and unmapped flow,
+unrecovered jump tables, declined structuring), else the slug
+`printc.rs (warning_slug)` gives the text, less its ` xN` count, so a slug added
+there is a kind at once; else a kuna warning's producer tag, else `other`.
+`message` is the stored text less its `WARNING: ` marker. Both warning styles
+give the same records but for `line`. The verdict does not move here either;
+`error` stays reserved for a failed function.
 
 Go integer stores use `p9_emit/kuna_gostorevalue.rs` to match the rendered
 pointer's pointee type. When both source and destination are signed or unsigned
@@ -4959,6 +5054,25 @@ whole arrays and fields, explicit casts, pointer stores with guard words, calls
 and callback order, and constant one-past addresses. Readable and protected
 mappings verify these address computations do not load the array contents.
 
+
+### Rust complete array initialization
+
+`p9_emit/kuna_rustarrayinit.rs` renders consecutive scalar COPY writes covering
+every element of a recovered integer array, in increasing index order, as one
+whole-array assignment. This initializes a previously uninitialized Rust local
+without zero-filling or manufacturing values. The existing COPY value renderer
+retains the original constants and integer conversions.
+
+The complete cover must remain inside one basic block with no intervening
+operations. Every output must be a nonvolatile local element of the same array
+symbol and type, with exact element width and no alignment padding. Inputs are
+constants or explicit named local values independent of that array; implied
+expressions, global/volatile reads, and reads of the destination or any physically
+overlapping source-high storage view are not moved.
+Incomplete, duplicate, reordered, mixed-symbol, and interrupted writes retain
+their ordinary statement rendering. No target-language-specific change to
+variable grouping is made. Complete native Rust formatting-consumer regressions
+compile and execute the resulting bodies against their original binaries.
 
 ### Rust zero values for byte-array stores
 
