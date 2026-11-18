@@ -1,7 +1,7 @@
 {
   description = "Kuna agent-first decompiler, built from source with Nix";
 
-  inputs.nixpkgs.url = "github:NixOS/nixpkgs/d5cc6833999746cffdfe0598f7bc801a57b887a9";
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/04906337b6d53e8bb0eaf0470ae9f070a4d4eb55";
 
   outputs = { self, nixpkgs }:
     let
