@@ -109,6 +109,7 @@ fn the_repaired_blocks_document_their_flags() {
 #[test]
 fn every_json_surface_names_its_root_in_help() {
     let stated: &[(&str, &str)] = &[
+        ("fid", "{binary,"),
         ("decompile", "{binary,"),
         ("decompile-all", "{binary,"),
         ("functions", "{binary,"),
@@ -118,6 +119,7 @@ fn every_json_surface_names_its_root_in_help() {
         ("xrefs", "{binary,"),
         ("strings", "{binary,"),
         ("crypto", "{binary,"),
+        ("blobs", "{binary,"),
         ("unpack", "{binary,"),
         ("test", "{unit_footer,"),
         ("modes", "{modes:["),

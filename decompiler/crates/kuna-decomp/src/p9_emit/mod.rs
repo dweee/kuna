@@ -18,10 +18,12 @@ pub mod kuna_unknowncasts;
 pub mod kuna_signedread; // (kuna) a signed read of an expression that prints unsigned casts it back
 pub(crate) mod kuna_rustsigned;
 pub(crate) mod kuna_rustintegers;
+pub(crate) mod kuna_rustwrapping;
 pub(crate) mod kuna_rustboolcast;
 pub(crate) mod kuna_callresult;
 pub(crate) mod kuna_callargextend;
 pub(crate) mod kuna_ruststorevalue;
+mod kuna_ruststorewidth;
 pub(crate) mod kuna_rustptradd;
 pub(crate) mod kuna_rustarrayindex;
 pub(crate) mod kuna_rustarrayaddr;
@@ -61,12 +63,15 @@ pub mod kuna_arraycoverwidth;
 pub mod kuna_bytearrayc;
 pub(crate) mod kuna_bytearrayslice;
 pub mod kuna_armregistershift; // (kuna) defined C for ARM register-controlled LSL
-mod kuna_armconstantshift;
+pub mod kuna_armconstantshift;
+pub(crate) mod kuna_acleintrinsics; // (kuna) AArch64 barrier, hint and memory-tagging user ops as ACLE intrinsics
 pub mod kuna_emptystrconst;
 pub mod kuna_cfstr; // (kuna) CFSTR("...") for a Mach-O __cfstring entry
+pub mod kuna_swiftstrobj; // (kuna) a Swift string object is not a pointer to the bytes it lands on
 pub mod kuna_renderfault; // (kuna) test-only: panic one function's render partway through
 pub mod kuna_truncarg;
 pub mod kuna_pointerargs; // (kuna) a scalar's address passed to a character-pointer parameter
+pub mod kuna_functionwarnings; // (kuna) the analysis warnings a render wrote, where the engine recorded them
 pub mod kuna_castimplied; // (kuna) casts C's own conversions already perform
 pub mod kuna_castnarrow; // (kuna) a narrowing C's own assignment, argument or return conversion performs keeps no cast
 pub mod kuna_declorder; // (kuna) the order local declarations print in
@@ -113,3 +118,7 @@ pub(crate) mod kuna_indirectargs;
 pub mod kuna_callprototypes;
 
 pub(crate) mod kuna_gostorevalue;
+
+pub(crate) mod kuna_constantshift;
+
+pub mod kuna_widenedadd;

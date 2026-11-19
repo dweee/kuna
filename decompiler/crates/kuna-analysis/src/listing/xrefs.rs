@@ -319,6 +319,11 @@ impl XrefIndex {
         self.by_target.get(&vma).map_or(&[], Vec::as_slice)
     }
 
+    /// Every reference to an address in `range`, in target then source order.
+    pub fn refs_into(&self, range: std::ops::Range<u64>) -> impl Iterator<Item = &Xref> {
+        self.by_target.range(range).flat_map(|(_, refs)| refs)
+    }
+
     /// Everything that references the *callable* `vma` names, rather than the
     /// literal address: [`refs_to`](Self::refs_to) taken over `vma`'s whole
     /// [`alias_class`](Self::alias_class), with the forwarding jumps that join
@@ -877,7 +882,7 @@ fn descend(
     let mut raw: Vec<RawOp> = Vec::new();
 
     // Share the decoded partition with prologue recovery and AIF.
-    let gapwalk = arch.analysis_aif;
+    let gapwalk = arch.analysis_aif.enabled();
     let mut fingerprint_contexts = (prologues && gapwalk)
         .then(super::kuna_fingerprintcontext::FingerprintContexts::default);
     let mut prologues_done = false;
@@ -1596,13 +1601,13 @@ fn gap_entries(
     if let Some(prior) = frame {
         crate::aif::run_aif_after_frames(
             &listing, prior, translate, Rc::clone(code_space),
-            arch.analysis_aifstrict, arch.analysis_aifcorroborate, bracket,
+            arch.analysis_aif.strict(), arch.analysis_aif.corroborate(), bracket,
             poolslide, None, None,
         )
     } else {
         crate::aif::run_aif(
             &listing, translate, Rc::clone(code_space), listing.exec_ranges(),
-            arch.analysis_aifstrict, arch.analysis_aifcorroborate, bracket,
+            arch.analysis_aif.strict(), arch.analysis_aif.corroborate(), bracket,
             poolslide,
         )
     }
