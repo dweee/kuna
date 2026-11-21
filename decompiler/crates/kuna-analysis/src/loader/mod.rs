@@ -32,6 +32,7 @@
 
 pub mod arm_markers;
 pub(crate) mod kuna_ppcaputarget;
+pub(crate) mod kuna_ppc64elfv2target;
 #[cfg(test)]
 mod powerpc_apu_tests;
 pub(crate) mod kuna_mipstarget;
@@ -47,6 +48,7 @@ pub mod kuna_globalref;
 pub mod elfv1;
 mod elfv1_imports;
 pub mod kuna_ppc32_imports;
+pub mod kuna_ppc64r12;
 mod kuna_ppc32picimports;
 pub use kuna_ppc32picimports::{ImportProofMemo, ImportProofScope};
 // (kuna) ELF section-table tolerance: an image whose section headers are
@@ -97,10 +99,14 @@ pub mod format;
 // typed import-pointer slots + upstream's strictly PE-only no-return API names.
 pub mod kuna_peimportcall;
 pub mod kuna_authptrcall;
+// (kuna) `stubbinds`: a stripped stub is named from the chained bind on its slot.
+pub mod kuna_stubbinds;
 // (kuna) `rexthunk`: an x86-64 `REX FF 25` tail jump is not an import thunk.
 pub(crate) mod kuna_rexthunk;
 // (kuna) `peordinal`: name a PE import-by-ordinal from a built-in export table.
 pub(crate) mod kuna_peordinal;
+// (kuna #1288) the PC memory a DOS program shares with the machine, volatile.
+pub mod kuna_pcmemory;
 // (kuna `kernelcache`) IMG4/IM4P/LZFSE/complzss unwrapping and MH_FILESET entry
 // selection for Apple kernelcaches.
 pub mod kuna_kernelcache;
@@ -114,6 +120,8 @@ pub mod mips_markers;
 pub mod kuna_mipsentry;
 pub(crate) mod kuna_mipsabi;
 pub mod kuna_mipsocteon;
+// (kuna) RISC-V Zcmp/Zcmt language selection from `Tag_RISCV_arch`.
+pub mod kuna_riscvzc;
 // (kuna) Go toolchain version off the build-info blob (goreg shell layouts).
 pub mod gobuildinfo;
 pub mod noreturn;
@@ -128,5 +136,9 @@ pub mod kuna_floatabi;
 pub mod kuna_returnext;
 // (kuna #1288) the x86 real-mode code segment a loader paints into the decode context.
 pub mod kuna_realmodecs;
+// (kuna `mzdgroup`) the data segment an MS-DOS program's startup code loads into DS.
+pub mod kuna_mzdgroup;
 
 pub mod kuna_mipsstubs;
+
+mod kuna_nullable_reloc;
