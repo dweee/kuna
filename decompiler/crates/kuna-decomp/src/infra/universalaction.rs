@@ -445,6 +445,7 @@ pub fn universal_sched(
         rrow!("lessone", "analysis", crate::ruleaction_1::RuleLessOne::new("analysis")),
         rrow!("rangemeld", "analysis", crate::ruleaction_1::RuleRangeMeld::new("analysis")),
         rrow!("ovlesssimplify", "analysis", crate::kuna_ovlesssimplify::RuleOvLessSimplify::with_group("analysis")),
+        rrow!("opaquepredicate", "analysis", crate::kuna_opaquepredicate::RuleOpaquePredicate::new("analysis")),
         rrow!("floatrange", "analysis", crate::ruleaction_2::RuleFloatRange),
         rrow!("piece2zext", "analysis", crate::ruleaction_1::RulePiece2Zext::new("analysis")),
         rrow!("piece2sext", "analysis", crate::ruleaction_1::RulePiece2Sext::new("analysis")),
@@ -610,6 +611,11 @@ pub fn universal_sched(
             act!(ActionDynamicMapping::boxed("dynamic")),
             act!(ActionSpacebase::boxed("base")),
             act!(ActionNonzeroMask::boxed("analysis")),
+            // (kuna) sitetypelock: pin client-asserted per-call-site output
+            // types onto the call output Varnodes before the first
+            // `buildLocaltypes`, so the lattice seeds from them and neither
+            // propagation nor structsynth can replace them.
+            act!(crate::kuna_sitetypelock::ActionSiteTypeLock::boxed("typerecovery")),
             act!(ActionInferTypes::boxed("typerecovery")),
             // (kuna) structsynth: once propagation has settled, complete a
             // `struct_N` over a pointer parameter dereferenced at two or more
@@ -678,6 +684,16 @@ pub fn universal_sched(
                 false,
                 "returnsplit"
             ))),
+            // (kuna) the post-SSA Go write-barrier arm fold (option
+            // `gowritebarrier`, same judgment as the pre-SSA one-hop fold in
+            // mainloop): shared arms and arms whose call result feeds the join
+            // phis are only provably bookkeeping once SSA is mature, so this
+            // stripper sits with the edge-removal family and lets the repeating
+            // fullloop re-run dead-code and type passes over the reduced graph.
+            act!(Box::new(crate::kuna_gowbphi::ActionGoWriteBarrierPhi::new(
+                false,
+                "returnsplit"
+            ))),
             // (kuna) devectorize (option `devectorize`, default-OFF): re-roll a
             // vectorized integer reduction -- guard, stride loop with one
             // accumulator per lane, fold, scalar remainder loop -- into its scalar
@@ -693,6 +709,10 @@ pub fn universal_sched(
             // passes above: mainloop has settled the count and the searched byte
             // to constants, and the repeating fullloop folds what it leaves.
             act!(Box::new(crate::kuna_strlenscan::ActionStrlenScan::new(false, "returnsplit"))),
+            // (kuna) repstring (option `repstring`): the same loop shape for
+            // `rep movs`, `rep stos` and `repz cmpsb`, collapsed into a copy,
+            // fill or compare builtin by removing the edge into the body.
+            act!(Box::new(crate::kuna_repstring::ActionRepString::new("returnsplit"))),
             act!(ActionReturnSplit::boxed("returnsplit")),
             // (kuna) angr SAILR gotoless `ReturnDuplicatorHigh` (option `returndup`,
             // default-OFF).  Runs right after ActionReturnSplit (the goto-driven
@@ -705,6 +725,9 @@ pub fn universal_sched(
             // same merge/naming passes and are re-structured by the next fullloop
             // iteration (and the final ActionBlockStructure).
             act!(crate::p8_structure::kuna_returndup::ActionReturnDup::boxed("returnsplit")),
+            // (kuna) `returndup calls`: split a cross-jumped `call f; return`
+            // block per predecessor.
+            act!(crate::p8_structure::kuna_returndupcalls::ActionReturnDupCalls::boxed("returnsplit")),
             // (kuna) angr SAILR `ReturnDuplicatorHigh`, per-edge const narrowing (option
             // `earlyreturn`, default-OFF).  Sibling of ActionReturnDup: peels only the
             // CONSTANT arm of a mixed return phi (the guard's `return K`), leaving the
@@ -764,6 +787,12 @@ pub fn universal_sched(
             // LOCKED prototype that ActionFuncLink must materialize.
             act!(crate::p2_lift::kuna_msvcstrappend::ActionMsvcStrAppend::boxed("protorecovery")),
             act!(crate::kuna_rustprobestack::ActionRustProbestack::boxed("protorecovery")),
+            // (kuna) chkstkdarwin (option `chkstkdarwin`, default on): remove the
+            // AArch64 calls to `___chkstk_darwin`.  Here for the reason
+            // rustprobestack is: the call is matched on the RAW p-code and must be
+            // gone before FuncLink gives it trials and heritage kills the argument
+            // registers at it.
+            act!(crate::kuna_chkstkdarwin::ActionChkstkDarwin::boxed("protorecovery")),
             act!(ActionNormalizeSetup::boxed("normalanalysis")),
             act!(ActionDefaultParams::boxed("base")),
             SchedNode::Action(Box::new(move || {
@@ -780,6 +809,7 @@ pub fn universal_sched(
             act!(ActionStructureTransform::boxed("blockrecovery", true)),
             act!(ActionNormalizeBranches::boxed("normalizebranches")),
             act!(crate::kuna_armfloatargs::ActionArmFloatArgs::boxed("merge")),
+            act!(crate::p9_emit::kuna_returnselector::ActionReturnSelector::boxed("merge")),
             act!(ActionAssignHigh::boxed("merge")),
             act!(ActionMergeRequired::boxed("merge")),
             act!(ActionMarkExplicit::boxed("merge")),
@@ -793,6 +823,7 @@ pub fn universal_sched(
             act!(ActionMergeType::boxed("merge")),
             act!(ActionHideShadow::boxed("merge")),
             act!(ActionCopyMarker::boxed("merge")),
+            act!(crate::kuna_typevote::ActionTypeVote::boxed("typerecovery")),
             act!(ActionLateDoNothing::boxed("blockrecovery")),
             act!(ActionBlockStructure::boxed("blockrecovery")),
             act!(ActionPreferComplement::boxed("blockrecovery", false)),
@@ -815,6 +846,7 @@ pub fn universal_sched(
             act!(crate::kuna_calltargettype::ActionCallTargetType::boxed("typerecovery")),
             act!(ActionSetCasts::boxed("casts")),
             act!(ActionFinalStructure::boxed("blockrecovery")),
+            act!(crate::kuna_postinc::ActionPostIncrement::boxed("blockrecovery")),
             // (kuna) angr SAILR return-tail goto-reduction (option `gotoreduce`):
             // call-free return tails at `return`, then return tails with a call
             // (`free(p); return;`) at `on`.  Runs after the tree is final + goto

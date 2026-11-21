@@ -279,10 +279,23 @@ impl Rule for RuleLoadVarnode {
         };
         let size = size_of(data, out_vn(data, op));
         let offoff = kuna_base::space::AddrSpace::address_to_byte(offoff, baseoff.get_word_size());
-        let newvn = data.new_varnode_space_off(size, Rc::clone(&baseoff), offoff);
+        // A read-only relocated pointer is the weak binding plus its addend,
+        // not the synthetic display address stored in its pre-link bytes.
+        let nullable = data.get_arch().nullable_relocations.get(&offoff)
+            .filter(|_| data.get_address().get_space().is_some_and(|s| s.get_index() == baseoff.get_index()))
+            .and_then(|records| records.iter().find(|r| r.pointer_size == size
+                && matches!(r.operand, crate::kuna_nullable_reloc::Operand::DataPointer))).cloned();
+        let offset = nullable.as_ref().map_or(offoff, |r| r.slot);
+        let newvn = data.new_varnode_space_off(size, Rc::clone(&baseoff), offset);
         data.op_set_input(op, newvn, 0).expect("RuleLoadVarnode: opSetInput");
-        data.op_remove_input(op, 1);
-        set_opcode(data, op, OpCode::CPUI_COPY);
+        if let Some(record) = nullable.filter(|r| r.addend != 0) {
+            let addend = data.new_constant(size, record.addend as u64);
+            data.op_set_input(op, addend, 1).expect("weak pointer addend");
+            set_opcode(data, op, OpCode::CPUI_INT_ADD);
+        } else {
+            data.op_remove_input(op, 1);
+            set_opcode(data, op, OpCode::CPUI_COPY);
+        }
         crate::p3_dataflow::kuna_stackreadscope::mark_stack_read(data, op);
         // C++ ruleaction.cc:4316-4324 — the spacebase-placeholder tail.  When the
         // converted COPY output is the stack-pointer placeholder the call set up,
@@ -1963,12 +1976,10 @@ impl Rule for RuleHumptyOr {
 /// \brief Convert BRANCHIND with only one computed destination to a BRANCH
 /// (C++ `RuleSwitchSingle`).
 ///
-/// STUB(W?-jumptable): the body needs `Funcdata::findJumpTable`,
-/// `removeJumpTable`, `getStructure`, `newCodeRef`, and `warningHeader` plus the
-/// `JumpTable` accessors — none ported to this wave's `Funcdata`.  The guard
-/// `bb->sizeOut() != 1` and the no-jumptable early-out are transcribed; with
-/// `findJumpTable` unported the rule short-circuits to "no jumptable" (the C++
-/// `jt == 0` early-out).  Recorded as a loss.
+/// A labelled table on a single-out-edge BRANCHIND becomes a BRANCH to its
+/// address. (kuna) A one-entry table over a computed value is left alone: table
+/// recovery can keep only the entries its guards prove reachable, so one kept
+/// entry is not proof of one destination.
 pub struct RuleSwitchSingle;
 
 impl RuleSwitchSingle {
@@ -2003,11 +2014,32 @@ impl Rule for RuleSwitchSingle {
         if data.bblocks_ref().block(bb).size_out() != 1 {
             return 0;
         }
-        //   -- STUB(W?-jumptable): findJumpTable + JumpTable accessors + newCodeRef
-        //   + removeJumpTable + getStructure().clear() + warningHeader unported.
-        //   The remaining body (label scan, BRANCHIND->BRANCH conversion) is
-        //   transcribed in the C++ but unreachable until the jumptable surface lands.
-        0
+        let Some(jt_idx) = data.find_jump_table_index(op) else { return 0 };
+        let jt = data.get_jump_table(jt_idx as int4);
+        let num = jt.num_entries();
+        if num == 0 || !jt.is_labelled() {
+            return 0;
+        }
+        let addr = jt.get_address_by_index(0);
+        let constant_input = data.vbank().get(in_vn(data, op, 0)).expect("RuleSwitchSingle: stale input").is_constant();
+        if num == 1 && !constant_input {
+            return 0;
+        }
+        let allcasesmatch = num != 1 && (1..num).all(|i| jt.get_address_by_index(i) == addr);
+        if num != 1 || !constant_input {
+            let mut s = String::from("Switch with 1 destination removed at ");
+            let _ = addr_of(data, op).print_raw(&mut s);
+            if allcasesmatch {
+                s.push_str(&format!(" : {num} cases all go to same destination"));
+            }
+            data.warning_header(&s);
+        }
+        set_opcode(data, op, OpCode::CPUI_BRANCH);
+        let coderef = data.new_code_ref(&addr);
+        data.op_set_input(op, coderef, 0).expect("RuleSwitchSingle: opSetInput");
+        data.remove_jump_table(jt_idx);
+        data.sblocks_clear();
+        1
     }
 }
 
