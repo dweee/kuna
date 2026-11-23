@@ -49,7 +49,7 @@ use kuna_base::xml::{DocumentStorage, Element};
 use kuna_decomp::architecture::Architecture;
 use kuna_decomp::options::register_option_elements;
 use kuna_decomp::raw_arch::RawBinaryArchitectureCapability;
-use kuna_decomp::kuna_memoryspecs::IntoSpecRoot;
+use kuna_decomp::kuna_memoryspecs::{IntoSpecRoot, SpecRoot};
 use kuna_decomp::kuna_loadoptions::LoadOptions;
 use kuna_decomp::sleigh_arch::{register_sleigh_arch_ids, LanguageDatabase, SleighArchitecture};
 use kuna_decomp::xml_arch::XmlArchitectureCapability;
@@ -264,6 +264,7 @@ pub struct RawPcodeOp {
 }
 
 /// A SLEIGH address-space, offset and byte-size tuple.
+#[derive(PartialEq, Eq)]
 pub struct RawPcodeVarnode {
     pub space: String,
     pub offset: u64,
@@ -700,7 +701,8 @@ pub struct ConsoleProgram {
     /// with, in the order they were given -- the one override plane an agent
     /// states facts through (`crate::assertions`).  Empty for every invocation
     /// that passed none, which is what keeps the plane free.
-    assertions: Vec<crate::assertions::Directive>,
+    assertions: Rc<[crate::assertions::Directive]>,
+    function_assertion_slots: Rc<[usize]>,
     /// One slot per [`Self::assertions`] entry: what became of that directive.
     /// `None` until something claims it, so a directive no surface reached is
     /// still distinguishable from one that was applied.
@@ -2574,6 +2576,7 @@ impl ConsoleProgram {
     /// directive so the report keeps the caller's own order however the
     /// directives are later dispatched.
     pub fn set_assertions(&mut self, directives: Vec<crate::assertions::Directive>) {
+        self.arch_mut().stated_jump_targets.clear();
         if directives.iter().any(|directive| matches!(directive.body,
             crate::assertions::Body::Flow { .. }
             | crate::assertions::Body::Callee { .. }
@@ -2584,12 +2587,23 @@ impl ConsoleProgram {
             self.callwide_unavailable("selected function flow or storage assertions lack a full image proof");
         }
         self.assertion_outcomes = vec![None; directives.len()];
-        self.assertions = directives;
+        self.function_assertion_slots = directives.iter().enumerate()
+            .filter(|(_, d)| d.body.is_function_scoped() && d.body.cross_function_prototype().is_none())
+            .map(|(slot, _)| slot).collect();
+        self.assertions = directives.into();
     }
 
     /// The installed assertions, in the order they were given.
     pub fn assertions(&self) -> &[crate::assertions::Directive] {
         &self.assertions
+    }
+
+    pub(crate) fn local_directives(&self) -> crate::assertions::LocalDirectives {
+        crate::assertions::LocalDirectives { all: self.assertions.clone(), slots: self.function_assertion_slots.clone() }
+    }
+
+    pub(crate) fn assertion_applied(&self, slot: usize) -> bool {
+        self.assertion_outcomes[slot].as_ref().is_some_and(|o| o.status == "applied")
     }
 
     /// Record what became of the `i`-th directive.
@@ -2607,6 +2621,17 @@ impl ConsoleProgram {
             .map(|(directive, outcome)| {
                 outcome.clone().unwrap_or_else(|| crate::assertions::unclaimed(directive))
             })
+            .collect()
+    }
+
+    /// The report rows a run that decompiles nothing can settle: every
+    /// directive except the per-function ones only a decompile binds.
+    pub fn image_assertion_outcomes(&self) -> Vec<crate::assertions::Outcome> {
+        self.assertion_outcomes()
+            .into_iter()
+            .enumerate()
+            .filter(|(slot, _)| self.function_assertion_slots.binary_search(slot).is_err())
+            .map(|(_, outcome)| outcome)
             .collect()
     }
 
@@ -3847,12 +3872,52 @@ fn build_registry() -> IdRegistry {
 /// roots).  A root may also be a tree held in memory
 /// ([`kuna_decomp::kuna_memoryspecs::MemorySpecs`]).
 fn scan_language_database(spec_roots: &[impl IntoSpecRoot], registry: &IdRegistry) -> KunaResult<LanguageDatabase> {
+    let roots: Vec<SpecRoot> = spec_roots.iter().map(IntoSpecRoot::to_spec_root).collect();
+    let key: Option<Vec<std::path::PathBuf>> = roots
+        .iter()
+        .map(|root| match root {
+            SpecRoot::Dir(path) => Some(path.clone()),
+            SpecRoot::Memory(_) => None,
+        })
+        .collect();
+    let reused = |key: &[std::path::PathBuf]| {
+        let scans = REUSED_SCANS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        scans.as_ref()?.iter().find(|(k, _)| k == key).map(|(_, db)| db.clone())
+    };
+    if let Some(db) = key.as_deref().and_then(reused) {
+        return Ok(db);
+    }
     let mut db = LanguageDatabase::new();
-    for root in spec_roots {
-        db.add_spec_root(&root.to_spec_root());
+    for root in &roots {
+        db.add_spec_root(root);
     }
     db.get_descriptions(registry)?;
+    if let Some(key) = key {
+        let mut scans = REUSED_SCANS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(scans) = scans.as_mut() {
+            scans.push((key, db.clone()));
+        }
+    }
     Ok(db)
+}
+
+type ReusedScans = Vec<(Vec<std::path::PathBuf>, LanguageDatabase)>;
+
+static REUSED_SCANS: std::sync::Mutex<Option<ReusedScans>> = std::sync::Mutex::new(None);
+
+/// From now on, reuse spec work across the bootstraps of this process: each
+/// set of on-disk spec roots is scanned once, and every later bootstrap over
+/// the same roots gets a copy of that scan; and each `.sla` a thread decodes
+/// twice is kept, so later translators from it are copies of the decoded form
+/// ([`kuna_sleigh::kuna_slacache`]). For runners whose spec trees cannot change
+/// while they run and that build many architectures, such as the datatest
+/// harness. A kept `.sla` costs about as much memory as one translator.
+pub fn reuse_specs() {
+    kuna_sleigh::kuna_slacache::enable();
+    REUSED_SCANS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get_or_insert_with(Vec::new);
 }
 
 /// Scan `spec_roots` into a [`LanguageDatabase`] once, for [`Bootstrap`]s to
@@ -4353,7 +4418,8 @@ fn empty_program(
         anonymous_symbols: std::cell::OnceCell::new(),
         canonical_entries: std::cell::RefCell::new(None),
         entry_names: std::cell::RefCell::new(None),
-        assertions: Vec::new(),
+        assertions: Rc::default(),
+        function_assertion_slots: Rc::default(),
         assertion_outcomes: Vec::new(),
         pending_prototypes: BTreeMap::new(),
         raw_address_units: None,
@@ -5037,6 +5103,7 @@ pub(crate) fn bootstrap_object(
     // section; an entry that only carries the Thumb bit arms the
     // `entrythumbflow` walk, exactly as a TE with that shape does.
     let arch_id = sleigh.arch_id().to_string();
+    sleigh.base_mut().unwrap().runtime_code_relocation = loader.runtime_code_relocation;
     let parsed = is_arm32_language(&arch_id)
         .then(|| kuna_analysis::loadimage_object::parse_object(&*bytes).ok())
         .flatten();
@@ -5467,8 +5534,9 @@ fn commit_analysis_output(
     if let Some(entry) = out.go_chanrecv2 {
         prog.arch_mut().go_chanrecv2 = Some(entry);
     }
-    if !out.case_entries.is_empty() {
-        let cases: std::collections::BTreeSet<u64> = out.case_entries.iter().copied().collect();
+    if !out.case_entries.is_empty() || !out.interior_entries.is_empty() {
+        let cases: std::collections::BTreeSet<u64> =
+            out.case_entries.iter().chain(&out.interior_entries).copied().collect();
         out.entries.retain(|e| !cases.contains(e));
     }
     for slot in std::mem::take(&mut out.ppc32_pic_slots) {
@@ -7041,6 +7109,27 @@ mod te_probe_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn function_assertion_index_shares_only_the_selected_report_slots() {
+        use crate::assertsyntax::parse_directive;
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let mut prog = super::bootstrap_from_object(
+            root.join("tests/fixtures/stated-jump/dispatch.elf").to_str().unwrap(), "",
+            &[root.join("specs").to_string_lossy().into_owned()],
+        ).unwrap();
+        let jump = parse_directive("jumptable 401009 401020 401030 401050").unwrap();
+        let mut directives = vec![jump; 1000];
+        directives.insert(123, parse_directive("flow dispatch::401009 call").unwrap());
+        prog.set_assertions(directives);
+        let first = prog.local_directives();
+        let next = prog.local_directives();
+        assert_eq!(&*first.slots, &[123]);
+        assert!(std::rc::Rc::ptr_eq(&first.slots, &next.slots));
+        assert!(std::rc::Rc::ptr_eq(&first.all, &next.all));
+        prog.set_assertions(Vec::new());
+        assert!(prog.local_directives().slots.is_empty());
+    }
+
     use std::rc::Rc;
 
     use kuna_base::space::{spacetype, AddrSpace};
